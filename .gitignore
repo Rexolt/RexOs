@@ -1,0 +1,18 @@
+# Build artifacts
+build/
+*.iso
+*.o
+*.elf
+
+# Limine cloned bootloader (külön repó)
+boot/limine/
+
+# Editor / IDE
+.vscode/
+.idea/
+*.swp
+.directory
+
+# Cscope / ctags
+cscope.*
+tags
