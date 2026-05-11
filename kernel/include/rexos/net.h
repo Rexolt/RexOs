@@ -179,6 +179,11 @@ void arp_receive(net_device_t *dev, const arp_header_t *arp, uint32_t len);
 void arp_request(net_device_t *dev, const ip4_addr_t *target_ip);
 void arp_reply(net_device_t *dev, const mac_addr_t *target_mac, const ip4_addr_t *target_ip);
 bool arp_resolve(const ip4_addr_t *ip, mac_addr_t *out_mac);
+void arp_queue_ipv4(net_device_t *dev, const ip4_addr_t *next_hop, const void *packet, uint32_t packet_len);
+
+/* DHCP (dhcp.c) */
+bool dhcp_configure(net_device_t *dev);
+void dhcp_receive(net_device_t *dev, const uint8_t *data, uint32_t len, uint16_t src_port);
 
 /* IPv4 (ipv4.c) */
 void     ipv4_receive(net_device_t *dev, const ip4_header_t *ip, uint32_t len);
@@ -202,31 +207,3 @@ void          tcp_close(tcp_socket_t *sock);
 /* DNS (dns.c) */
 bool dns_resolve(net_device_t *dev, const char *hostname, ip4_addr_t *out_ip);
 void dns_receive(net_device_t *dev, const uint8_t *data, uint32_t len, uint16_t src_port);
-
-/* DHCP (dhcp.c) */
-#define DHCP_MSG_DISCOVER 1
-#define DHCP_MSG_OFFER    2
-#define DHCP_MSG_REQUEST  3
-#define DHCP_MSG_ACK      5
-
-typedef struct {
-    uint8_t  op;
-    uint8_t  htype;
-    uint8_t  hlen;
-    uint8_t  hops;
-    uint32_t xid;
-    uint16_t secs;
-    uint16_t flags;
-    ip4_addr_t ciaddr;
-    ip4_addr_t yiaddr;
-    ip4_addr_t siaddr;
-    ip4_addr_t giaddr;
-    uint8_t  chaddr[16];
-    uint8_t  sname[64];
-    uint8_t  file[128];
-    uint32_t magic;
-    uint8_t  options[312];
-} __packed dhcp_packet_t;
-
-void dhcp_discover(net_device_t *dev);
-void dhcp_receive(net_device_t *dev, const uint8_t *data, uint32_t len);

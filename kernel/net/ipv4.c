@@ -15,16 +15,13 @@ void ipv4_receive(net_device_t *dev, const ip4_header_t *ip, uint32_t len) {
         return;
     }
     
-    /* Is it for us? */
-    bool is_bcast = true;
-    for(int i=0; i<4; i++) if(ip->dest_ip.ip[i] != 255) is_bcast = false;
-
-    if (kmemcmp(ip->dest_ip.ip, dev->ip.ip, 4) != 0 && !is_bcast) {
-        /* If we have no IP (0.0.0.0), accept broadcast for DHCP */
-        bool no_ip = true;
-        for(int i=0; i<4; i++) if(dev->ip.ip[i] != 0) no_ip = false;
-        
-        if (!no_ip) return;
+    /* Is it for us? Accept limited broadcast too: DHCP replies arrive before
+     * the interface owns an address, so they target 255.255.255.255. */
+    bool is_broadcast = ip->dest_ip.ip[0] == 255 && ip->dest_ip.ip[1] == 255 &&
+                        ip->dest_ip.ip[2] == 255 && ip->dest_ip.ip[3] == 255;
+    if (!is_broadcast && kmemcmp(ip->dest_ip.ip, dev->ip.ip, 4) != 0) {
+        /* For now, drop packets not destined to us (no routing yet). */
+        return;
     }
     
     uint32_t payload_len = ntohs(ip->length) - header_len;
@@ -43,27 +40,10 @@ void ipv4_receive(net_device_t *dev, const ip4_header_t *ip, uint32_t len) {
     }
 }
 
-/* --- ARP Pending Queue --- */
 static uint16_t s_ip_id = 0;
-typedef struct {
-    ip4_addr_t  target_ip;
-    uint8_t     data[2048];
-    uint32_t    len;
-    net_device_t *dev;
-    bool        active;
-} arp_pending_t;
 
-#define MAX_PENDING 4
-static arp_pending_t s_pending[MAX_PENDING];
-
-void arp_flush_pending(const ip4_addr_t *resolved_ip, const mac_addr_t *resolved_mac) {
-    for (int i = 0; i < MAX_PENDING; i++) {
-        if (s_pending[i].active && kmemcmp(s_pending[i].target_ip.ip, resolved_ip->ip, 4) == 0) {
-            eth_send(s_pending[i].dev, resolved_mac, ETHERTYPE_IPv4, s_pending[i].data, s_pending[i].len);
-            s_pending[i].active = false;
-        }
-    }
-}
+/* External ARP queue function (implemented in arp.c) */
+extern void arp_queue_ipv4(net_device_t *dev, const ip4_addr_t *next_hop, const void *data, uint32_t len);
 
 void ipv4_send(net_device_t *dev, const ip4_addr_t *dest_ip, uint8_t protocol, const void *payload, uint32_t payload_len) {
     uint32_t total_len = sizeof(ip4_header_t) + payload_len;
@@ -82,11 +62,19 @@ void ipv4_send(net_device_t *dev, const ip4_addr_t *dest_ip, uint8_t protocol, c
     ip->checksum = net_checksum(ip, sizeof(ip4_header_t));
     kmemcpy(ip->payload, payload, payload_len);
 
-    /* Routing */
+    /* --- Routing ---
+     * Ha a célcím nincs az egy helyi alhálózaton, az átjárón (gateway) küldjük át.
+     * Helyi: (dest_ip & netmask) == (my_ip & netmask) */
+    bool is_limited_broadcast = dest_ip->ip[0] == 255 && dest_ip->ip[1] == 255 &&
+                                dest_ip->ip[2] == 255 && dest_ip->ip[3] == 255;
     bool is_local = true;
-    for (int i = 0; i < 4; i++) {
-        if ((dest_ip->ip[i] & dev->netmask.ip[i]) != (dev->ip.ip[i] & dev->netmask.ip[i])) {
-            is_local = false; break;
+    if (!is_limited_broadcast) {
+        for (int i = 0; i < 4; i++) {
+            if ((dest_ip->ip[i] & dev->netmask.ip[i]) !=
+                (dev->ip.ip[i]  & dev->netmask.ip[i])) {
+                is_local = false;
+                break;
+            }
         }
     }
     const ip4_addr_t *next_hop = is_local ? dest_ip : &dev->gateway;
@@ -102,17 +90,11 @@ void ipv4_send(net_device_t *dev, const ip4_addr_t *dest_ip, uint8_t protocol, c
     } else if (arp_resolve(next_hop, &dest_mac)) {
         eth_send(dev, &dest_mac, ETHERTYPE_IPv4, buffer, total_len);
     } else {
-        /* Queue packet and send ARP request */
-        for (int i = 0; i < MAX_PENDING; i++) {
-            if (!s_pending[i].active) {
-                s_pending[i].target_ip = *next_hop;
-                s_pending[i].dev = dev;
-                s_pending[i].len = total_len;
-                kmemcpy(s_pending[i].data, buffer, total_len);
-                s_pending[i].active = true;
-                break;
-            }
-        }
+        /* Nincs MAC a cache-ben: küldjünk ARP Request-et a next_hop-ra */
+        kprintf("[ipv4] ARP miss for %d.%d.%d.%d (next_hop), requesting...\n",
+                next_hop->ip[0], next_hop->ip[1],
+                next_hop->ip[2], next_hop->ip[3]);
+        arp_queue_ipv4(dev, next_hop, buffer, total_len);
         arp_request(dev, next_hop);
     }
 }

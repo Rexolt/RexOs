@@ -24,13 +24,29 @@ void net_register_device(net_device_t *dev) {
     dev->next = s_net_devices;
     s_net_devices = dev;
     
-    /* Initialize with zeros and use DHCP */
-    kmemset(dev->ip.ip, 0, 4);
-    kmemset(dev->gateway.ip, 0, 4);
-    kmemset(dev->netmask.ip, 0, 4);
-    
-    kprintf("[net] Registered device '%s'. Requesting IP via DHCP...\n", dev->name);
-    dhcp_discover(dev);
+    if (!dhcp_configure(dev)) {
+        /* Static fallback matching QEMU user-mode NAT defaults. */
+        dev->ip.ip[0] = 10;
+        dev->ip.ip[1] = 0;
+        dev->ip.ip[2] = 2;
+        dev->ip.ip[3] = 15;
+
+        dev->gateway.ip[0] = 10;
+        dev->gateway.ip[1] = 0;
+        dev->gateway.ip[2] = 2;
+        dev->gateway.ip[3] = 2;
+
+        dev->netmask.ip[0] = 255;
+        dev->netmask.ip[1] = 255;
+        dev->netmask.ip[2] = 255;
+        dev->netmask.ip[3] = 0;
+        kprintf("[net] DHCP failed, using static fallback for QEMU user NAT\n");
+    }
+
+    kprintf("[net] Registered device '%s' with IP %d.%d.%d.%d, GW %d.%d.%d.%d\n",
+            dev->name,
+            dev->ip.ip[0], dev->ip.ip[1], dev->ip.ip[2], dev->ip.ip[3],
+            dev->gateway.ip[0], dev->gateway.ip[1], dev->gateway.ip[2], dev->gateway.ip[3]);
 }
 
 net_device_t *net_get_default_dev(void) {
