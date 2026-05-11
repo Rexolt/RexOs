@@ -155,6 +155,7 @@ typedef struct net_device {
     ip4_addr_t ip;
     ip4_addr_t gateway;
     ip4_addr_t netmask;
+    ip4_addr_t dns_server;
     
     /* Küldés a kártyán keresztül */
     int (*send_frame)(struct net_device *dev, const void *data, uint32_t len);

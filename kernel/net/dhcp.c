@@ -18,6 +18,7 @@
 #define DHCP_OPT_PAD         0
 #define DHCP_OPT_SUBNET_MASK 1
 #define DHCP_OPT_ROUTER      3
+#define DHCP_OPT_DNS_SERVER  6
 #define DHCP_OPT_REQ_IP      50
 #define DHCP_OPT_MSG_TYPE    53
 #define DHCP_OPT_SERVER_ID   54
@@ -99,7 +100,7 @@ static void dhcp_send(net_device_t *dev, uint8_t msg_type, const ip4_addr_t *req
     buffer[pos++] = DHCP_OPT_PARAM_REQ; buffer[pos++] = 3;
     buffer[pos++] = DHCP_OPT_SUBNET_MASK;
     buffer[pos++] = DHCP_OPT_ROUTER;
-    buffer[pos++] = 6; /* DNS server; parsed later when resolver becomes configurable. */
+    buffer[pos++] = DHCP_OPT_DNS_SERVER;
     buffer[pos++] = DHCP_OPT_END;
 
     ip4_addr_t broadcast = { {255, 255, 255, 255} };
@@ -108,7 +109,7 @@ static void dhcp_send(net_device_t *dev, uint8_t msg_type, const ip4_addr_t *req
 
 static void dhcp_parse_options(const uint8_t *opts, uint32_t len, uint8_t *msg_type,
                                ip4_addr_t *server_id, ip4_addr_t *netmask,
-                               ip4_addr_t *gateway) {
+                               ip4_addr_t *gateway, ip4_addr_t *dns_server) {
     uint32_t pos = 0;
     while (pos < len) {
         uint8_t opt = opts[pos++];
@@ -126,6 +127,8 @@ static void dhcp_parse_options(const uint8_t *opts, uint32_t len, uint8_t *msg_t
             kmemcpy(netmask->ip, opts + pos, 4);
         } else if (opt == DHCP_OPT_ROUTER && opt_len >= 4) {
             kmemcpy(gateway->ip, opts + pos, 4);
+        } else if (opt == DHCP_OPT_DNS_SERVER && opt_len >= 4) {
+            kmemcpy(dns_server->ip, opts + pos, 4);
         }
         pos += opt_len;
     }
@@ -145,8 +148,9 @@ void dhcp_receive(net_device_t *dev, const uint8_t *data, uint32_t len, uint16_t
     ip4_addr_t server_id; ip4_zero(&server_id);
     ip4_addr_t netmask;   ip4_zero(&netmask);
     ip4_addr_t gateway;   ip4_zero(&gateway);
+    ip4_addr_t dns_server; ip4_zero(&dns_server);
     dhcp_parse_options(pkt->options, len - sizeof(dhcp_packet_t), &msg_type,
-                       &server_id, &netmask, &gateway);
+                       &server_id, &netmask, &gateway, &dns_server);
 
     if (msg_type == DHCPOFFER) {
         s_offered_ip = pkt->yiaddr;
@@ -158,17 +162,20 @@ void dhcp_receive(net_device_t *dev, const uint8_t *data, uint32_t len, uint16_t
         dev->ip = pkt->yiaddr;
         if (!ip4_is_zero(&netmask)) dev->netmask = netmask;
         if (!ip4_is_zero(&gateway)) dev->gateway = gateway;
+        if (!ip4_is_zero(&dns_server)) dev->dns_server = dns_server;
         s_ack_seen = true;
-        kprintf("[dhcp] ACK IP %d.%d.%d.%d GW %d.%d.%d.%d MASK %d.%d.%d.%d\n",
+        kprintf("[dhcp] ACK IP %d.%d.%d.%d GW %d.%d.%d.%d MASK %d.%d.%d.%d DNS %d.%d.%d.%d\n",
                 dev->ip.ip[0], dev->ip.ip[1], dev->ip.ip[2], dev->ip.ip[3],
                 dev->gateway.ip[0], dev->gateway.ip[1], dev->gateway.ip[2], dev->gateway.ip[3],
-                dev->netmask.ip[0], dev->netmask.ip[1], dev->netmask.ip[2], dev->netmask.ip[3]);
+                dev->netmask.ip[0], dev->netmask.ip[1], dev->netmask.ip[2], dev->netmask.ip[3],
+                dev->dns_server.ip[0], dev->dns_server.ip[1], dev->dns_server.ip[2], dev->dns_server.ip[3]);
     }
 }
 
 bool dhcp_configure(net_device_t *dev) {
     ip4_zero(&dev->ip);
     ip4_zero(&dev->gateway);
+    ip4_zero(&dev->dns_server);
     dev->netmask.ip[0] = 255; dev->netmask.ip[1] = 255; dev->netmask.ip[2] = 255; dev->netmask.ip[3] = 0;
 
     for (int attempt = 0; attempt < 3; attempt++) {

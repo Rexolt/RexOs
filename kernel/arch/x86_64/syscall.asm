@@ -46,8 +46,14 @@ syscall_entry:
     mov rcx, [rsp + 24] ; arg3 (saved RDX)
     mov r8,  [rsp + 16] ; arg4 (saved R10)
     mov r9,  [rsp + 8]  ; arg5 (saved R8)
-    
+
+    ; Syscall entry masked IF while we were still on the user stack.
+    ; Now that the user RSP/RIP/RFLAGS and arguments are saved on this
+    ; task's kernel stack, interrupts must be enabled again so blocking
+    ; network syscalls can receive PIT/e1000 IRQs and actually time out.
+    sti
     call syscall_handler
+    cli
     
     pop r9
     pop r8
