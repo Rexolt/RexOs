@@ -27,25 +27,30 @@
 #define TITLE_H        24
 #define BORDER         1
 
-#define COLOR_BG_TOP      0x101020
-#define COLOR_BG_BOT      0x303060
-#define COLOR_TASKBAR     0x1A1A2E
-#define COLOR_TASKBAR_SEP 0x3A3A5E
-#define COLOR_ACCENT      0xE94560
-#define COLOR_ACCENT_DIM  0x6B1F2A
-#define COLOR_WIN_BG      0x1E1E2E
-#define COLOR_WIN_TITLE   0x2B2B40
-#define COLOR_WIN_TITLE_A 0x3D4D8A   /* active */
-#define COLOR_TEXT        0xE6E6F0
-#define COLOR_TEXT_DIM    0x9F9FB8
-#define COLOR_FRAME       0x4A4A6E
-#define COLOR_BUTTON      0x3E3E58
-#define COLOR_BUTTON_HOV  0x55557A
-#define COLOR_FIELD       0x14141F
-#define COLOR_FOLDER      0xFFC857
-#define COLOR_FILE        0x6FB1E8
-#define COLOR_EXE         0x7BD389
-#define COLOR_TXT         0xD8AEFF
+/* === Modern Dark Mode paletta (Slate/Violet) ============================= */
+#define COLOR_BG_TOP      0x060B14  /* Mélykék háttér teteje */
+#define COLOR_BG_BOT      0x0F1A2E  /* Mélykék háttér alja */
+#define COLOR_TASKBAR     0x080E1C  /* Szinte fekete tálca */
+#define COLOR_TASKBAR_SEP 0x1E2D45  /* Elválasztó vonal */
+#define COLOR_ACCENT      0x7C3AED  /* Violet lila */
+#define COLOR_ACCENT_HOV  0x8B5CF6  /* Hover lila (világosabb) */
+#define COLOR_ACCENT_DIM  0x3B1F6A  /* Sötétebb lila */
+#define COLOR_WIN_BG      0x111827  /* Ablak háttér */
+#define COLOR_WIN_TITLE   0x1A2438  /* Inaktív titlebar */
+#define COLOR_WIN_TITLE_A 0x1E3A5F  /* Aktív titlebar */
+#define COLOR_WIN_TITLE_A2 0x0F2444 /* Aktív titlebar gradient alja */
+#define COLOR_TEXT        0xF1F5F9  /* Kellemes off-white szöveg */
+#define COLOR_TEXT_DIM    0x64748B  /* Halványabb szöveg */
+#define COLOR_FRAME       0x1E3050  /* Ablak keret */
+#define COLOR_FRAME_A     0x3B5BDB  /* Aktív keret (kék) */
+#define COLOR_BUTTON      0x1E293B  /* Gomb alap */
+#define COLOR_BUTTON_HOV  0x334155  /* Gomb hover */
+#define COLOR_FIELD       0x0A1020  /* Input mező */
+#define COLOR_FOLDER      0xFBBF24  /* Amber sárga */
+#define COLOR_FILE        0x60A5FA  /* Kék fájl */
+#define COLOR_EXE         0x34D399  /* Smaragdzöld futtatható */
+#define COLOR_TXT         0xC084FC  /* Lila szöveg */
+#define COLOR_SHADOW      0x000000  /* Árnyék alap */
 
 static uint32_t *fb;
 static uint64_t scr_w, scr_h, pitch;
@@ -141,27 +146,296 @@ static void bb_frame(int x, int y, int w, int h, uint32_t c) {
     bb_vline(x + w - 1, y, h, c);
 }
 
-/* Gradient háttér */
-static void bb_draw_wallpaper(uint64_t tick) {
-    (void)tick;
+/* Háttérkép puffer (deklarálás az összes wallpaper-függvény előtt) */
+static uint32_t *g_wallpaper_buf  = NULL;
+static int       g_wallpaper_ok   = 0;
+
+/* Procedurális háttér az g_wallpaper_buf-ba rajzol (csak egyszer hívják). */
+static void wallpaper_render_procedural(void) {
+    /* Kétszínű mélykék vertikális gradiens */
     for (uint32_t y = 0; y < scr_h; y++) {
-        uint8_t r = 16  + (y * 32) / scr_h;
-        uint8_t g = 24  + (y * 56) / scr_h;
-        uint8_t b = 56  + (y * 80) / scr_h;
-        uint32_t c = ((uint32_t)r << 16) | ((uint32_t)g << 8) | b;
-        uint32_t *row = backbuf + (uint64_t)y * scr_w;
+        uint8_t t = (uint8_t)(y * 255 / scr_h);
+        uint32_t r = (uint8_t)(((uint32_t)6  * (255 - t) + (uint32_t)15  * t) / 255);
+        uint32_t g_ch=(uint8_t)(((uint32_t)11 * (255 - t) + (uint32_t)26  * t) / 255);
+        uint32_t b = (uint8_t)(((uint32_t)20 * (255 - t) + (uint32_t)46  * t) / 255);
+        uint32_t c = (r << 16) | (g_ch << 8) | b;
+        uint32_t *row = g_wallpaper_buf + (uint64_t)y * scr_w;
         for (uint32_t x = 0; x < scr_w; x++) row[x] = c;
     }
-    /* "csillagok" - random pontok */
+    /* Halvány csillagok (véletlenszerű pozíciók) */
     static const uint16_t starpos[] = {
-        137, 412, 891, 1023, 234, 567, 778, 1145, 99, 1199, 333, 890,
-        201, 645, 1011, 1230, 178, 456, 723, 999, 1067, 88, 444, 822
+        137,412,891,1023,234,567,778,1145,99,333,890,201,645,1011,
+        178,456,723,999,1067,88,444,822,512,703,169,938,275,1188,61,849
     };
     for (uint32_t i = 0; i < sizeof(starpos)/sizeof(starpos[0]); i++) {
-        uint32_t x = starpos[i] % scr_w;
-        uint32_t y = (starpos[i] * 7 + 13) % (scr_h - TASKBAR_H);
-        put_bb(x, y, 0xCCCCFF);
+        uint32_t sx = starpos[i] % scr_w;
+        uint32_t sy = (starpos[i] * 7 + 13) % (scr_h > TASKBAR_H ? scr_h - TASKBAR_H : 1);
+        uint8_t br = 40 + (uint8_t)((starpos[i] * 3) % 80);
+        g_wallpaper_buf[sy * scr_w + sx] = ((uint32_t)br << 16) | ((uint32_t)br << 8) | (uint32_t)(br + 30);
     }
+    /* Halvány kékeslila vinjett a sarokba (inline blend, alpha_blend nélkül) */
+    for (uint32_t vy = 0; vy < scr_h / 3; vy++) {
+        for (uint32_t vx = 0; vx < scr_w / 4; vx++) {
+            uint32_t d = vx * vx / 4 + vy * vy / 2;
+            if (d < 30000) {
+                uint32_t a2 = (30000u - d) * 30u / 30000u;
+                uint32_t *ppx = g_wallpaper_buf + vy * scr_w + vx;
+                uint32_t fg = 0x4C1D95u, bg = *ppx, ia = 255u - a2;
+                uint32_t rb = (((fg & 0xFF00FFu) * a2 + (bg & 0xFF00FFu) * ia) >> 8) & 0xFF00FFu;
+                uint32_t gv = (((fg & 0x00FF00u) * a2 + (bg & 0x00FF00u) * ia) >> 8) & 0x00FF00u;
+                *ppx = rb | gv;
+            }
+        }
+    }
+}
+
+/* Háttér másolása a backbufba (minden frame elején). */
+static void bb_draw_wallpaper(uint64_t tick) {
+    (void)tick;
+    if (!g_wallpaper_buf) return;
+    uint64_t bytes = (uint64_t)scr_w * scr_h * 4;
+    uint8_t *dst = (uint8_t *)backbuf;
+    uint8_t *src = (uint8_t *)g_wallpaper_buf;
+    /* Gyors másolás 8-bájtos blokkokban */
+    uint64_t words = bytes / 8;
+    uint64_t *d64 = (uint64_t *)dst, *s64 = (uint64_t *)src;
+    for (uint64_t i = 0; i < words; i++) d64[i] = s64[i];
+}
+
+/* ============================================================================
+ *  MODERN GRAFIKUS PRIMITÍVEK
+ * ========================================================================== */
+
+/* Forward declaration (definíció lejjebb van) */
+static void flush_rect(int x, int y, int w, int h);
+
+/* --- Alpha blending ------------------------------------------------------ */
+
+/* Gyors alpha blend: fg-t a=0..255 opacitással kever bg-re.
+ * A két csatorna (RB és G) egyszerre kezelhető 32-bit szélességű trükkel. */
+static inline uint32_t alpha_blend(uint32_t fg, uint32_t bg, uint8_t a) {
+    uint32_t ia = 255u - a;
+    uint32_t rb = (((fg & 0xFF00FFu) * a + (bg & 0xFF00FFu) * ia) >> 8) & 0xFF00FFu;
+    uint32_t g  = (((fg & 0x00FF00u) * a + (bg & 0x00FF00u) * ia) >> 8) & 0x00FF00u;
+    return rb | g;
+}
+
+/* Alpha-blendelt téglalapkitöltés a back bufferbe.
+ * alpha=255 teljesen átlátszatlan, alpha=0 láthatatlan. */
+static void bb_fill_rect_alpha(int x, int y, int w, int h, uint32_t color, uint8_t alpha) {
+    if (alpha == 255) { bb_fill_rect(x, y, w, h, color); return; }
+    if (alpha == 0) return;
+    if (x < 0) { w += x; x = 0; }
+    if (y < 0) { h += y; y = 0; }
+    if (x + w > (int)scr_w) w = (int)scr_w - x;
+    if (y + h > (int)scr_h) h = (int)scr_h - y;
+    if (w <= 0 || h <= 0) return;
+    for (int dy = 0; dy < h; dy++) {
+        uint32_t *row = backbuf + (uint64_t)(y + dy) * scr_w;
+        for (int dx = 0; dx < w; dx++) {
+            row[x + dx] = alpha_blend(color, row[x + dx], alpha);
+        }
+    }
+}
+
+/* --- Lekerekített sarkok ------------------------------------------------- */
+
+/* Egypixeles lekerekítési maszk: az adott sarokhoz tartozó pixelt beleteszi,
+ * ha belül van a köríven. */
+static void bb_fill_rounded_rect(int x, int y, int w, int h, int r, uint32_t c) {
+    if (r <= 0 || w <= 0 || h <= 0) { bb_fill_rect(x, y, w, h, c); return; }
+    if (r > w / 2) r = w / 2;
+    if (r > h / 2) r = h / 2;
+
+    /* Középső vízszintes sáv (teljes) */
+    bb_fill_rect(x, y + r, w, h - 2 * r, c);
+    /* Felső és alsó vízszintes sáv (sarkok nélkül) */
+    bb_fill_rect(x + r, y,         w - 2 * r, r, c);
+    bb_fill_rect(x + r, y + h - r, w - 2 * r, r, c);
+
+    /* 4 sarok: körív alapú pixelezés */
+    for (int dy = 0; dy < r; dy++) {
+        for (int dx = 0; dx < r; dx++) {
+            int ndx = r - 1 - dx;
+            int ndy = r - 1 - dy;
+            int dist2 = ndx * ndx + ndy * ndy;
+            if (dist2 <= r * r) {
+                put_bb(x + dx,           y + dy,           c); /* bal-felső */
+                put_bb(x + w - 1 - dx,   y + dy,           c); /* jobb-felső */
+                put_bb(x + dx,           y + h - 1 - dy,   c); /* bal-alsó */
+                put_bb(x + w - 1 - dx,   y + h - 1 - dy,   c); /* jobb-alsó */
+            }
+        }
+    }
+}
+
+static void bb_fill_rounded_rect_alpha(int x, int y, int w, int h, int r, uint32_t c, uint8_t a) {
+    if (a == 255) { bb_fill_rounded_rect(x, y, w, h, r, c); return; }
+    if (a == 0 || w <= 0 || h <= 0) return;
+    if (r <= 0) { bb_fill_rect_alpha(x, y, w, h, c, a); return; }
+    if (r > w / 2) r = w / 2;
+    if (r > h / 2) r = h / 2;
+
+    bb_fill_rect_alpha(x,     y + r, w,         h - 2 * r, c, a);
+    bb_fill_rect_alpha(x + r, y,     w - 2 * r, r,         c, a);
+    bb_fill_rect_alpha(x + r, y + h - r, w - 2 * r, r,     c, a);
+
+    for (int dy = 0; dy < r; dy++) {
+        for (int dx = 0; dx < r; dx++) {
+            int ndx = r - 1 - dx, ndy = r - 1 - dy;
+            if (ndx * ndx + ndy * ndy <= r * r) {
+                int bx, by;
+                /* bal-felső */ bx = x + dx; by = y + dy;
+                if (bx < (int)scr_w && by < (int)scr_h && bx >= 0 && by >= 0)
+                    backbuf[by * scr_w + bx] = alpha_blend(c, backbuf[by * scr_w + bx], a);
+                /* jobb-felső */ bx = x + w - 1 - dx;
+                if (bx < (int)scr_w && bx >= 0)
+                    backbuf[by * scr_w + bx] = alpha_blend(c, backbuf[by * scr_w + bx], a);
+                /* bal-alsó */ bx = x + dx; by = y + h - 1 - dy;
+                if (bx < (int)scr_w && by < (int)scr_h && bx >= 0 && by >= 0)
+                    backbuf[by * scr_w + bx] = alpha_blend(c, backbuf[by * scr_w + bx], a);
+                /* jobb-alsó */ bx = x + w - 1 - dx;
+                if (bx < (int)scr_w && by < (int)scr_h && bx >= 0)
+                    backbuf[by * scr_w + bx] = alpha_blend(c, backbuf[by * scr_w + bx], a);
+            }
+        }
+    }
+}
+
+/* --- Lineáris gradiens (vertical) --------------------------------------- */
+
+static void bb_fill_gradient_v(int x, int y, int w, int h, uint32_t c1, uint32_t c2) {
+    if (w <= 0 || h <= 0) return;
+    if (x < 0) { w += x; x = 0; }
+    if (y < 0) { h += y; y = 0; }
+    if (x + w > (int)scr_w) w = (int)scr_w - x;
+    if (y + h > (int)scr_h) h = (int)scr_h - y;
+    if (w <= 0 || h <= 0) return;
+    for (int dy = 0; dy < h; dy++) {
+        uint8_t t = (h > 1) ? (uint8_t)(dy * 255 / (h - 1)) : 0;
+        uint32_t c = alpha_blend(c2, c1, t);  /* c1 a tetején, c2 alul */
+        uint32_t *row = backbuf + (uint64_t)(y + dy) * scr_w;
+        for (int dx = 0; dx < w; dx++) row[x + dx] = c;
+    }
+}
+
+/* --- Drop shadow (könnyű, 3 rétegű) ------------------------------------- */
+
+/* Hatékony "slot" árnyék: csak a jobb és alsó élt rajzolja meg,
+ * 3 rétegben csökkenő átlátszósággal. */
+static void bb_draw_shadow(int x, int y, int w, int h) {
+    bb_fill_rect_alpha(x + w,     y + 4, 4, h,     COLOR_SHADOW, 90);
+    bb_fill_rect_alpha(x + 4, y + h,     w, 4,     COLOR_SHADOW, 90);
+    bb_fill_rect_alpha(x + w + 1, y + 5, 2, h - 2, COLOR_SHADOW, 50);
+    bb_fill_rect_alpha(x + 5, y + h + 1, w - 2, 2, COLOR_SHADOW, 50);
+}
+
+/* --- Dirty rectangle rendszer ------------------------------------------- */
+
+static int g_dirty_x1 = 0, g_dirty_y1 = 0;
+static int g_dirty_x2 = 0, g_dirty_y2 = 0;
+
+static void dirty_reset(void) {
+    g_dirty_x1 = (int)scr_w;
+    g_dirty_y1 = (int)scr_h;
+    g_dirty_x2 = 0;
+    g_dirty_y2 = 0;
+}
+
+static void dirty_mark(int x, int y, int w, int h) {
+    int x2 = x + w, y2 = y + h;
+    if (x  < g_dirty_x1) g_dirty_x1 = x;
+    if (y  < g_dirty_y1) g_dirty_y1 = y;
+    if (x2 > g_dirty_x2) g_dirty_x2 = x2;
+    if (y2 > g_dirty_y2) g_dirty_y2 = y2;
+}
+
+static void dirty_flush(void) {
+    if (g_dirty_x1 >= g_dirty_x2 || g_dirty_y1 >= g_dirty_y2) return;
+    int cx = g_dirty_x1 < 0 ? 0 : g_dirty_x1;
+    int cy = g_dirty_y1 < 0 ? 0 : g_dirty_y1;
+    int cx2 = g_dirty_x2 > (int)scr_w ? (int)scr_w : g_dirty_x2;
+    int cy2 = g_dirty_y2 > (int)scr_h ? (int)scr_h : g_dirty_y2;
+    flush_rect(cx, cy, cx2 - cx, cy2 - cy);
+}
+
+/* --- BMP háttérkép betöltő (24/32bpp) ----------------------------------- */
+
+/* BMP beolvasása és scaler a wallpaper_buf-ba. */
+static uint32_t bmp_row_stride(int bpp, int width) {
+    return (uint32_t)(((bpp * width + 31) / 32) * 4);
+}
+
+static void load_bmp_wallpaper(const char *path) {
+    int fd = open(path);
+    if (fd < 0) return;
+
+    /* BMP fejléc: minimum 54 byte */
+    uint8_t hdr[54];
+    if (read(fd, hdr, 54) != 54) { close(fd); return; }
+    if (hdr[0] != 'B' || hdr[1] != 'M') { close(fd); return; }
+
+    uint32_t px_off  = (uint32_t)(hdr[10] | (hdr[11]<<8) | (hdr[12]<<16) | (hdr[13]<<24));
+    int32_t  bmp_w   = (int32_t)(hdr[18] | (hdr[19]<<8) | (hdr[20]<<16) | (hdr[21]<<24));
+    int32_t  bmp_h   = (int32_t)(hdr[22] | (hdr[23]<<8) | (hdr[24]<<16) | (hdr[25]<<24));
+    uint16_t bpp     = (uint16_t)(hdr[28] | (hdr[29]<<8));
+
+    if ((bpp != 24 && bpp != 32) || bmp_w <= 0) { close(fd); return; }
+
+    int top_down = 0;
+    if (bmp_h < 0) { bmp_h = -bmp_h; top_down = 1; }
+    if (bmp_w == 0 || bmp_h == 0) { close(fd); return; }
+
+    uint32_t stride = bmp_row_stride(bpp, bmp_w);
+    uint32_t img_bytes = stride * (uint32_t)bmp_h;
+
+    uint8_t *raw = (uint8_t *)malloc(img_bytes);
+    if (!raw) { close(fd); return; }
+
+    /* Seek to pixel data: pozícionálás (seek syscall) */
+    seek(fd, px_off);
+    /* Olvassuk be a pixel adatokat blokkokban */
+    uint32_t total = 0;
+    while (total < img_bytes) {
+        uint32_t chunk = img_bytes - total;
+        if (chunk > 4096) chunk = 4096;
+        int r = read(fd, (char *)raw + total, chunk);
+        if (r <= 0) break;
+        total += (uint32_t)r;
+    }
+    close(fd);
+    if (total < img_bytes) { free(raw); return; }
+
+    /* Allokálás ha nincs még */
+    if (!g_wallpaper_buf) {
+        g_wallpaper_buf = (uint32_t *)malloc(scr_w * scr_h * 4);
+        if (!g_wallpaper_buf) { free(raw); return; }
+    }
+
+    /* Nearest-neighbor méretezés a képernyőre */
+    for (uint32_t sy = 0; sy < scr_h; sy++) {
+        int src_y = (int)((uint64_t)sy * (uint32_t)bmp_h / scr_h);
+        /* BMP alapból alulról felfelé tárol (ha top_down=0) */
+        int real_y = top_down ? src_y : (bmp_h - 1 - src_y);
+        const uint8_t *src_row = raw + (uint64_t)real_y * stride;
+
+        uint32_t *dst_row = g_wallpaper_buf + sy * scr_w;
+        for (uint32_t sx = 0; sx < scr_w; sx++) {
+            int src_x = (int)((uint64_t)sx * (uint32_t)bmp_w / scr_w);
+            const uint8_t *px;
+            if (bpp == 24) {
+                px = src_row + src_x * 3;
+                /* BMP: BGR sorrendben tárolja! */
+                dst_row[sx] = ((uint32_t)px[2] << 16) | ((uint32_t)px[1] << 8) | px[0];
+            } else {
+                px = src_row + src_x * 4;
+                dst_row[sx] = ((uint32_t)px[2] << 16) | ((uint32_t)px[1] << 8) | px[0];
+            }
+        }
+    }
+
+    free(raw);
+    g_wallpaper_ok = 1;
 }
 
 /* --- Front buffer flush ------------------------------------------------- */
@@ -179,8 +453,6 @@ static void flush_rect(int x, int y, int w, int h) {
         for (int dx = 0; dx < w; dx++) dst[dx] = src[dx];
     }
 }
-
-static void flush_all(void) { flush_rect(0, 0, (int)scr_w, (int)scr_h); }
 
 /* --- Egér kurzor (közvetlen FB-re rajzol az utolsó lépésben) ------------- */
 
@@ -288,12 +560,38 @@ static int      g_focus = -1;
 static int g_drag_idx = -1;
 static int g_drag_dx, g_drag_dy;
 
+/* Ikon hover animáció: per-ikon fényesség (0..220), lassú fade */
+static uint8_t g_icon_hover_alpha[16]; /* max DT_ICON_COUNT */
+#define HOVER_FADE_IN  35
+#define HOVER_FADE_OUT 25
+#define HOVER_MAX      200
+
 /* Mouse edge-detection */
 static uint32_t g_prev_btn = 0;
 static uint32_t g_prev_mx  = 0, g_prev_my = 0;
 
 /* Start menu állapot */
 static int g_start_menu_open = 0;
+
+/* Leállítás kérés flag */
+static int g_shutdown_requested = 0;
+
+/* --- Power ikon pixel-art rajzolás (9×10 px) ---------------------------- */
+static void bb_power_icon(int ox, int oy, uint32_t c) {
+    /* Körív (felső rés nélkül) */
+    put_bb(ox+1,oy+3,c); put_bb(ox+7,oy+3,c);
+    put_bb(ox+0,oy+4,c); put_bb(ox+8,oy+4,c);
+    put_bb(ox+0,oy+5,c); put_bb(ox+8,oy+5,c);
+    put_bb(ox+0,oy+6,c); put_bb(ox+8,oy+6,c);
+    put_bb(ox+1,oy+7,c); put_bb(ox+7,oy+7,c);
+    put_bb(ox+2,oy+8,c); put_bb(ox+3,oy+8,c);
+    put_bb(ox+4,oy+8,c); put_bb(ox+5,oy+8,c); put_bb(ox+6,oy+8,c);
+    put_bb(ox+2,oy+2,c); put_bb(ox+6,oy+2,c);
+    /* Függőleges vonal felülről */
+    put_bb(ox+4,oy+0,c); put_bb(ox+4,oy+1,c);
+    put_bb(ox+4,oy+2,c); put_bb(ox+4,oy+3,c);
+    put_bb(ox+4,oy+4,c);
+}
 
 /* --- Window kezelők ----------------------------------------------------- */
 
@@ -306,30 +604,42 @@ static window_t *window_find_by_app(app_kind_t app) {
 
 static int window_new(app_kind_t app, const char *title, int w, int h,
                       draw_fn dr, event_fn ev, key_fn ky) {
-    /* Ha már nyitva van ilyen app, csak fokuszáljuk */
+    /* Singleton: ha már nyitva van ugyanez az app, csak fokuszáljuk. */
     for (int i = 0; i < g_window_count; i++) {
         if (g_windows[i].open && g_windows[i].app == app) {
             g_focus = i;
             return i;
         }
     }
-    if (g_window_count >= MAX_WINDOWS) return -1;
-    int i = g_window_count++;
-    window_t *win = &g_windows[i];
+
+    /* Slotkeresés: először zárt (újrahasznosítható) slotot keresünk,
+     * hogy ne nőjön a g_window_count a végtelenségig. */
+    int slot = -1;
+    for (int i = 0; i < g_window_count; i++) {
+        if (!g_windows[i].open) { slot = i; break; }
+    }
+    if (slot < 0) {
+        /* Nincs szabad zárt slot: bővítjük a tömböt. */
+        if (g_window_count >= MAX_WINDOWS) return -1;
+        slot = g_window_count++;
+    }
+
+    window_t *win = &g_windows[slot];
     win->open = 1;
-    win->app = app;
+    win->app  = app;
     win->w = w; win->h = h;
-    /* Pozíció: kaszkád */
-    win->x = 60 + (i * 32) % 300;
-    win->y = 50 + (i * 28) % 200;
+    /* Kaszkád pozíció az aktív ablakok száma alapján */
+    int active = 0;
+    for (int i = 0; i < g_window_count; i++) if (g_windows[i].open) active++;
+    win->x = 60 + (active * 28) % 280;
+    win->y = 44 + (active * 24) % 180;
     win->draw = dr; win->click = ev; win->key = ky;
     int j = 0;
     while (title[j] && j < 47) { win->title[j] = title[j]; j++; }
     win->title[j] = 0;
-    /* Priv inicializálás 0-ra */
     for (int k = 0; k < APP_PRIV_SIZE; k++) win->priv[k] = 0;
-    g_focus = i;
-    return i;
+    g_focus = slot;
+    return slot;
 }
 
 static void window_close(int idx) {
@@ -349,9 +659,10 @@ static int window_hit_titlebar(window_t *w, int mx, int my) {
 }
 
 static int window_hit_close(window_t *w, int mx, int my) {
-    int bx = w->x + w->w - 20;
-    int by = w->y + 4;
-    return (mx >= bx && mx < bx + 16 && my >= by && my < by + 16);
+    /* draw_window_frame: bb_fill_rounded_rect(x+w-22, y+5, 17, 15, ...) */
+    int bx = w->x + w->w - 22;
+    int by = w->y + 5;
+    return (mx >= bx && mx < bx + 17 && my >= by && my < by + 15);
 }
 
 static int window_hit_client(window_t *w, int mx, int my) {
@@ -360,20 +671,47 @@ static int window_hit_client(window_t *w, int mx, int my) {
 }
 
 static void draw_window_frame(window_t *win, int focused) {
-    /* Árnyék */
-    bb_fill_rect(win->x + 3, win->y + 3, win->w, win->h, 0x000010);
-    /* Háttér */
-    bb_fill_rect(win->x, win->y, win->w, win->h, COLOR_WIN_BG);
-    /* Címsor */
-    uint32_t titlebar = focused ? COLOR_WIN_TITLE_A : COLOR_WIN_TITLE;
-    bb_fill_rect(win->x, win->y, win->w, TITLE_H, titlebar);
-    bb_draw_text(win->x + 8, win->y + 6, win->title, COLOR_TEXT, 2);
-    /* Bezáró gomb (x) */
-    bb_fill_rect(win->x + win->w - 20, win->y + 4, 16, 16, COLOR_ACCENT);
-    bb_draw_text(win->x + win->w - 17, win->y + 6, "x", 0xFFFFFF, 2);
-    /* Keret */
-    bb_frame(win->x, win->y, win->w, win->h, COLOR_FRAME);
-    bb_hline(win->x, win->y + TITLE_H, win->w, COLOR_FRAME);
+    int x = win->x, y = win->y, w = win->w, h = win->h;
+    int r = 8; /* lekerekítési sugár */
+
+    /* Dirty mark: az egész ablak területe + árnyék */
+    dirty_mark(x, y, w + 6, h + 6);
+
+    /* Árnyék (vékony, jobb és alsó él) */
+    bb_draw_shadow(x, y, w, h);
+
+    /* Ablak háttér: lekerekített sarokkal */
+    bb_fill_rounded_rect(x, y, w, h, r, COLOR_WIN_BG);
+
+    /* Titlebar: gradiens (aktív = kék, inaktív = sötétszürke) */
+    if (focused) {
+        bb_fill_gradient_v(x, y, w, TITLE_H, COLOR_WIN_TITLE_A, COLOR_WIN_TITLE_A2);
+    } else {
+        bb_fill_rounded_rect(x, y, w, TITLE_H, r, COLOR_WIN_TITLE);
+        /* Kiegészítés: az alsó sarkok ne legyenek lekerekítve (titlebar közép) */
+        bb_fill_rect(x, y + r, w, TITLE_H - r, COLOR_WIN_TITLE);
+    }
+
+    /* Titlebar szöveg */
+    int tlen = sstrlen(win->title);
+    (void)tlen;
+    bb_draw_text(x + 12, y + 7, win->title, COLOR_TEXT, 2);
+
+    /* Bezáró gomb: lekerekített piros pill */
+    int bx = x + w - 22, by = y + 5;
+    bb_fill_rounded_rect(bx, by, 17, 15, 7, COLOR_ACCENT);
+    bb_draw_text(bx + 5, by + 4, "x", 0xFFFFFF, 1);
+
+    /* Elválasztó vonal titlebar alatt */
+    bb_hline(x, y + TITLE_H, w, focused ? COLOR_FRAME_A : COLOR_FRAME);
+
+    /* Ablak keret (1px) */
+    uint32_t frame_c = focused ? COLOR_FRAME_A : COLOR_FRAME;
+    /* Csak 4 oldal, lekerekített saroknál a keret a kör köré kerül - egyszerűsítve: */
+    bb_hline(x + r, y,         w - 2 * r, frame_c);
+    bb_hline(x + r, y + h - 1, w - 2 * r, frame_c);
+    bb_vline(x,         y + r, h - 2 * r, frame_c);
+    bb_vline(x + w - 1, y + r, h - 2 * r, frame_c);
 }
 
 /* --- VFS olvasó segéd: egy fájl tartalmát kmalloc-olt bufferbe olvassa --- */
@@ -1240,7 +1578,7 @@ static void app_editor_draw(window_t *w) {
     int sy = w->y + w->h - 18;
     bb_fill_rect(w->x + 1, sy, w->w - 2, 17, 0x12121A);
     char st[64];
-    sstrcpy(st, s->insert_mode ? "INSERT MODE | press ESC to exit" : "COMMAND MODE | w/a/s/d move, i insert");
+    sstrcpy(st, s->insert_mode ? "INSERT MODE | press ESC to exit" : "COMMAND MODE | w/a/s/d move, i insert, m save");
     bb_draw_text(w->x + 8, sy + 5, st, COLOR_TEXT_DIM, 1);
 }
 
@@ -1279,6 +1617,13 @@ static void app_editor_key(window_t *w, char c) {
         }
         if (c == 'k') s->scroll = (s->scroll > 0) ? s->scroll - 1 : 0;
         if (c == 'j') s->scroll++;
+        if (c == 'm') {
+            int fd = open_ex(s->path, O_RDWR | O_CREAT);
+            if (fd >= 0) {
+                write_file(fd, s->content, len);
+                close(fd);
+            }
+        }
     } else {
         if (c == '\b') {
             if (s->cursor > 0) {
@@ -1622,14 +1967,42 @@ static void draw_desktop_icons(int hover_idx) {
     for (int i = 0; i < DT_ICON_COUNT; i++) {
         int ix, iy;
         desktop_icon_pos(i, &ix, &iy);
-        uint32_t bg = (i == hover_idx) ? 0x303060 : 0;
-        if (bg) bb_fill_rect(ix - 4, iy - 4, DT_ICON_W + 8, DT_ICON_H + 8, bg);
-        bb_fill_rect(ix + 24, iy, 32, 32, g_dt_icons[i].color);
-        bb_frame(ix + 24, iy, 32, 32, 0x101020);
+
+        /* Hover animáció: alpha lassan közelít a célértékhez */
+        uint8_t target = (i == hover_idx) ? HOVER_MAX : 0;
+        if (g_icon_hover_alpha[i] < target) {
+            int v = (int)g_icon_hover_alpha[i] + HOVER_FADE_IN;
+            g_icon_hover_alpha[i] = (v > target) ? target : (uint8_t)v;
+        } else if (g_icon_hover_alpha[i] > target) {
+            int v = (int)g_icon_hover_alpha[i] - HOVER_FADE_OUT;
+            g_icon_hover_alpha[i] = (v < 0) ? 0 : (uint8_t)v;
+        }
+
+        /* Ha valamelyik ikon animálódik, dirty-nek jelöljük */
+        if (g_icon_hover_alpha[i] > 0) {
+            dirty_mark(ix - 6, iy - 6, DT_ICON_W + 12, DT_ICON_H + 12);
+        }
+
+        /* Hover háttér: lekerekített, semi-transparent */
+        if (g_icon_hover_alpha[i] > 0) {
+            bb_fill_rounded_rect_alpha(ix - 4, iy - 4,
+                                       DT_ICON_W + 8, DT_ICON_H + 8,
+                                       8, 0x312E81, g_icon_hover_alpha[i]);
+        }
+
+        /* Ikon szimbólum: lekerekített négyzetben */
+        uint32_t ic = g_dt_icons[i].color;
+        bb_fill_rounded_rect(ix + 20, iy + 4, 36, 36, 6, 0x1E293B);
+        /* Kis fény az ikon tetején */
+        bb_fill_rect_alpha(ix + 21, iy + 5, 34, 8, 0xFFFFFF, 15);
+        bb_fill_rounded_rect(ix + 24, iy + 8, 28, 28, 4, ic);
+
+        /* Felirat: árnyékkal */
         int tlen = sstrlen(g_dt_icons[i].label);
-        int tw = tlen * 6 - 1;
-        bb_draw_text(ix + (DT_ICON_W - tw) / 2, iy + 40, g_dt_icons[i].label,
-                     COLOR_TEXT, 1);
+        int tw = tlen * 6;
+        int tx = ix + (DT_ICON_W - tw) / 2;
+        bb_draw_text(tx + 1, iy + 47, g_dt_icons[i].label, 0x000000, 1); /* árnyék */
+        bb_draw_text(tx,     iy + 46, g_dt_icons[i].label, COLOR_TEXT, 1);
     }
 }
 
@@ -1701,37 +2074,60 @@ static void launch_app(app_kind_t app) {
 
 static void draw_taskbar(uint64_t ticks, int mx, int my) {
     int ty = (int)scr_h - TASKBAR_H;
-    bb_fill_rect(0, ty, (int)scr_w, TASKBAR_H, COLOR_TASKBAR);
-    bb_hline(0, ty, (int)scr_w, COLOR_TASKBAR_SEP);
 
-    /* Start gomb */
-    int start_x = 6, start_y = ty + 4;
-    int start_w = 80, start_h = TASKBAR_H - 8;
+    /* Dirty rect: a teljes tálca sáv */
+    dirty_mark(0, ty - 1, (int)scr_w, TASKBAR_H + 1);
+
+    /* Glassmorphism alap: semi-transparent sötét réteg */
+    bb_fill_rect_alpha(0, ty, (int)scr_w, TASKBAR_H, 0x040A14, 220);
+    /* Felső elválasztó vonal (kékeslila glow) */
+    bb_fill_rect_alpha(0, ty, (int)scr_w, 1, COLOR_ACCENT, 80);
+    bb_fill_rect_alpha(0, ty + 1, (int)scr_w, 1, COLOR_ACCENT, 30);
+
+    /* Start gomb: lekerekített pill */
+    int start_x = 6, start_y = ty + 5;
+    int start_w = 80, start_h = TASKBAR_H - 10;
     int hover = (mx >= start_x && mx < start_x + start_w &&
                  my >= start_y && my < start_y + start_h);
-    uint32_t bg = hover ? COLOR_ACCENT : COLOR_ACCENT_DIM;
-    bb_fill_rect(start_x, start_y, start_w, start_h, bg);
-    bb_frame(start_x, start_y, start_w, start_h, 0x000000);
-    bb_draw_text(start_x + 14, start_y + 8, "Start", 0xFFFFFF, 2);
+    uint32_t sbg = hover ? COLOR_ACCENT_HOV : COLOR_ACCENT;
+    bb_fill_rounded_rect(start_x, start_y, start_w, start_h, 6, sbg);
+    /* Tetején egy halvány fehér fény-csík */
+    bb_fill_rect_alpha(start_x + 2, start_y + 1, start_w - 4, 4, 0xFFFFFF, 30);
+    bb_draw_text(start_x + 8, start_y + 8, "Rex", 0xFFFFFF, 2);
 
     /* Megnyitott ablakok */
-    int tx = start_x + start_w + 8;
+    int tx = start_x + start_w + 10;
     for (int i = 0; i < g_window_count; i++) {
         if (!g_windows[i].open) continue;
-        int tbw = 120;
-        uint32_t tbg = (i == g_focus) ? 0x404068 : 0x282838;
-        bb_fill_rect(tx, ty + 4, tbw, TASKBAR_H - 8, tbg);
-        bb_frame(tx, ty + 4, tbw, TASKBAR_H - 8, COLOR_FRAME);
-        /* csak az első X karakter */
-        char nb[24]; int j = 0;
-        while (g_windows[i].title[j] && j < 14) { nb[j] = g_windows[i].title[j]; j++; }
+        int tbw = 110;
+        int is_focused = (i == g_focus);
+        /* Aktív ablak: accent csíkkal */
+        bb_fill_rounded_rect_alpha(tx, ty + 5, tbw, TASKBAR_H - 10, 4,
+                                   is_focused ? 0x1E3A5F : 0x111827, 200);
+        if (is_focused) {
+            bb_fill_rect(tx + 4, ty + TASKBAR_H - 5, tbw - 8, 2, COLOR_ACCENT);
+        }
+        char nb[16]; int j = 0;
+        while (g_windows[i].title[j] && j < 12) { nb[j] = g_windows[i].title[j]; j++; }
         nb[j] = 0;
-        bb_draw_text(tx + 8, ty + 12, nb, COLOR_TEXT, 1);
-        tx += tbw + 6;
-        if (tx > (int)scr_w - 160) break;
+        bb_draw_text(tx + 8, ty + 13, nb,
+                     is_focused ? COLOR_TEXT : COLOR_TEXT_DIM, 1);
+        tx += tbw + 5;
+        if (tx > (int)scr_w - 120) break;
     }
 
-    /* Óra jobbra */
+    /* Power gomb: piros pill a jobb oldalon */
+    int pw = 30, ph = TASKBAR_H - 10;
+    int px = (int)scr_w - pw - 4;
+    int py = ty + 5;
+    int pow_hover = (mx >= px && mx < px + pw && my >= py && my < py + ph);
+    uint32_t pow_bg  = pow_hover ? 0xDC2626 : 0x7F1D1D;  /* piros hover */
+    bb_fill_rounded_rect(px, py, pw, ph, 5, pow_bg);
+    bb_fill_rect_alpha(px + 1, py + 1, pw - 2, 3, 0xFFFFFF, 20);
+    /* Power ikon: viszonylag kicsi a gombhoz képest */
+    bb_power_icon(px + 10, py + (ph - 10) / 2, 0xFFFFFF);
+
+    /* Óra: pill alakú, kék szín */
     uint64_t sec = ticks / 100;
     int hr = (int)((sec / 3600) % 24);
     int mn = (int)((sec / 60) % 60);
@@ -1740,37 +2136,71 @@ static void draw_taskbar(uint64_t ticks, int mx, int my) {
     pad2(p, hr); sstrcpy(clk, p); sstrcat(clk, ":");
     pad2(p, mn); sstrcat(clk, p); sstrcat(clk, ":");
     pad2(p, sc); sstrcat(clk, p);
-    int clk_x = (int)scr_w - 96;
-    bb_fill_rect(clk_x - 6, ty + 4, 92, TASKBAR_H - 8, 0x12121A);
-    bb_frame(clk_x - 6, ty + 4, 92, TASKBAR_H - 8, COLOR_FRAME);
-    bb_draw_text(clk_x + 2, ty + 12, clk, 0x9FE0FF, 2);
+    int clk_x = px - 96;
+    bb_fill_rounded_rect(clk_x - 4, ty + 5, 88, TASKBAR_H - 10, 5, 0x0F1A2E);
+    bb_fill_rect_alpha(clk_x - 4, ty + 5, 88, 1, 0x60A5FA, 60);
+    bb_draw_text(clk_x + 4, ty + 13, clk, 0x60A5FA, 2);
 }
 
 static void draw_start_menu(int mx, int my) {
     if (!g_start_menu_open) return;
-    int sx = 6, sy = (int)scr_h - TASKBAR_H - 28 - DT_ICON_COUNT * 28;
-    int sw = 200, sh = DT_ICON_COUNT * 28 + 16;
-    bb_fill_rect(sx, sy, sw, sh, 0x14141E);
-    bb_frame(sx, sy, sw, sh, COLOR_FRAME);
-    bb_draw_text(sx + 8, sy + 6, "Launch", COLOR_TEXT_DIM, 1);
+    int sx = 6, sy = (int)scr_h - TASKBAR_H - 20 - DT_ICON_COUNT * 30 - 42;
+    int sw = 210, sh = DT_ICON_COUNT * 30 + 28 + 42;  /* +42: elválasztó + Shutdown */
+
+    dirty_mark(sx - 2, sy - 2, sw + 4, sh + 4);
+
+    /* Panel háttér: glassmorphism */
+    bb_fill_rounded_rect_alpha(sx, sy, sw, sh, 10, 0x080E1C, 230);
+    bb_fill_rect_alpha(sx + 1, sy + 1, sw - 2, 1, 0xFFFFFF, 20);
+    /* Keret */
+    bb_hline(sx, sy, sw, COLOR_FRAME);
+    bb_hline(sx, sy + sh - 1, sw, COLOR_FRAME);
+    bb_vline(sx, sy, sh, COLOR_FRAME);
+    bb_vline(sx + sw - 1, sy, sh, COLOR_FRAME);
+
+    /* Fejléc */
+    bb_fill_rect_alpha(sx, sy, sw, 22, COLOR_ACCENT, 30);
+    bb_draw_text(sx + 10, sy + 6, "Applications", COLOR_TEXT_DIM, 1);
+    bb_hline(sx, sy + 22, sw, COLOR_FRAME);
+
     for (int i = 0; i < DT_ICON_COUNT; i++) {
-        int iy = sy + 20 + i * 28;
-        int hov = (mx >= sx && mx < sx + sw && my >= iy && my < iy + 24);
-        if (hov) bb_fill_rect(sx + 2, iy, sw - 4, 24, COLOR_BUTTON_HOV);
-        bb_fill_rect(sx + 10, iy + 6, 12, 12, g_dt_icons[i].color);
-        bb_frame(sx + 10, iy + 6, 12, 12, 0x000000);
-        bb_draw_text(sx + 30, iy + 8, g_dt_icons[i].label, COLOR_TEXT, 1);
+        int iy = sy + 26 + i * 30;
+        int hov = (mx >= sx && mx < sx + sw && my >= iy && my < iy + 26);
+        if (hov) {
+            bb_fill_rounded_rect_alpha(sx + 4, iy + 2, sw - 8, 24, 4,
+                                       COLOR_ACCENT, 80);
+        }
+        bb_fill_rounded_rect(sx + 12, iy + 7, 12, 12, 3, g_dt_icons[i].color);
+        bb_draw_text(sx + 32, iy + 9, g_dt_icons[i].label,
+                     hov ? 0xFFFFFF : COLOR_TEXT, 1);
     }
+
+    /* Elválasztó + Shutdown gomb */
+    int sep_y = sy + 26 + DT_ICON_COUNT * 30 + 4;
+    bb_hline(sx + 8, sep_y, sw - 16, COLOR_FRAME);
+    int shut_y = sep_y + 6;
+    int shut_hov = (mx >= sx && mx < sx + sw && my >= shut_y && my < shut_y + 26);
+    if (shut_hov) {
+        bb_fill_rounded_rect_alpha(sx + 4, shut_y + 2, sw - 8, 24, 4, 0x991B1B, 180);
+    }
+    bb_power_icon(sx + 13, shut_y + 8, shut_hov ? 0xFFFFFF : 0xFF6B6B);
+    bb_draw_text(sx + 32, shut_y + 9, "Shutdown",
+                 shut_hov ? 0xFFFFFF : 0xFF6B6B, 1);
 }
 
 static int start_menu_hit(int mx, int my) {
     if (!g_start_menu_open) return -1;
-    int sx = 6, sy = (int)scr_h - TASKBAR_H - 28 - DT_ICON_COUNT * 28;
-    int sw = 200;
+    /* Koordináták meg kell egyezzenek a draw_start_menu-val */
+    int sx = 6, sy = (int)scr_h - TASKBAR_H - 20 - DT_ICON_COUNT * 30 - 42;
+    int sw = 210;
     for (int i = 0; i < DT_ICON_COUNT; i++) {
-        int iy = sy + 20 + i * 28;
-        if (mx >= sx && mx < sx + sw && my >= iy && my < iy + 24) return i;
+        int iy = sy + 26 + i * 30;
+        if (mx >= sx && mx < sx + sw && my >= iy && my < iy + 26) return i;
     }
+    /* Shutdown gomb */
+    int sep_y = sy + 26 + DT_ICON_COUNT * 30 + 4;
+    int shut_y = sep_y + 6;
+    if (mx >= sx && mx < sx + sw && my >= shut_y && my < shut_y + 26) return -2;
     return -1;
 }
 
@@ -1800,6 +2230,20 @@ void _start(void) {
     backbuf_size = scr_w * scr_h * 4;
     backbuf = (uint32_t *)malloc(backbuf_size);
     if (!backbuf) { print("desktop: no memory for back buffer\n"); exit(1); }
+
+    /* Wallpaper inicializálás */
+    g_wallpaper_buf = (uint32_t *)malloc(scr_w * scr_h * 4);
+    if (g_wallpaper_buf) {
+        /* Előbb procedurális fallback, majd felülírja BMP ha van */
+        wallpaper_render_procedural();
+        g_wallpaper_ok = 1;
+        /* BMP keresés: initrd és FAT32 /mnt is */
+        load_bmp_wallpaper("wallpaper.bmp");
+        if (!g_wallpaper_ok) load_bmp_wallpaper("/mnt/wallpaper.bmp");
+    }
+
+    /* Ikon hover állapotok nullázása */
+    for (int i = 0; i < 16; i++) g_icon_hover_alpha[i] = 0;
 
     /* Initial sysinfo window */
     launch_app(APP_ABOUT);
@@ -1843,12 +2287,42 @@ void _start(void) {
             }
         }
 
+        /* Leállítás: ha kértem, rajzolunk egy leállási képernyőt, majd kilépünk */
+        if (g_shutdown_requested) {
+            bb_fill_rect(0, 0, (int)scr_w, (int)scr_h, 0x000000);
+            bb_fill_rounded_rect((int)scr_w/2-160, (int)scr_h/2-40, 320, 80, 10, 0x0F172A);
+            bb_hline((int)scr_w/2-160, (int)scr_h/2-40, 320, 0x334155);
+            bb_power_icon((int)scr_w/2-16, (int)scr_h/2-28, 0x7C3AED);
+            bb_draw_text((int)scr_w/2-52, (int)scr_h/2-4,  "Shutting down...", 0xF1F5F9, 2);
+            bb_draw_text((int)scr_w/2-48, (int)scr_h/2+20, "It is safe to power off.", 0x64748B, 1);
+            flush_rect(0, 0, (int)scr_w, (int)scr_h);
+            /* Rövid várakozás (kb. 1 másodperc) */
+            uint64_t t0 = get_ticks();
+            while (get_ticks() - t0 < 100) yield();
+            exit(0);
+        }
+
         /* Klikk eseménykezelés (press edge) */
         if (btn_down) {
+            /* Tálca power gomb */
+            int tb_ty = (int)scr_h - TASKBAR_H;
+            int pw = 30, px2 = (int)scr_w - pw - 4;
+            int py2 = tb_ty + 5;
+            if (mx >= (uint32_t)px2 && mx < (uint32_t)(px2 + pw) &&
+                my >= (uint32_t)py2 && my < (uint32_t)(py2 + TASKBAR_H - 10)) {
+                g_shutdown_requested = 1;
+                goto skip_other;
+            }
+
             /* Start menü hit? */
             if (g_start_menu_open) {
                 int sm = start_menu_hit(mx, my);
-                if (sm >= 0) {
+                if (sm == -2) {
+                    /* Shutdown kattintott */
+                    g_shutdown_requested = 1;
+                    g_start_menu_open = 0;
+                    goto skip_other;
+                } else if (sm >= 0) {
                     launch_app(g_dt_icons[sm].app);
                     g_start_menu_open = 0;
                 } else if (!taskbar_hit_start(mx, my)) {
@@ -1927,6 +2401,7 @@ void _start(void) {
         if (now - last_draw >= 4) {
             last_draw = now;
 
+            dirty_reset();
             bb_draw_wallpaper(now);
 
             int hover_icon = desktop_icon_hit((int)mx, (int)my);
@@ -1942,7 +2417,13 @@ void _start(void) {
             draw_taskbar(now, (int)mx, (int)my);
             draw_start_menu((int)mx, (int)my);
 
-            flush_all();
+            /* A taskbar és a kurzorozó terület mindig dirty */
+            dirty_mark(0, (int)scr_h - TASKBAR_H - 1, (int)scr_w, TASKBAR_H + 1);
+            dirty_mark((int)g_prev_mx, (int)g_prev_my, CURSOR_W + 2, CURSOR_H + 2);
+            dirty_mark((int)mx, (int)my, CURSOR_W + 2, CURSOR_H + 2);
+
+            dirty_flush();
+            dirty_reset();
             draw_cursor_to_fb(mx, my);
         }
 
