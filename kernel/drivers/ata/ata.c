@@ -29,13 +29,16 @@
 #define ATA_SR_ERR     0x01
 
 #define ATA_CMD_READ_PIO    0x20
+#define ATA_CMD_WRITE_PIO   0x30
+#define ATA_CMD_CACHE_FLUSH 0xE7
 #define ATA_CMD_IDENTIFY    0xEC
 
 static bool s_present = false;
 static uint64_t s_sectors = 0;
 
 /* Forward */
-static int ata_block_read(block_device_t *dev, uint64_t lba, uint32_t count, void *buf);
+static int ata_block_read (block_device_t *dev, uint64_t lba, uint32_t count, void *buf);
+static int ata_block_write(block_device_t *dev, uint64_t lba, uint32_t count, const void *buf);
 
 static void ata_io_delay(void) {
     /* 400 ns "alternate status" olvasás 4x — IDE szabványos várakozás */
@@ -125,7 +128,7 @@ bool ata_init(void) {
     bd.sector_size = 512;
     bd.sector_count = s_sectors;
     bd.read  = ata_block_read;
-    bd.write = NULL;
+    bd.write = ata_block_write;
     bd.driver_data = NULL;
     block_register(&bd);
 
@@ -144,6 +147,61 @@ static int ata_block_read(block_device_t *dev, uint64_t lba, uint32_t count, voi
         uint32_t r = ata_read_sectors((uint32_t)(lba + done),
                                       (uint8_t)chunk,
                                       p + done * 512);
+        if (r == 0) return (int)done;
+        done += r;
+    }
+    return (int)done;
+}
+
+uint32_t ata_write_sectors(uint32_t lba, uint8_t count, const void *buffer) {
+    if (!s_present) return 0;
+    if (count == 0) return 0;
+
+    /* BSY-re várunk */
+    while (inb(ATA_PRIMARY_STATUS) & ATA_SR_BSY) { /* spin */ }
+
+    outb(ATA_PRIMARY_DRIVE,    0xE0 | ((lba >> 24) & 0x0F));
+    outb(ATA_PRIMARY_SECCOUNT, count);
+    outb(ATA_PRIMARY_LBA_LO,   (uint8_t)(lba));
+    outb(ATA_PRIMARY_LBA_MID,  (uint8_t)(lba >> 8));
+    outb(ATA_PRIMARY_LBA_HI,   (uint8_t)(lba >> 16));
+    outb(ATA_PRIMARY_COMMAND,  ATA_CMD_WRITE_PIO);
+    ata_io_delay();
+
+    const uint16_t *buf = (const uint16_t *)buffer;
+    uint32_t actual = 0;
+
+    for (uint8_t s = 0; s < count; s++) {
+        /* DRQ-ra várunk mielőtt az adatot kiírjuk */
+        if (ata_poll() < 0) {
+            kprintf("[ata] write error at LBA %u (sector %u)\n", lba, s);
+            return actual;
+        }
+        for (int i = 0; i < 256; i++) {
+            outw(ATA_PRIMARY_DATA, buf[(uint32_t)s * 256 + i]);
+        }
+        ata_io_delay();
+        actual++;
+    }
+
+    /* Cache flush: biztosítéjuk, hogy a drive a pufferét kiírta */
+    outb(ATA_PRIMARY_COMMAND, ATA_CMD_CACHE_FLUSH);
+    while (inb(ATA_PRIMARY_STATUS) & ATA_SR_BSY) { /* spin */ }
+
+    return actual;
+}
+
+/* Block device write callback: a meglévő ata_write_sectors-ra hív át. */
+static int ata_block_write(block_device_t *dev, uint64_t lba, uint32_t count, const void *buf) {
+    (void)dev;
+    uint8_t *p = (uint8_t *)buf;
+    uint32_t done = 0;
+    while (done < count) {
+        uint32_t chunk = count - done;
+        if (chunk > 255) chunk = 255;
+        uint32_t r = ata_write_sectors((uint32_t)(lba + done),
+                                       (uint8_t)chunk,
+                                       p + done * 512);
         if (r == 0) return (int)done;
         done += r;
     }

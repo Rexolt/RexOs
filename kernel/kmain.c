@@ -30,6 +30,7 @@
 #include <drivers/ahci/ahci.h>
 #include <drivers/pci/pci.h>
 #include <drivers/usb/xhci.h>
+#include <drivers/nvme/nvme.h>
 #include <rexos/elf.h>
 #include <arch/x86_64/syscall.h>
 
@@ -445,9 +446,14 @@ void kmain(void)
      */
     pci_init();
 
-    if (!ahci_init()) {
-        kprintf("[storage] no AHCI; falling back to legacy ATA PIO\n");
-        ata_init();
+    /* NVMe prioritás: ha van NVMe kontroller, azt preferáljuk az AHCI/ATA előtt. */
+    bool has_nvme = nvme_init();
+
+    if (!has_nvme) {
+        if (!ahci_init()) {
+            kprintf("[storage] no AHCI; falling back to legacy ATA PIO\n");
+            ata_init();
+        }
     }
 
     /* USB stack: xHCI controller + HID devices */

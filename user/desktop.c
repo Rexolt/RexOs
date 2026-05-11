@@ -257,6 +257,7 @@ typedef enum {
     APP_ABOUT,
     APP_HARDWARE,
     APP_INSTALLER,
+    APP_SNAKE,
 } app_kind_t;
 
 typedef struct window window_t;
@@ -1177,6 +1178,8 @@ typedef struct {
     char content[3200];   /* legalább ennyi belefér a 4 KB priv-be */
     int  loaded;
     int  scroll;
+    int  cursor;
+    int  insert_mode;
 } editor_state_t;
 
 static editor_state_t g_editor_pending;
@@ -1215,31 +1218,153 @@ static void app_editor_draw(window_t *w) {
     int yy = cy + 6 - s->scroll * line_h;
     int xx = x_start;
     int max_w = cx + cw - 8;
-    for (int i = 0; s->content[i]; i++) {
+    int i = 0;
+    while (1) {
+        if (i == s->cursor && yy >= cy && yy < cy + ch - 8) {
+            bb_fill_rect(xx, yy, 6, 12, 0x666666);
+        }
+        if (!s->content[i]) break;
         char c = s->content[i];
-        if (c == '\n') { yy += line_h; xx = x_start; continue; }
-        if (c == '\r') continue;
-        if (c == '\t') { xx += 24; continue; }
+        if (c == '\n') { yy += line_h; xx = x_start; i++; continue; }
+        if (c == '\r') { i++; continue; }
+        if (c == '\t') { xx += 24; i++; continue; }
         if (xx + 6 > max_w) { yy += line_h; xx = x_start; }
         if (yy >= cy && yy < cy + ch - 8 && c >= 32 && c < 127) {
             bb_draw_char(xx, yy, c, COLOR_TEXT, 1);
         }
         xx += 6;
+        i++;
     }
 
     /* Status */
     int sy = w->y + w->h - 18;
     bb_fill_rect(w->x + 1, sy, w->w - 2, 17, 0x12121A);
     char st[64];
-    sstrcpy(st, "Read-only viewer | PgUp/PgDn to scroll");
+    sstrcpy(st, s->insert_mode ? "INSERT MODE | press ESC to exit" : "COMMAND MODE | w/a/s/d move, i insert");
     bb_draw_text(w->x + 8, sy + 5, st, COLOR_TEXT_DIM, 1);
 }
 
 static void app_editor_key(window_t *w, char c) {
     editor_state_t *s = (editor_state_t *)w->priv;
-    if (c == 'k') s->scroll = (s->scroll > 0) ? s->scroll - 1 : 0;
-    if (c == 'j') s->scroll++;
-    if (c == 'g') s->scroll = 0;
+    int len = sstrlen(s->content);
+    if (c == 27) { s->insert_mode = 0; return; }
+    if (!s->insert_mode) {
+        if (c == 'i') s->insert_mode = 1;
+        if (c == 'a' && s->cursor > 0) s->cursor--;
+        if (c == 'd' && s->cursor < len) s->cursor++;
+        if (c == 'w') {
+            int p = s->cursor;
+            while (p > 0 && s->content[p-1] != '\n') p--;
+            if (p > 0) {
+                int col = s->cursor - p;
+                int prev = p - 1;
+                while (prev > 0 && s->content[prev-1] != '\n') prev--;
+                int new_col = 0;
+                while (new_col < col && prev + new_col < p - 1) new_col++;
+                s->cursor = prev + new_col;
+            }
+        }
+        if (c == 's') {
+            int p = s->cursor;
+            while (p > 0 && s->content[p-1] != '\n') p--;
+            int col = s->cursor - p;
+            int nxt = s->cursor;
+            while (nxt < len && s->content[nxt] != '\n') nxt++;
+            if (nxt < len) {
+                nxt++;
+                int new_col = 0;
+                while (new_col < col && nxt + new_col < len && s->content[nxt+new_col] != '\n') new_col++;
+                s->cursor = nxt + new_col;
+            }
+        }
+        if (c == 'k') s->scroll = (s->scroll > 0) ? s->scroll - 1 : 0;
+        if (c == 'j') s->scroll++;
+    } else {
+        if (c == '\b') {
+            if (s->cursor > 0) {
+                for (int i = s->cursor - 1; i <= len; i++) s->content[i] = s->content[i + 1];
+                s->cursor--;
+            }
+        } else if (c == '\n' || (c >= 32 && c < 127)) {
+            if (len < 3198) {
+                for (int i = len; i >= s->cursor; i--) s->content[i + 1] = s->content[i];
+                s->content[s->cursor] = c;
+                s->cursor++;
+            }
+        }
+    }
+}
+
+/* =============================================================================
+ *  APP: SNAKE
+ * ========================================================================== */
+
+typedef struct {
+    int snake_x[200], snake_y[200];
+    int len;
+    int dir_x, dir_y;
+    int food_x, food_y;
+    int score;
+    int game_over;
+    uint64_t last_move;
+} snake_state_t;
+
+static void app_snake_draw(window_t *w) {
+    snake_state_t *s = (snake_state_t *)w->priv;
+    int cx = w->x + 10, cy = w->y + TITLE_H + 10;
+    int gw = 20, gh = 15, cs = 14;
+    
+    if (s->len == 0) {
+        s->len = 3; s->snake_x[0] = 10; s->snake_y[0] = 7;
+        for(int i=1;i<3;i++){ s->snake_x[i]=10-i; s->snake_y[i]=7; }
+        s->dir_x = 1; s->dir_y = 0;
+        s->food_x = 15; s->food_y = 7;
+        s->last_move = get_ticks();
+    }
+    
+    uint64_t now = get_ticks();
+    if (!s->game_over && now - s->last_move > 15) {
+        s->last_move = now;
+        int nx = s->snake_x[0] + s->dir_x;
+        int ny = s->snake_y[0] + s->dir_y;
+        if (nx < 0 || nx >= gw || ny < 0 || ny >= gh) s->game_over = 1;
+        for (int i = 0; i < s->len; i++) if (nx == s->snake_x[i] && ny == s->snake_y[i]) s->game_over = 1;
+        if (!s->game_over) {
+            for (int i = s->len; i > 0; i--) {
+                s->snake_x[i] = s->snake_x[i-1];
+                s->snake_y[i] = s->snake_y[i-1];
+            }
+            s->snake_x[0] = nx; s->snake_y[0] = ny;
+            if (nx == s->food_x && ny == s->food_y) {
+                if (s->len < 199) s->len++;
+                s->score += 10;
+                s->food_x = (now * 7) % gw; s->food_y = (now * 11) % gh;
+            }
+        }
+    }
+    
+    char sb[32]; sstrcpy(sb, "Score: "); utoa10(s->score, sb + 7);
+    bb_draw_text(cx, cy, sb, COLOR_TEXT, 1); cy += 16;
+    bb_fill_rect(cx, cy, gw * cs, gh * cs, 0x222233);
+    bb_frame(cx, cy, gw * cs, gh * cs, COLOR_FRAME);
+    
+    bb_fill_rect(cx + s->food_x * cs + 1, cy + s->food_y * cs + 1, cs - 2, cs - 2, 0xFF4444);
+    for (int i = 0; i < s->len; i++) {
+        uint32_t col = (i == 0) ? 0x55FF55 : 0x22CC22;
+        bb_fill_rect(cx + s->snake_x[i] * cs + 1, cy + s->snake_y[i] * cs + 1, cs - 2, cs - 2, col);
+    }
+    
+    if (s->game_over) bb_draw_text(cx + 40, cy + 100, "GAME OVER (press r to restart)", 0xFF0000, 1);
+    else bb_draw_text(cx, cy + gh * cs + 8, "Use w/a/s/d to move", COLOR_TEXT_DIM, 1);
+}
+
+static void app_snake_key(window_t *w, char c) {
+    snake_state_t *s = (snake_state_t *)w->priv;
+    if (c == 'r') { s->len = 0; s->game_over = 0; s->score = 0; return; }
+    if (c == 'w' && s->dir_y == 0) { s->dir_x = 0; s->dir_y = -1; }
+    if (c == 's' && s->dir_y == 0) { s->dir_x = 0; s->dir_y = 1; }
+    if (c == 'a' && s->dir_x == 0) { s->dir_x = -1; s->dir_y = 0; }
+    if (c == 'd' && s->dir_x == 0) { s->dir_x = 1; s->dir_y = 0; }
 }
 
 /* =============================================================================
@@ -1479,6 +1604,7 @@ static const desktop_icon_t g_dt_icons[] = {
     { "Install",   APP_INSTALLER,0x81C784     },
     { "Clock",     APP_CLOCK,    0x9FE0FF     },
     { "About",     APP_ABOUT,    COLOR_ACCENT },
+    { "Snake",     APP_SNAKE,    0x55FF55     },
 };
 #define DT_ICON_COUNT ((int)(sizeof(g_dt_icons) / sizeof(g_dt_icons[0])))
 
@@ -1564,6 +1690,10 @@ static void launch_app(app_kind_t app) {
             }
             break;
         }
+        case APP_SNAKE:
+            window_new(APP_SNAKE, "Snake", 300, 290,
+                       app_snake_draw, NULL, app_snake_key);
+            break;
     }
 }
 
@@ -1663,7 +1793,7 @@ static int taskbar_hit_start(int mx, int my) {
 
 /* --- Main ---------------------------------------------------------------- */
 
-void _start() {
+void _start(void) {
     fb = (uint32_t *)get_fb(&scr_w, &scr_h, &pitch);
     if (!fb) { print("desktop: no framebuffer\n"); exit(1); }
 

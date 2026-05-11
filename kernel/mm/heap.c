@@ -183,7 +183,22 @@ void *krealloc(void *ptr, size_t new_size)
     check_block(b, "krealloc");
 
     size_t aligned = align_up(new_size, KHEAP_ALIGN);
-    if (b->size >= aligned) return ptr;  /* in-place shrink, nem split-eljük */
+    if (b->size >= aligned) {
+        /* Ha van elég hely a split-hez, kettévágjuk a blokkot,
+         * hogy a maradék visszakerülön a szabad listába. */
+        size_t leftover = b->size - aligned;
+        if (leftover >= sizeof(block_t) + KHEAP_ALIGN) {
+            block_t *split = (block_t *)((uint8_t *)b + sizeof(block_t) + aligned);
+            split->size  = leftover - sizeof(block_t);
+            split->magic = BLOCK_MAGIC_FREE;
+            split->next  = b->next;
+            split->prev  = b;
+            if (b->next) b->next->prev = split;
+            b->next = split;
+            b->size = aligned;
+        }
+        return ptr;
+    }
 
     /* Egyszerű: új allokáció + másolás + free. */
     void *np = kmalloc(new_size);

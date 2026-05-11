@@ -47,3 +47,8 @@ uintptr_t vmm_create_user_pml4(void);
 /* Töröl egy felhasználói PML4 táblát, és felszabadítja a teljes User Space
  * alatti memóriakereteket és lapkönyvtárakat. */
 void vmm_destroy_user_pml4(uintptr_t pml4_phys);
+
+/* Virt → phys fordítás egy adott (tetszőleges) PML4 táblában.
+ * Hasznos pl. az ELF betöltőben, ahol egy nem-aktív user PML4-ba kell
+ * írni HHDM-en keresztül. 0-t ad vissza, ha a cím nincs mappelva. */
+uintptr_t vmm_translate_pml4(uintptr_t pml4_phys, uintptr_t virt);

@@ -26,6 +26,11 @@ typedef void (*close_type_t)(struct vfs_node *node);
 typedef struct dirent *(*readdir_type_t)(struct vfs_node *node, uint32_t index);
 typedef struct vfs_node *(*finddir_type_t)(struct vfs_node *node, const char *name);
 
+/* Írási műveletek */
+typedef struct vfs_node *(*create_type_t)(struct vfs_node *dir, const char *name, uint32_t flags);
+typedef int (*mkdir_type_t) (struct vfs_node *dir, const char *name);
+typedef int (*unlink_type_t)(struct vfs_node *dir, const char *name);
+
 /* A VFS Csomópont (Node) */
 typedef struct vfs_node {
     char name[128];         // A csomópont neve
@@ -44,6 +49,9 @@ typedef struct vfs_node {
     close_type_t close;
     readdir_type_t readdir;
     finddir_type_t finddir;
+    create_type_t  create;   /* Fájl létrehozása a könyvtárban */
+    mkdir_type_t   mkdir;    /* Alkönyvtár létrehozása */
+    unlink_type_t  unlink;   /* Fájl törlése */
 
     struct vfs_node *ptr;   // Mutató egyéb adatokra (pl. szimbolikus linkeknél, mountoknál vagy TAR file címe)
 } vfs_node_t;
@@ -69,3 +77,10 @@ vfs_node_t *vfs_lookup(const char *path);
  * node: A felmountolt fájlrendszer gyökér csomópontja.
  * Egy egyszerű, fix méretű táblát használunk: max 4 mount. */
 bool vfs_mount(const char *mount_path, vfs_node_t *node);
+
+/* Fájl létrehozása egy könyvtárban. flags: jövőbeli bővítéshez (jelenleg 0). */
+vfs_node_t *vfs_create(vfs_node_t *dir, const char *name, uint32_t flags);
+/* Alkönyvtár létrehozása. Visszatérés: 0=OK, -1=hiba. */
+int vfs_mkdir_node(vfs_node_t *dir, const char *name);
+/* Fájl törlése. Visszatérés: 0=OK, -1=hiba. */
+int vfs_unlink(vfs_node_t *dir, const char *name);

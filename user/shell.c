@@ -5,7 +5,7 @@ int strcmp(const char *s1, const char *s2) {
     return *(const unsigned char *)s1 - *(const unsigned char *)s2;
 }
 
-void _start() {
+void _start(void) {
     print("\n----------------------------------\n");
     print("  Welcome to the User Mode Shell! \n");
     print("----------------------------------\n");
@@ -30,6 +30,8 @@ void _start() {
                     print("Built-in commands:\n");
                     print("  help        - Show this help\n");
                     print("  exit        - Exit the shell\n");
+                    print("  mkdir <dir> - Create a directory\n");
+                    print("  rm <file>   - Delete a file\n");
                     print("  ls [path]   - List files (default: /)\n");
                     print("  cat <file>  - Show file contents (supports /mnt/...)\n");
                     print("  clear       - Clear the screen (ANSI)\n");
@@ -71,6 +73,20 @@ void _start() {
                         print(fname);
                         print("\n");
                     }
+                } else if (line[0]=='m'&&line[1]=='k'&&line[2]=='d'&&line[3]=='i'&&line[4]=='r'&&line[5]==' ') {
+                    const char *dname = &line[6];
+                    while (*dname == ' ') dname++;
+                    if (*dname) {
+                        if (mkdir(dname) == 0) { print("Created: "); print(dname); print("\n"); }
+                        else { print("mkdir: failed\n"); }
+                    } else { print("Usage: mkdir <name>\n"); }
+                } else if (line[0]=='r'&&line[1]=='m'&&line[2]==' ') {
+                    const char *fname = &line[3];
+                    while (*fname == ' ') fname++;
+                    if (*fname) {
+                        if (unlink(fname) == 0) { print("Removed: "); print(fname); print("\n"); }
+                        else { print("rm: failed\n"); }
+                    } else { print("Usage: rm <file>\n"); }
                 } else {
                     /* Próbáljuk spawnolni programként, ha nem megy, .elf-fel is */
                     int pid = spawn(line);

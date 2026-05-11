@@ -31,28 +31,43 @@ static inline uint64_t rdmsr(uint32_t msr) {
     return ((uint64_t)high << 32) | low;
 }
 
+/* Felhasználói tér-beli pointer ellenőrzés (alapvető range-validáció).
+ * Megakadályozza, hogy user-space kód kernel memóriacímet adjon át syscall-ban.
+ * Az x86_64 canonical user space felső határa: 0x00007fffffffffff.
+ * FONTOS: lap-szintű validáció (vmm_translate) nincs; ez csak address range ellenőrzés. */
+static inline bool uptr_ok(uint64_t ptr, uint64_t len)
+{
+    if (!ptr) return false;
+    if (ptr > 0x00007fffffffffffULL) return false;
+    if (len && (ptr + len < ptr || ptr + len > 0x00007fffffffffffULL + 1ULL)) return false;
+    return true;
+}
+
 void syscall_init(void) {
     /* 1. System Call Enable (SCE) bekapcsolása az EFER MSR-ben */
     uint64_t efer = rdmsr(MSR_EFER);
     wrmsr(MSR_EFER, efer | 1);
     
     /* 2. STAR MSR beállítása:
-     * Bit 32-47: Kernel CS (a sys_call ide fog ugrani). Az SS automatikusan Kernel CS + 8 lesz.
-     * Bit 48-63: User Base (a sysretq ide fog ugrani).
-     *            sysretq a User CS-t a (Base + 16)-ból veszi, az SS-t pedig a (Base + 8)-ból!
-     *            GDT-nk: Index 3 = User DS (0x1B), Index 4 = User CS (0x23).
-     *            Így ha Base = 0x10, Base + 8 = 0x18 (User DS), Base + 16 = 0x20 (User CS).
-     */
+     * Bit 32-47: Kernel CS (syscall → Ring 0, SS automatikusan CS+8 = 0x10).
+     * Bit 48-63: sysretq User-szelektor alap.
+     *   A sysretq 64-bit módban: User CS = (Alap+16) | 3, User SS = (Alap+8) | 3.
+     *   GDT layout: 0x08=Kernel CS, 0x10=Kernel DS,
+     *               0x18=User DS (alap), 0x20=User CS (alap).
+     *   Alap=0x10 → Alap+8=0x18 | 3 = 0x1B (User DS), Alap+16=0x20 | 3 = 0x23 (User CS).
+     *   A CPU automatikusan beállítja az RPL=3 bitet a sysretq során. */
     uint64_t star = ((uint64_t)0x08 << 32) | ((uint64_t)0x10 << 48);
     wrmsr(MSR_STAR, star);
     
     /* 3. LSTAR MSR: A syscall belépési pontja */
     wrmsr(MSR_LSTAR, (uint64_t)syscall_entry);
     
-    /* 4. FMASK MSR: A syscall alatt törlendő flag-ek.
-     * 0x202 = RFLAGS.IF (Interrupts Disable) és TF (Trap Flag) törlése.
-     * Ez azért kell, hogy syscall alatt ne kapjunk hardware interruptot, amíg nem váltunk kernel stackre! */
-    wrmsr(MSR_FMASK, 0x202);
+    /* 4. FMASK MSR: A syscall belépésekor törlendő RFLAGS bitek.
+     * Bit 9 (IF)  – interruptok letiltása, amíg kernel stackre nem váltunk.
+     * Bit 8 (TF)  – single-step debug letiltása kernel kódban (biztonság).
+     * 0x300 = IF (bit 9) + TF (bit 8).
+     * (Az eredeti 0x202 csak IF-et tiltotta; bit 1 reserved, maszkolása hatástalan.) */
+    wrmsr(MSR_FMASK, 0x300);
     
     kprintf("[syscall] System call interface (syscall/sysret) initialized.\n");
 }
@@ -62,12 +77,25 @@ uint64_t syscall_handler(uint64_t nr, uint64_t arg1, uint64_t arg2, uint64_t arg
     (void)arg4; (void)arg5;
     
     /* Syscall tábla szimulálása if-else szerkezettel */
-    if (nr == 0) { // sys_write (stdout)
-        // RDI = arg1 (fd), RSI = arg2 (str), RDX = arg3 (len)
-        if (arg1 == 1 || arg1 == 2) {
+    if (nr == 0) { // sys_write
+        // RDI = arg1 (fd), RSI = arg2 (buf), RDX = arg3 (len)
+        if (arg1 == 1 || arg1 == 2) {  /* stdout / stderr */
+            if (!uptr_ok(arg2, arg3)) return (uint64_t)-1;
             kprintf("%s", (const char *)arg2);
             return arg3;
+        } else if (arg1 >= 3 && arg1 < 16) {  /* fájl fd */
+            if (!uptr_ok(arg2, arg3)) return (uint64_t)-1;
+            task_t *t = task_current();
+            if (t->fd_table[arg1]) {
+                uint64_t written = vfs_write(t->fd_table[arg1],
+                                             t->fd_offset[arg1],
+                                             arg3,
+                                             (uint8_t *)arg2);
+                t->fd_offset[arg1] += written;
+                return written;
+            }
         }
+        return (uint64_t)-1;
     } else if (nr == 1) { // sys_exit
         kprintf("\n[syscall] User task '%s' exited with code %lu.\n", task_current()->name, arg1);
         task_exit(); // Ez kilép és meghívja a schedulert
@@ -77,6 +105,7 @@ uint64_t syscall_handler(uint64_t nr, uint64_t arg1, uint64_t arg2, uint64_t arg
         return 0;
     } else if (nr == 3) { // sys_read
         if (arg1 == 0) { // stdin
+            if (!uptr_ok(arg2, arg3)) return (uint64_t)-1;
             char *buf = (char *)arg2;
             uint64_t count = arg3;
             uint64_t read = 0;
@@ -89,6 +118,7 @@ uint64_t syscall_handler(uint64_t nr, uint64_t arg1, uint64_t arg2, uint64_t arg
             }
             return read;
         } else if (arg1 >= 3 && arg1 < 16) {
+            if (!uptr_ok(arg2, arg3)) return (uint64_t)-1;
             task_t *t = task_current();
             if (t->fd_table[arg1]) {
                 uint64_t bytes = vfs_read(t->fd_table[arg1], t->fd_offset[arg1], arg3, (uint8_t *)arg2);
@@ -98,6 +128,9 @@ uint64_t syscall_handler(uint64_t nr, uint64_t arg1, uint64_t arg2, uint64_t arg
         }
         return 0;
     } else if (nr == 4) { // sys_get_fb
+        if (!uptr_ok(arg1, sizeof(uint64_t)) ||
+            !uptr_ok(arg2, sizeof(uint64_t)) ||
+            !uptr_ok(arg3, sizeof(uint64_t))) return (uint64_t)-1;
         uint64_t *width = (uint64_t *)arg1;
         uint64_t *height = (uint64_t *)arg2;
         uint64_t *pitch = (uint64_t *)arg3;
@@ -116,6 +149,7 @@ uint64_t syscall_handler(uint64_t nr, uint64_t arg1, uint64_t arg2, uint64_t arg
         
         return fb_vaddr;
     } else if (nr == 5) { // sys_spawn
+        if (!uptr_ok(arg1, 1)) return (uint64_t)-1;
         const char *path = (const char *)arg1;
         vfs_node_t *node = vfs_lookup(path);
         if (!node) node = vfs_finddir(fs_root, path);
@@ -124,16 +158,40 @@ uint64_t syscall_handler(uint64_t nr, uint64_t arg1, uint64_t arg2, uint64_t arg
             if (t) return t->id;
         }
         return (uint64_t)-1;
-    } else if (nr == 6) { // sys_open
+    } else if (nr == 6) { // sys_open(path, flags)
+        if (!uptr_ok(arg1, 1)) return (uint64_t)-1;
         const char *path = (const char *)arg1;
+        uint64_t oflags = arg2;   /* O_CREAT = 0x40 */
         vfs_node_t *node;
         if (path[0] == '/') {
             node = vfs_lookup(path);
         } else {
             node = vfs_finddir(fs_root, path);
         }
+        /* O_CREAT: ha nem létezik, létrehozzuk */
+        if (!node && (oflags & 0x40)) {
+            vfs_node_t *parent = fs_root;
+            const char *fname = path;
+            /* Utolsó '/' előtti rész = szülő könyvtár */
+            const char *last_slash = NULL;
+            for (const char *q = path; *q; q++) if (*q == '/') last_slash = q;
+            if (last_slash && last_slash != path) {
+                char parent_path[128];
+                size_t plen = (size_t)(last_slash - path);
+                if (plen < 127) {
+                    for (size_t qi = 0; qi < plen; qi++) parent_path[qi] = path[qi];
+                    parent_path[plen] = 0;
+                    vfs_node_t *pp = vfs_lookup(parent_path);
+                    if (pp) parent = pp;
+                }
+                fname = last_slash + 1;
+            } else if (path[0] == '/') {
+                fname = path + 1;
+            }
+            if (*fname) node = vfs_create(parent, fname, 0);
+        }
         if (!node) return (uint64_t)-1;
-        
+
         task_t *t = task_current();
         for (int i = 3; i < 16; i++) {
             if (!t->fd_table[i]) {
@@ -144,6 +202,7 @@ uint64_t syscall_handler(uint64_t nr, uint64_t arg1, uint64_t arg2, uint64_t arg
         }
         return (uint64_t)-1;
     } else if (nr == 7) { // sys_getdents
+        if (!uptr_ok(arg2, sizeof(dirent_t))) return (uint64_t)-1;
         task_t *t = task_current();
         if (arg1 >= 3 && arg1 < 16 && t->fd_table[arg1]) {
             dirent_t *user_dir = (dirent_t *)arg2;
@@ -197,6 +256,7 @@ uint64_t syscall_handler(uint64_t nr, uint64_t arg1, uint64_t arg2, uint64_t arg
         }
         return 0; /* nincs adat */
     } else if (nr == 12) { // sys_mouse
+        if (!uptr_ok(arg1, 3 * sizeof(uint32_t))) return (uint64_t)-1;
         uint32_t *out = (uint32_t *)arg1;
         mouse_state_t ms;
         mouse_get_state(&ms);
@@ -213,6 +273,7 @@ uint64_t syscall_handler(uint64_t nr, uint64_t arg1, uint64_t arg2, uint64_t arg
          *   out[40..43]   = sector_size  (u32)
          *   out[44]       = writable (u8: 0/1)
          */
+        if (!uptr_ok(arg2, 45)) return (uint64_t)-1;
         size_t idx = (size_t)arg1;
         block_device_t *bd = block_at(idx);
         if (!bd) return (uint64_t)-1;
@@ -235,6 +296,7 @@ uint64_t syscall_handler(uint64_t nr, uint64_t arg1, uint64_t arg2, uint64_t arg
          *   out[6..7]   = vendor (u16)
          *   out[8..9]   = device (u16)
          */
+        if (!uptr_ok(arg2, 10)) return (uint64_t)-1;
         size_t idx = (size_t)arg1;
         const pci_device_t *p = pci_device_at(idx);
         if (!p) return (uint64_t)-1;
@@ -244,8 +306,75 @@ uint64_t syscall_handler(uint64_t nr, uint64_t arg1, uint64_t arg2, uint64_t arg
         *(uint16_t *)(out + 6) = p->vendor;
         *(uint16_t *)(out + 8) = p->device;
         return 0;
+    } else if (nr == 17) { // sys_mkdir(path)
+        if (!uptr_ok(arg1, 1)) return (uint64_t)-1;
+        const char *path = (const char *)arg1;
+        vfs_node_t *parent = fs_root;
+        const char *dname = path;
+        const char *last_slash = NULL;
+        for (const char *q = path; *q; q++) if (*q == '/') last_slash = q;
+        if (last_slash && last_slash != path) {
+            char parent_path[128];
+            size_t plen = (size_t)(last_slash - path);
+            if (plen < 127) {
+                for (size_t qi = 0; qi < plen; qi++) parent_path[qi] = path[qi];
+                parent_path[plen] = 0;
+                vfs_node_t *pp = vfs_lookup(parent_path);
+                if (pp) parent = pp;
+            }
+            dname = last_slash + 1;
+        } else if (path[0] == '/') {
+            dname = path + 1;
+        }
+        return (*dname && vfs_mkdir_node(parent, dname) == 0) ? 0 : (uint64_t)-1;
+
+    } else if (nr == 18) { // sys_unlink(path)
+        if (!uptr_ok(arg1, 1)) return (uint64_t)-1;
+        const char *path = (const char *)arg1;
+        vfs_node_t *parent = fs_root;
+        const char *fname = path;
+        const char *last_slash = NULL;
+        for (const char *q = path; *q; q++) if (*q == '/') last_slash = q;
+        if (last_slash && last_slash != path) {
+            char parent_path[128];
+            size_t plen = (size_t)(last_slash - path);
+            if (plen < 127) {
+                for (size_t qi = 0; qi < plen; qi++) parent_path[qi] = path[qi];
+                parent_path[plen] = 0;
+                vfs_node_t *pp = vfs_lookup(parent_path);
+                if (pp) parent = pp;
+            }
+            fname = last_slash + 1;
+        } else if (path[0] == '/') {
+            fname = path + 1;
+        }
+        return (*fname && vfs_unlink(parent, fname) == 0) ? 0 : (uint64_t)-1;
+
+    } else if (nr == 19) { // sys_close(fd)
+        int fd = (int)arg1;
+        if (fd >= 3 && fd < 16) {
+            task_t *t = task_current();
+            if (t->fd_table[fd]) {
+                vfs_close(t->fd_table[fd]);
+                t->fd_table[fd] = NULL;
+                t->fd_offset[fd] = 0;
+                return 0;
+            }
+        }
+        return (uint64_t)-1;
+
+    } else if (nr == 20) { // sys_seek(fd, offset)
+        int fd = (int)arg1;
+        if (fd >= 3 && fd < 16) {
+            task_t *t = task_current();
+            if (t->fd_table[fd]) {
+                t->fd_offset[fd] = arg2;
+                return arg2;
+            }
+        }
+        return (uint64_t)-1;
     }
-    
+
     kprintf("[syscall] Unknown syscall %lu from task '%s'\n", nr, task_current()->name);
     return (uint64_t)-1;
 }

@@ -125,6 +125,12 @@ static int read_blocks(uint64_t lba, uint32_t count, void *buf) {
     return g_fat.bdev->read(g_fat.bdev, lba, count, buf);
 }
 
+/* Helper: szektor írás a kiválasztott block device-ra. */
+static int write_blocks(uint64_t lba, uint32_t count, const void *buf) {
+    if (!g_fat.bdev || !g_fat.bdev->write) return 0;
+    return g_fat.bdev->write(g_fat.bdev, lba, count, buf);
+}
+
 /* --- FAT cluster lánc --------------------------------------------------- */
 
 /* Cluster-szám -> első szektor (LBA) a data area-ban. */
@@ -141,6 +147,73 @@ static uint32_t fat_next_cluster(uint32_t cluster) {
     if (read_blocks(fat_sector, 1, buf) != 1) return 0x0FFFFFFF;
     uint32_t *entries = (uint32_t *)buf;
     return entries[ent_offset] & 0x0FFFFFFF;
+}
+
+/* FAT entry írása (MINDKÉT FAT példányba). */
+static void fat_set_entry(uint32_t cluster, uint32_t value) {
+    uint32_t fat_offset  = cluster * 4;
+    uint32_t fat_sector  = g_fat.fat_start_lba + (fat_offset / SECTOR_SIZE);
+    uint32_t ent_offset  = fat_offset % SECTOR_SIZE;
+
+    static uint8_t wbuf[SECTOR_SIZE];
+    for (uint8_t fi = 0; fi < (g_fat.fat_size > 0 ? 2 : 1); fi++) {
+        uint32_t sec = fat_sector + fi * g_fat.fat_size;
+        if (read_blocks(sec, 1, wbuf) != 1) return;
+        uint32_t *e = (uint32_t *)(wbuf + ent_offset);
+        *e = (*e & 0xF0000000u) | (value & 0x0FFFFFFFu);
+        write_blocks(sec, 1, wbuf);
+    }
+}
+
+/* Szabad cluster keresés és foglalás. Visszaad 0-t ha nincs szabad hely. */
+static uint32_t fat_alloc_cluster(void) {
+    static uint8_t fat_sec_buf[SECTOR_SIZE];
+    uint32_t entries_per_sec = SECTOR_SIZE / 4;
+
+    for (uint32_t sec = 0; sec < g_fat.fat_size; sec++) {
+        if (read_blocks(g_fat.fat_start_lba + sec, 1, fat_sec_buf) != 1) continue;
+        uint32_t *entries = (uint32_t *)fat_sec_buf;
+        for (uint32_t j = 0; j < entries_per_sec; j++) {
+            if ((entries[j] & 0x0FFFFFFF) == 0) {
+                uint32_t cluster = sec * entries_per_sec + j;
+                if (cluster < 2) continue;  /* cluster 0 és 1 speciális */
+                /* Foglalás: EOC jel */
+                entries[j] = (entries[j] & 0xF0000000u) | 0x0FFFFFFFFu;
+                write_blocks(g_fat.fat_start_lba + sec, 1, fat_sec_buf);
+                /* Második FAT frissítése ha van */
+                if (g_fat.fat_size > 0 && read_blocks(g_fat.fat_start_lba + g_fat.fat_size + sec, 1, fat_sec_buf) == 1) {
+                    entries[j] = (entries[j] & 0xF0000000u) | 0x0FFFFFFFFu;
+                    write_blocks(g_fat.fat_start_lba + g_fat.fat_size + sec, 1, fat_sec_buf);
+                }
+                return cluster;
+            }
+        }
+    }
+    return 0;  /* nincs szabad cluster */
+}
+
+/* Teljes cluster lánc felszabadítása. */
+static void fat_free_chain(uint32_t cluster) {
+    while (cluster >= 2 && cluster < CLUSTER_END_MARK) {
+        uint32_t next = fat_next_cluster(cluster);
+        fat_set_entry(cluster, 0);
+        cluster = next;
+    }
+}
+
+/* Egy cluster adatának kiírása a lemezre. */
+static int fat_write_cluster(uint32_t cluster, const uint8_t *data) {
+    uint32_t lba = cluster_to_lba(cluster);
+    uint32_t remaining = g_fat.sectors_per_cluster;
+    const uint8_t *p = data;
+    while (remaining > 0) {
+        uint32_t chunk = remaining > 32 ? 32 : remaining;
+        if ((uint32_t)write_blocks(lba, chunk, p) != chunk) return -1;
+        lba += chunk;
+        p += chunk * SECTOR_SIZE;
+        remaining -= chunk;
+    }
+    return 0;
 }
 
 /* Cluster teljes tartalmát olvassa ki egy frissen kmalloc-olt bufferbe. */
@@ -201,8 +274,18 @@ typedef struct {
     /* Csak könyvtárakhoz: cache-elt gyermek lista (lazy) */
     vfs_node_t **children;
     uint32_t    child_count;
+    uint32_t    children_cap;     /* allokált kapacitás */
     bool        children_loaded;
+    /* Íráshoz: a directory entry helye a szülő könyvtárban */
+    uint32_t    dirent_sector;    /* LBA of parent dir sector containing this node's 8.3 entry */
+    uint32_t    dirent_off;       /* byte offset within dirent_sector (multiple of 32) */
 } fat32_priv_t;
+
+/* Forward deklarációk (write API) */
+static vfs_node_t *fat32_create_impl(vfs_node_t *dir, const char *name, uint32_t flags);
+static int         fat32_mkdir_impl (vfs_node_t *dir, const char *name);
+static int         fat32_unlink_impl(vfs_node_t *dir, const char *name);
+static uint64_t    fat32_write(vfs_node_t *node, uint64_t offset, uint64_t size, uint8_t *buffer);
 
 static fat32_priv_t *priv_of(vfs_node_t *n) { return (fat32_priv_t *)n->ptr; }
 
@@ -270,6 +353,105 @@ static uint64_t fat32_read(vfs_node_t *node, uint64_t offset, uint64_t size, uin
     return out_pos;
 }
 
+/* A directory entry méret és cluster mezőinek frissítése a lemezen. */
+static void fat32_update_dirent(vfs_node_t *node, uint32_t new_size, uint32_t new_cluster) {
+    fat32_priv_t *p = priv_of(node);
+    if (!p || p->dirent_sector == 0) return;
+
+    static uint8_t sec_buf[SECTOR_SIZE];
+    if (read_blocks(p->dirent_sector, 1, sec_buf) != 1) return;
+    fat32_dir_entry_t *e = (fat32_dir_entry_t *)(sec_buf + p->dirent_off);
+    if (new_size != (uint32_t)-1) {
+        e->size = new_size;
+    }
+    if (new_cluster != (uint32_t)-1) {
+        e->cluster_hi = (uint16_t)(new_cluster >> 16);
+        e->cluster_lo = (uint16_t)(new_cluster & 0xFFFF);
+    }
+    write_blocks(p->dirent_sector, 1, sec_buf);
+}
+
+/* VFS write callback: adatot ír egy FAT32 fájlba. */
+static uint64_t fat32_write(vfs_node_t *node, uint64_t offset, uint64_t size, uint8_t *buffer) {
+    if (!node) return 0;
+    fat32_priv_t *p = priv_of(node);
+    if (!p || p->is_dir) return 0;
+    if (size == 0) return 0;
+
+    /* Ha a fájlnak nincs még clustere, foglalunk egyet */
+    if (p->start_cluster < 2) {
+        uint32_t nc = fat_alloc_cluster();
+        if (!nc) return 0;
+        p->start_cluster = nc;
+        /* Töröljük az új clustert */
+        uint8_t *zeros = (uint8_t *)kzalloc(g_fat.bytes_per_cluster);
+        if (zeros) { fat_write_cluster(nc, zeros); kfree(zeros); }
+        fat32_update_dirent(node, (uint32_t)-1, nc);
+    }
+
+    uint64_t out_pos = 0;
+    uint32_t cluster = p->start_cluster;
+    uint64_t cluster_offset = 0;
+    uint32_t prev_cluster = 0;
+
+    /* Seek az offset-ig, cluster lánc bővítéssel ha szükséges */
+    while (cluster_offset + g_fat.bytes_per_cluster <= offset) {
+        uint32_t next = fat_next_cluster(cluster);
+        if (next >= CLUSTER_END_MARK || next < 2) {
+            /* Lánc vége, de még nem értük el az offset-et: bővítés */
+            uint32_t nc = fat_alloc_cluster();
+            if (!nc) return 0;
+            fat_set_entry(cluster, nc);
+            uint8_t *zeros = (uint8_t *)kzalloc(g_fat.bytes_per_cluster);
+            if (zeros) { fat_write_cluster(nc, zeros); kfree(zeros); }
+            next = nc;
+        }
+        prev_cluster = cluster;
+        cluster = next;
+        cluster_offset += g_fat.bytes_per_cluster;
+    }
+
+    /* Írás cluster-onként */
+    while (out_pos < size) {
+        if (cluster < 2 || cluster >= CLUSTER_END_MARK) {
+            /* Lánc vége: bővítjük */
+            uint32_t nc = fat_alloc_cluster();
+            if (!nc) break;
+            fat_set_entry(prev_cluster ? prev_cluster : p->start_cluster, nc);
+            /* Ha ez az első cluster az EOC volt, most frissítjük a start_cluster-t */
+            cluster = nc;
+            uint8_t *zeros = (uint8_t *)kzalloc(g_fat.bytes_per_cluster);
+            if (zeros) { fat_write_cluster(nc, zeros); kfree(zeros); }
+        }
+
+        /* Olvassuk be az aktuális clustert, módosítjuk, visszaírjuk */
+        uint8_t *cbuf = read_cluster(cluster);
+        if (!cbuf) break;
+
+        uint64_t in_cluster_offset = (out_pos == 0) ? (offset - cluster_offset) : 0;
+        uint64_t copy_len = g_fat.bytes_per_cluster - in_cluster_offset;
+        if (copy_len > size - out_pos) copy_len = size - out_pos;
+
+        kmemcpy(cbuf + in_cluster_offset, buffer + out_pos, copy_len);
+        fat_write_cluster(cluster, cbuf);
+        kfree(cbuf);
+
+        out_pos += copy_len;
+        cluster_offset += g_fat.bytes_per_cluster;
+        prev_cluster = cluster;
+        cluster = fat_next_cluster(cluster);
+    }
+
+    /* Frissítjük a fájl méretét ha nőtt */
+    uint64_t new_end = offset + out_pos;
+    if (new_end > p->size) {
+        p->size = (uint32_t)new_end;
+        node->length = new_end;
+        fat32_update_dirent(node, (uint32_t)new_end, (uint32_t)-1);
+    }
+    return out_pos;
+}
+
 static vfs_node_t *create_fat32_node(const char *name, bool is_dir, uint32_t cluster, uint32_t size) {
     vfs_node_t *n = (vfs_node_t *)kzalloc(sizeof(vfs_node_t));
     if (!n) return NULL;
@@ -289,9 +471,16 @@ static vfs_node_t *create_fat32_node(const char *name, bool is_dir, uint32_t clu
     p->child_count = 0;
     p->children_loaded = false;
 
-    n->read = fat32_read;
+    n->read    = fat32_read;
+    n->write   = is_dir ? NULL : fat32_write;
     n->readdir = fat32_readdir;
     n->finddir = fat32_finddir;
+    n->create  = NULL;   /* later set for dirs */
+    n->mkdir   = NULL;
+    n->unlink  = NULL;
+    p->dirent_sector = 0;
+    p->dirent_off    = 0;
+    p->children_cap  = 0;
 
     if (g_fat_node_count < FAT32_MAX_NODES) {
         g_fat_nodes_pool[g_fat_node_count++] = n;
@@ -330,6 +519,8 @@ static void fat32_dir_load_children(vfs_node_t *dir) {
         if (!cbuf) break;
 
         uint32_t entries = g_fat.bytes_per_cluster / 32;
+        uint32_t base_lba = cluster_to_lba(cluster);  /* LBA a cluster első szektora */
+
         for (uint32_t i = 0; i < entries; i++) {
             fat32_dir_entry_t *e = (fat32_dir_entry_t *)(cbuf + i * 32);
 
@@ -380,7 +571,21 @@ static void fat32_dir_load_children(vfs_node_t *dir) {
             vfs_node_t *child = create_fat32_node(name, is_dir, first_cluster, size);
             if (!child) continue;
 
-            /* Adjuk a kids listához (egyszerű double-on-grow) */
+            /* Dirent helye a lemezen */
+            fat32_priv_t *cp = priv_of(child);
+            if (cp) {
+                cp->dirent_sector = base_lba + (i * 32) / SECTOR_SIZE;
+                cp->dirent_off    = (i * 32) % SECTOR_SIZE;
+            }
+
+            /* Könyvtáraknál regisztráljuk a create/mkdir/unlink callbackeket */
+            if (is_dir) {
+                child->create = fat32_create_impl;
+                child->mkdir  = fat32_mkdir_impl;
+                child->unlink = fat32_unlink_impl;
+            }
+
+            /* Adjuk a kids listához */
             if (kids_n == kids_cap) {
                 uint32_t new_cap = kids_cap ? kids_cap * 2 : 8;
                 vfs_node_t **new_arr = (vfs_node_t **)kmalloc(new_cap * sizeof(*new_arr));
@@ -400,6 +605,236 @@ static void fat32_dir_load_children(vfs_node_t *dir) {
 done:
     dp->children = kids;
     dp->child_count = kids_n;
+    dp->children_cap = kids_cap;
+}
+
+/* --- FAT32 Write API: create, mkdir, unlink ------------------------------ */
+
+/* 8.3 fájlnév előállítása (uppercase, kiterjesztés nélkül max 8 char). */
+static void name_to_83(const char *name, uint8_t out[11]) {
+    for (int i = 0; i < 11; i++) out[i] = ' ';
+    int i = 0, o = 0;
+    /* Alapnév */
+    while (name[i] && name[i] != '.' && o < 8) {
+        char c = name[i++];
+        if (c >= 'a' && c <= 'z') c -= 32;
+        out[o++] = (uint8_t)c;
+    }
+    /* Kiterjesztés keresése */
+    const char *dot = name;
+    while (*dot && *dot != '.') dot++;
+    if (*dot == '.') {
+        dot++;
+        int eo = 8;
+        while (*dot && eo < 11) {
+            char c = *dot++;
+            if (c >= 'a' && c <= 'z') c -= 32;
+            out[eo++] = (uint8_t)c;
+        }
+    }
+}
+
+/* Szabad (0x00 vagy 0xE5) directory entry keresése a könyvtárban.
+ * Visszaadja a szektor LBA-ját és a byte offset-et.
+ * Ha nincs hely, 0-t ad vissza. */
+static bool fat32_find_free_dirent(uint32_t dir_cluster,
+                                   uint32_t *out_sector, uint32_t *out_off) {
+    static uint8_t sec_buf[SECTOR_SIZE];
+    uint32_t cluster = dir_cluster;
+
+    while (cluster >= 2 && cluster < CLUSTER_END_MARK) {
+        uint32_t base_lba = cluster_to_lba(cluster);
+        for (uint32_t s = 0; s < g_fat.sectors_per_cluster; s++) {
+            if (read_blocks(base_lba + s, 1, sec_buf) != 1) continue;
+            for (uint32_t e = 0; e < SECTOR_SIZE / 32; e++) {
+                uint8_t first = sec_buf[e * 32];
+                if (first == 0x00 || first == 0xE5) {
+                    *out_sector = base_lba + s;
+                    *out_off    = e * 32;
+                    return true;
+                }
+            }
+        }
+        cluster = fat_next_cluster(cluster);
+    }
+    return false;
+}
+
+/* Hozzáadja az új gyermeket a könyvtár in-memory children tömbjéhez. */
+static void dir_add_child(vfs_node_t *dir, vfs_node_t *child) {
+    fat32_priv_t *dp = priv_of(dir);
+    if (!dp) return;
+    if (dp->child_count == dp->children_cap) {
+        uint32_t nc = dp->children_cap ? dp->children_cap * 2 : 8;
+        vfs_node_t **na = (vfs_node_t **)kmalloc(nc * sizeof(*na));
+        if (!na) return;
+        for (uint32_t k = 0; k < dp->child_count; k++) na[k] = dp->children[k];
+        if (dp->children) kfree(dp->children);
+        dp->children = na;
+        dp->children_cap = nc;
+    }
+    dp->children[dp->child_count++] = child;
+}
+
+/* Fájl létrehozása egy könyvtárban (VFS create callback). */
+static vfs_node_t *fat32_create_impl(vfs_node_t *dir, const char *name, uint32_t flags) {
+    (void)flags;
+    if (!dir || !name) return NULL;
+    fat32_priv_t *dp = priv_of(dir);
+    if (!dp || !dp->is_dir) return NULL;
+
+    /* Allokálunk egy clustert az új fájlnak */
+    uint32_t clust = fat_alloc_cluster();
+    /* Üres cluster: size=0, cluster megadva */
+
+    /* Szabad directory entry keresése */
+    uint32_t ds, doff;
+    if (!fat32_find_free_dirent(dp->start_cluster, &ds, &doff)) {
+        if (clust) fat_set_entry(clust, 0);
+        kprintf("[fat32] create: no free dirent for '%s'\n", name);
+        return NULL;
+    }
+
+    /* 8.3 directory entry írása */
+    static uint8_t sec_buf[SECTOR_SIZE];
+    if (read_blocks(ds, 1, sec_buf) != 1) {
+        if (clust) fat_set_entry(clust, 0);
+        return NULL;
+    }
+    fat32_dir_entry_t *e = (fat32_dir_entry_t *)(sec_buf + doff);
+    kmemset(e, 0, 32);
+    name_to_83(name, e->name);
+    e->attr        = ATTR_ARCHIVE;
+    e->cluster_hi  = clust ? (uint16_t)(clust >> 16) : 0;
+    e->cluster_lo  = clust ? (uint16_t)(clust & 0xFFFF) : 0;
+    e->size        = 0;
+    write_blocks(ds, 1, sec_buf);
+
+    /* VFS node létrehozása */
+    vfs_node_t *child = create_fat32_node(name, false, clust ? clust : 0, 0);
+    if (!child) {
+        if (clust) fat_set_entry(clust, 0);
+        return NULL;
+    }
+    fat32_priv_t *cp = priv_of(child);
+    if (cp) {
+        cp->dirent_sector = ds;
+        cp->dirent_off    = doff;
+    }
+
+    dir_add_child(dir, child);
+
+    if (g_fat_node_count < FAT32_MAX_NODES)
+        g_fat_nodes_pool[g_fat_node_count++] = child;
+
+    return child;
+}
+
+/* Alkönyvtár létrehozása (VFS mkdir callback). */
+static int fat32_mkdir_impl(vfs_node_t *dir, const char *name) {
+    if (!dir || !name) return -1;
+    fat32_priv_t *dp = priv_of(dir);
+    if (!dp || !dp->is_dir) return -1;
+
+    /* Cluster allokálás az új könyvtárnak */
+    uint32_t clust = fat_alloc_cluster();
+    if (!clust) return -1;
+
+    /* "." és ".." bejegyzések írása az új clusterbe */
+    uint8_t *dir_buf = (uint8_t *)kzalloc(g_fat.bytes_per_cluster);
+    if (!dir_buf) { fat_set_entry(clust, 0); return -1; }
+
+    fat32_dir_entry_t *dot = (fat32_dir_entry_t *)dir_buf;
+    kmemset(dot, ' ', 11); dot->name[0] = '.';
+    dot->attr = ATTR_DIRECTORY;
+    dot->cluster_hi = (uint16_t)(clust >> 16);
+    dot->cluster_lo = (uint16_t)(clust & 0xFFFF);
+
+    fat32_dir_entry_t *dotdot = (fat32_dir_entry_t *)(dir_buf + 32);
+    kmemset(dotdot->name, ' ', 11); dotdot->name[0] = '.'; dotdot->name[1] = '.';
+    dotdot->attr = ATTR_DIRECTORY;
+    dotdot->cluster_hi = (uint16_t)(dp->start_cluster >> 16);
+    dotdot->cluster_lo = (uint16_t)(dp->start_cluster & 0xFFFF);
+
+    fat_write_cluster(clust, dir_buf);
+    kfree(dir_buf);
+
+    /* Szabad dirent keresése a szülő könyvtárban */
+    uint32_t ds, doff;
+    if (!fat32_find_free_dirent(dp->start_cluster, &ds, &doff)) {
+        fat_set_entry(clust, 0);
+        return -1;
+    }
+
+    static uint8_t sec_buf[SECTOR_SIZE];
+    if (read_blocks(ds, 1, sec_buf) != 1) { fat_set_entry(clust, 0); return -1; }
+    fat32_dir_entry_t *e = (fat32_dir_entry_t *)(sec_buf + doff);
+    kmemset(e, 0, 32);
+    name_to_83(name, e->name);
+    e->attr        = ATTR_DIRECTORY;
+    e->cluster_hi  = (uint16_t)(clust >> 16);
+    e->cluster_lo  = (uint16_t)(clust & 0xFFFF);
+    e->size        = 0;
+    write_blocks(ds, 1, sec_buf);
+
+    /* VFS node létrehozása és hozzáadása */
+    vfs_node_t *child = create_fat32_node(name, true, clust, 0);
+    if (child) {
+        fat32_priv_t *cp = priv_of(child);
+        if (cp) { cp->dirent_sector = ds; cp->dirent_off = doff; }
+        child->create = fat32_create_impl;
+        child->mkdir  = fat32_mkdir_impl;
+        child->unlink = fat32_unlink_impl;
+        dir_add_child(dir, child);
+        if (g_fat_node_count < FAT32_MAX_NODES)
+            g_fat_nodes_pool[g_fat_node_count++] = child;
+    }
+    return 0;
+}
+
+/* Fájl törlése a könyvtárból (VFS unlink callback). */
+static int fat32_unlink_impl(vfs_node_t *dir, const char *name) {
+    if (!dir || !name) return -1;
+    fat32_priv_t *dp = priv_of(dir);
+    if (!dp || !dp->is_dir) return -1;
+
+    /* Megkeressük a gyereket az in-memory listában */
+    if (!dp->children_loaded) fat32_dir_load_children(dir);
+    vfs_node_t *found = NULL;
+    uint32_t found_idx = 0;
+    for (uint32_t i = 0; i < dp->child_count; i++) {
+        if (kstrcmp(dp->children[i]->name, name) == 0) {
+            found = dp->children[i];
+            found_idx = i;
+            break;
+        }
+    }
+    if (!found) return -1;
+
+    fat32_priv_t *fp = priv_of(found);
+    if (!fp) return -1;
+
+    /* Directory entry törlése (0xE5 jelölő) */
+    if (fp->dirent_sector != 0) {
+        static uint8_t sec_buf[SECTOR_SIZE];
+        if (read_blocks(fp->dirent_sector, 1, sec_buf) == 1) {
+            sec_buf[fp->dirent_off] = 0xE5;
+            write_blocks(fp->dirent_sector, 1, sec_buf);
+        }
+    }
+
+    /* Cluster lánc felszabadítása */
+    if (fp->start_cluster >= 2) {
+        fat_free_chain(fp->start_cluster);
+    }
+
+    /* Kivétel az in-memory listából */
+    for (uint32_t i = found_idx; i + 1 < dp->child_count; i++) {
+        dp->children[i] = dp->children[i + 1];
+    }
+    dp->child_count--;
+
+    return 0;
 }
 
 /* --- Init ---------------------------------------------------------------- */
@@ -482,5 +917,21 @@ vfs_node_t *fat32_init(void) {
     for (int i = 10; i >= 0 && (vol[i] == ' ' || vol[i] == 0); i--) vol[i] = 0;
 
     vfs_node_t *root = create_fat32_node(vol[0] ? vol : "fat32", true, g_fat.root_cluster, 0);
+    if (root) {
+        root->create = fat32_create_impl;
+        root->mkdir  = fat32_mkdir_impl;
+        root->unlink = fat32_unlink_impl;
+    }
     return root;
+}
+
+/* Globális API wrapper-ek a fat32.h-ban deklarált függvényekhez */
+vfs_node_t *fat32_create_file(vfs_node_t *dir, const char *name) {
+    return fat32_create_impl(dir, name, 0);
+}
+int fat32_mkdir(vfs_node_t *dir, const char *name) {
+    return fat32_mkdir_impl(dir, name);
+}
+int fat32_unlink(vfs_node_t *dir, const char *name) {
+    return fat32_unlink_impl(dir, name);
 }
