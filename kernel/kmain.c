@@ -25,6 +25,8 @@
 #include <sched/sched.h>
 #include <rexos/fs.h>
 #include <fs/tarfs.h>
+#include <fs/fat32.h>
+#include <drivers/ata/ata.h>
 #include <rexos/elf.h>
 #include <arch/x86_64/syscall.h>
 
@@ -59,7 +61,7 @@ static __noreturn void hcf(void)
 
 static void worker_ticker(void *arg)
 {
-    uint64_t id = (uint64_t)arg;
+    (void)arg;
     uint64_t last_tick = 0;
 
     for (;;) {
@@ -352,6 +354,7 @@ static void shell_execute(char *line)
     else kprintf("unknown command: '%s' (try 'help')\n", line);
 }
 
+__attribute__((unused))
 static __noreturn void shell_run(void)
 {
     char line[SHELL_LINE_MAX];
@@ -431,6 +434,25 @@ void kmain(void)
         kprintf("[vfs] No modules found from bootloader!\n");
     }
 
+    /* --- FAT32 mount (ATA primary master) ----------------------------- */
+    if (ata_init()) {
+        vfs_node_t *fat_root = fat32_init();
+        if (fat_root) {
+            vfs_mount("/mnt", fat_root);
+
+            /* Önteszt: olvassunk egy fájlt a FAT32-ről, hogy lássuk működik */
+            vfs_node_t *test = vfs_lookup("/mnt/README.TXT");
+            if (!test) test = vfs_lookup("/mnt/readme.txt");
+            if (test && test->length > 0 && test->length < 256) {
+                uint8_t tbuf[256];
+                uint64_t n = vfs_read(test, 0, test->length, tbuf);
+                tbuf[n < 255 ? n : 255] = 0;
+                kprintf("[fat32] read self-test (/mnt/README.TXT, %lu bytes): %s\n",
+                        n, (const char *)tbuf);
+            }
+        }
+    }
+
     console_init();
 
     sched_init();
@@ -442,13 +464,20 @@ void kmain(void)
     kprintf("   Preemptive Scheduler + User Mode initialized.\n");
     kprintf("============================================================\n");
 
-    /* Shell-t már nem a kernel futtatja, hanem Ring 3-as processzként indul! */
-    kprintf("[kmain] Spawning User Mode shell...\n");
-    vfs_node_t *shell_node = vfs_finddir(fs_root, "shell.elf");
-    if (shell_node) {
-        task_spawn_user("shell.elf", shell_node);
+    /* Grafikus asztal indítása Ring 3-as processzként.
+     * Ha a desktop.elf nem található, fallback shell.elf-re. */
+    kprintf("[kmain] Spawning RexOS Desktop...\n");
+    vfs_node_t *desktop_node = vfs_finddir(fs_root, "desktop.elf");
+    if (desktop_node) {
+        task_spawn_user("desktop.elf", desktop_node);
     } else {
-        kprintf("[kmain] ERROR: shell.elf not found in initrd!\n");
+        vfs_node_t *shell_node = vfs_finddir(fs_root, "shell.elf");
+        if (shell_node) {
+            kprintf("[kmain] desktop.elf not found, falling back to shell.elf\n");
+            task_spawn_user("shell.elf", shell_node);
+        } else {
+            kprintf("[kmain] ERROR: no shell or desktop found in initrd!\n");
+        }
     }
 
     /* A kernel fő taszkja (kmain) befejezte a dolgát, nyugovóra térhet.

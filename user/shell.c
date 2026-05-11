@@ -28,14 +28,21 @@ void _start() {
                     exit(0);
                 } else if (strcmp(line, "help") == 0) {
                     print("Built-in commands:\n");
-                    print("  help       - Show this help\n");
-                    print("  exit       - Exit the shell\n");
-                    print("  ls         - List files\n");
-                    print("  cat <file> - Show file contents\n");
+                    print("  help        - Show this help\n");
+                    print("  exit        - Exit the shell\n");
+                    print("  ls [path]   - List files (default: /)\n");
+                    print("  cat <file>  - Show file contents (supports /mnt/...)\n");
+                    print("  clear       - Clear the screen (ANSI)\n");
+                    print("  desktop     - Launch the graphical desktop\n");
                     print("You can also run any .elf file directly.\n");
-                } else if (strcmp(line, "ls") == 0) {
-                    /* Beépített ls: megnyitjuk a root-ot és listázzuk */
-                    int fd = open("/");
+                } else if (strcmp(line, "clear") == 0) {
+                    /* ANSI clear screen */
+                    print("\033[2J\033[H");
+                } else if (line[0] == 'l' && line[1] == 's' && (line[2] == 0 || line[2] == ' ')) {
+                    const char *path = (line[2] == ' ') ? &line[3] : "/";
+                    while (*path == ' ') path++;
+                    if (*path == 0) path = "/";
+                    int fd = open(path);
                     if (fd >= 0) {
                         dirent_t dir;
                         while (getdents(fd, &dir) > 0) {
@@ -44,7 +51,9 @@ void _start() {
                             print("\n");
                         }
                     } else {
-                        print("ls: failed to open directory\n");
+                        print("ls: cannot open '");
+                        print(path);
+                        print("'\n");
                     }
                 } else if (line[0] == 'c' && line[1] == 'a' && line[2] == 't' && line[3] == ' ') {
                     /* Beépített cat: cat <fájlnév> */
