@@ -116,9 +116,10 @@ Egységes absztrakció a tároló-driverekhez (`kernel/drivers/block/block.h`). 
 
 ### 5.6. FAT32 (Lemez)
 Valódi háttértároló-támogatás FAT32 fájlrendszerre:
-- **FAT32 read-only** driver (`kernel/fs/fat32.c`), 8.3 nevek + LFN (Long File Name) támogatással, alkönyvtárak rekurzívan.
+- **FAT32 write-enabled** driver (`kernel/fs/fat32.c`), 8.3 nevek + LFN (Long File Name) támogatással, alkönyvtárak rekurzívan.
+- **Írási műveletek**: fájlok létrehozása (`O_CREAT`), módosítása, törlése (`sys_unlink`) és mappák létrehozása (`sys_mkdir`).
 - **MBR + sima FAT32** is támogatott (boot szektor detektálás).
-- Bármilyen regisztrált block device-ról olvas.
+- Bármilyen regisztrált block device-ról olvas/ír.
 - Felmountolva a `/mnt`-re; minden FAT32 fájl elérhető a `vfs_lookup("/mnt/...")` hívással.
 - A `make disk` célt használja a `disk.img` előállítására `mtools` segítségével (nem kell root).
 
@@ -169,12 +170,15 @@ A felhasználói programok nem közvetlenül hívják a syscall-okat, hanem a `l
 ### 7.2. Desktop Environment (v2)
 A RexOS grafikus asztali környezete teljes többablakos shell:
 - **Interaktív ablakkezelés**: címsor-húzás, bezárás (x), fókusz, kaszkád pozícionálás (max. 16 ablak).
-- **Asztali ikonok**: Bal oldalt kattintható alkalmazás-indítók (dupla kattintás).
-- **Tálca**: Start gomb, megnyitott ablakok listája, digitális óra.
-- **Start menü**: Felugró applikáció-választó panel.
+- **Modern Grafika**: Alpha blending (átlátszóság), lekerekített sarkok, vetett árnyékok és vertikális színátmenetek.
+- **Asztali ikonok**: Bal oldalt kattintható alkalmazás-indítók, **smooth hover animációkkal**.
+- **Tálca**: Glassmorphism (áttetsző) effekt, Start gomb, megnyitott ablakok listája, digitális óra, Shutdown gomb.
+- **Háttérkép**: Automatikus `.bmp` háttérkép betöltése a lemezről vagy procedurális gradiens generálása.
+- **Performance**: Dirty Rectangle alapú renderelés (csak a változott képernyőterületek frissítése).
+- **Start menü**: Felugró applikáció-választó panel, beépített Shutdown funkcióval.
 - **Beépített alkalmazások**:
-  - **Files** — fájlkezelő initrd és FAT32 (`/mnt`) támogatással, navigálható alkönyvtárakkal.
-  - **Text Viewer** — szöveges fájl megjelenítő (Files-ban kattintással nyílik).
+  - **Files** — fájlkezelő initrd és FAT32 (`/mnt`) támogatással.
+  - **Code Editor** — Teljes értékű szövegszerkesztő: Command/Insert módok (Vim-stílus), és **lemezre mentési lehetőség (`m` billentyű)**.
   - **Calculator** — 4 alapművelet, billentyűzettel és egérrel is.
   - **Terminal** — beépített parancssor: `ls`, `cd`, `cat`, `pwd`, `run`, `uptime`, `clear`.
   - **SysInfo** — élő rendszer-információk (uptime, block + PCI device szám).
@@ -239,15 +243,18 @@ A BIOS-ban kapcsold ki a **Secure Boot**-ot, és ha nem indul modern módban, á
 **Mi működik ma valós gépen:**
 - ✅ Framebuffer (UEFI GOP / BIOS VBE)
 - ✅ Kernel boot, scheduler, memóriakezelés
-- ✅ AHCI SATA (olvasás) — `/mnt` FAT32
+- ✅ AHCI SATA (olvasás/írás) — `/mnt` FAT32
+- ✅ NVMe SSD támogatás (PCIe / MMIO)
 - ✅ USB billentyűzet + egér (xHCI + HID boot)
 - ✅ PS/2 fallback ha a BIOS emulál
+- ✅ Modern GUI: Átlátszóság, árnyékok, animációk
+- ✅ ACPI Shutdown / Power management
+- ✅ VFS írás: fájlok mentése, törlése, mappák létrehozása
 
 **Mi NEM működik (még):**
 - ❌ USB Mass Storage (a pendrive csak bootra lesz jó, a RexOS-on belül nem jelenik meg block device-ként)
-- ❌ Telepítés (FAT32 write hiányzik)
-- ❌ Hálózat
-- ❌ NVMe (ha csak NVMe van a gépben, nem lesz `/mnt`)
+- ❌ Hálózat (E1000/virtio-net folyamatban)
+- ❌ Hang (Intel HDA driver hiánya)
 
 ---
 
@@ -266,11 +273,12 @@ A RexOS célja, hogy egy teljes értékű, tanulságos és használható live + 
 **Folyamatban (live rendszer + telepítő útvonal):**
 - [x] **USB xHCI controller**: modern gépeken USB bekapcsolása (2025-11-es úttal).
 - [x] **USB HID**: USB billentyűzet + egér driver, transzparens integráció.
+- [x] **NVMe**: modern SSD-k támogatása (PCIe MMIO).
+- [x] **FAT32 írás**: cluster-foglalás, FAT-frissítés, directory entry alloc.
+- [x] **ACPI shutdown**: szoftveres leállítás és shutdown képernyő.
 - [ ] **USB Mass Storage**: boot pendrive-ról, második block device.
-- [ ] **FAT32 írás**: cluster-foglalás, FAT-frissítés, directory entry alloc.
 - [ ] **Installer logika**: partició + FAT32 formáz + kernel/initrd másolás + Limine setup.
 - [ ] **USB hub támogatás**: több device egy porton.
-- [ ] **ACPI shutdown / reboot**: S5 állapot triple-fault helyett.
 
 **Távoli célok:**
 - [ ] **NVMe**: modern SSD-k.

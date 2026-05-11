@@ -335,6 +335,12 @@ static void bb_draw_shadow(int x, int y, int w, int h) {
 static int g_dirty_x1 = 0, g_dirty_y1 = 0;
 static int g_dirty_x2 = 0, g_dirty_y2 = 0;
 
+/* Előző frame flush területe.
+ * Szükséges: ha egy ablak elmozdul, a RÉGI pozícióját is frissíteni kell
+ * a framebufferben (különben ott marad a "szellemkép"). */
+static int g_prev_flush_x1 = 0, g_prev_flush_y1 = 0;
+static int g_prev_flush_x2 = 0, g_prev_flush_y2 = 0;
+
 static void dirty_reset(void) {
     g_dirty_x1 = (int)scr_w;
     g_dirty_y1 = (int)scr_h;
@@ -2397,11 +2403,21 @@ void _start(void) {
             }
         }
 
-        /* Renderelés ~25Hz */
+        /* Rendelés ~25Hz */
         if (now - last_draw >= 4) {
             last_draw = now;
 
+            /* --- Dirty rect inicializálás ----------------------------------------
+             * Az előző frame flush területét BELEÉPJÜK az új dirty rectbe.
+             * Ez biztosítja, hogy az elmozdulés régi pozíciója is frissül a
+             * framebufferben (a backbufban már helyül van a háttérkep). */
             dirty_reset();
+            if (g_prev_flush_x2 > g_prev_flush_x1) {
+                dirty_mark(g_prev_flush_x1, g_prev_flush_y1,
+                           g_prev_flush_x2 - g_prev_flush_x1,
+                           g_prev_flush_y2 - g_prev_flush_y1);
+            }
+
             bb_draw_wallpaper(now);
 
             int hover_icon = desktop_icon_hit((int)mx, (int)my);
@@ -2417,10 +2433,15 @@ void _start(void) {
             draw_taskbar(now, (int)mx, (int)my);
             draw_start_menu((int)mx, (int)my);
 
-            /* A taskbar és a kurzorozó terület mindig dirty */
+            /* A taskbar és a kurzor területe mindig dirty */
             dirty_mark(0, (int)scr_h - TASKBAR_H - 1, (int)scr_w, TASKBAR_H + 1);
             dirty_mark((int)g_prev_mx, (int)g_prev_my, CURSOR_W + 2, CURSOR_H + 2);
             dirty_mark((int)mx, (int)my, CURSOR_W + 2, CURSOR_H + 2);
+
+            /* Mentjük a mostani dirty rect-et a következő frame számára
+             * (a dirty_flush után, a reset előtt). */
+            g_prev_flush_x1 = g_dirty_x1; g_prev_flush_y1 = g_dirty_y1;
+            g_prev_flush_x2 = g_dirty_x2; g_prev_flush_y2 = g_dirty_y2;
 
             dirty_flush();
             dirty_reset();
