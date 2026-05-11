@@ -24,25 +24,26 @@ void net_register_device(net_device_t *dev) {
     dev->next = s_net_devices;
     s_net_devices = dev;
     
-    /* Set a default IP for testing: 10.0.2.15 (QEMU default user network) */
-    dev->ip.ip[0] = 10;
-    dev->ip.ip[1] = 0;
-    dev->ip.ip[2] = 2;
-    dev->ip.ip[3] = 15;
-    
-    /* Default gateway: 10.0.2.2 (QEMU user-mode NAT gateway) */
-    dev->gateway.ip[0] = 10;
-    dev->gateway.ip[1] = 0;
-    dev->gateway.ip[2] = 2;
-    dev->gateway.ip[3] = 2;
+    if (!dhcp_configure(dev)) {
+        /* Static fallback matching QEMU user-mode NAT defaults. */
+        dev->ip.ip[0] = 10;
+        dev->ip.ip[1] = 0;
+        dev->ip.ip[2] = 2;
+        dev->ip.ip[3] = 15;
 
-    /* Netmask: 255.255.255.0 */
-    dev->netmask.ip[0] = 255;
-    dev->netmask.ip[1] = 255;
-    dev->netmask.ip[2] = 255;
-    dev->netmask.ip[3] = 0;
-    
-    kprintf("[net] Registered device '%s' with IP %d.%d.%d.%d, GW %d.%d.%d.%d\n", 
+        dev->gateway.ip[0] = 10;
+        dev->gateway.ip[1] = 0;
+        dev->gateway.ip[2] = 2;
+        dev->gateway.ip[3] = 2;
+
+        dev->netmask.ip[0] = 255;
+        dev->netmask.ip[1] = 255;
+        dev->netmask.ip[2] = 255;
+        dev->netmask.ip[3] = 0;
+        kprintf("[net] DHCP failed, using static fallback for QEMU user NAT\n");
+    }
+
+    kprintf("[net] Registered device '%s' with IP %d.%d.%d.%d, GW %d.%d.%d.%d\n",
             dev->name,
             dev->ip.ip[0], dev->ip.ip[1], dev->ip.ip[2], dev->ip.ip[3],
             dev->gateway.ip[0], dev->gateway.ip[1], dev->gateway.ip[2], dev->gateway.ip[3]);

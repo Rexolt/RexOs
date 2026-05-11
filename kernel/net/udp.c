@@ -20,6 +20,12 @@ void udp_receive(net_device_t *dev, const ip4_header_t *ip_hdr, const udp_header
             ip_hdr->src_ip.ip[2], ip_hdr->src_ip.ip[3],
             src_port, dest_port, payload_len);
 
+    /* Route DHCP replies before the interface has a configured IPv4 address. */
+    if (dest_port == 68) {
+        dhcp_receive(dev, payload, payload_len, src_port);
+        return;
+    }
+
     /* Route to DNS if it's a response on our DNS query port */
     if (dest_port == 1053) {
         dns_receive(dev, payload, payload_len, src_port);
