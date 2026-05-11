@@ -59,9 +59,33 @@ uint64_t elf_load_ex(vfs_node_t *file, uint64_t *brk_out) {
                 kmemset((void *)phys_to_virt(phys), 0, 0x1000); // HHDM-en keresztül írjuk, biztonságosabb
             }
             
-            /* Adat beolvasása a memóriába (már fel van mappelva a virtuális cím!) */
+            /* Adat beolvasása HHDM-en keresztül, lap-onként.
+             * A közvetlen vaddr írás nem biztonságos: az aktív CR3 nem
+             * feltétlenül tartalmazza a user PML4 mappingjait ilyenkor. */
             if (filesz > 0) {
-                vfs_read(file, phdr->p_offset, filesz, (uint8_t *)vaddr);
+                uint64_t remaining = filesz;
+                uint64_t src_off   = phdr->p_offset;
+                uint64_t dst_v     = vaddr;
+
+                while (remaining > 0) {
+                    uint64_t page_off = dst_v & 0xFFFULL;
+                    uint64_t chunk    = 0x1000ULL - page_off;
+                    if (chunk > remaining) chunk = remaining;
+
+                    uintptr_t frame = vmm_translate_pml4(current_pml4,
+                                                          dst_v & ~0xFFFULL);
+                    if (!frame) {
+                        kprintf("[elf] translate failed at vaddr 0x%lx\n", dst_v);
+                        kfree(ph_buf);
+                        return 0;
+                    }
+                    vfs_read(file, src_off, chunk,
+                             (uint8_t *)phys_to_virt(frame) + page_off);
+
+                    dst_v     += chunk;
+                    src_off   += chunk;
+                    remaining -= chunk;
+                }
             }
             
             kprintf("[elf] Loaded segment at 0x%lx (size: %lu bytes)\n", vaddr, memsz);

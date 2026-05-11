@@ -156,6 +156,26 @@ uintptr_t vmm_translate(uintptr_t virt)
     return (pt[PT_INDEX(virt)] & ADDR_MASK_4K) | (virt & PAGE_OFF_4K);
 }
 
+uintptr_t vmm_translate_pml4(uintptr_t pml4_phys, uintptr_t virt)
+{
+    uint64_t *pml4 = (uint64_t *)phys_to_virt(pml4_phys);
+    if (!(pml4[PML4_INDEX(virt)] & PAGE_PRESENT)) return 0;
+
+    uint64_t *pdpt = table_phys_to_virt(pml4[PML4_INDEX(virt)]);
+    if (!(pdpt[PDPT_INDEX(virt)] & PAGE_PRESENT)) return 0;
+
+    uint64_t *pd = table_phys_to_virt(pdpt[PDPT_INDEX(virt)]);
+    if (!(pd[PD_INDEX(virt)] & PAGE_PRESENT)) return 0;
+
+    if (pd[PD_INDEX(virt)] & PAGE_HUGE) {
+        return (pd[PD_INDEX(virt)] & ADDR_MASK_2M) | (virt & PAGE_OFF_2M);
+    }
+
+    uint64_t *pt = table_phys_to_virt(pd[PD_INDEX(virt)]);
+    if (!(pt[PT_INDEX(virt)] & PAGE_PRESENT)) return 0;
+    return (pt[PT_INDEX(virt)] & ADDR_MASK_4K) | (virt & PAGE_OFF_4K);
+}
+
 void vmm_flush_tlb(uintptr_t virt)
 {
     __asm__ volatile ("invlpg (%0)" : : "r"(virt) : "memory");

@@ -175,3 +175,29 @@ void free(void *ptr) {
     b->used = 0;
 }
 
+/* --- Fájlrendszer write-képes műveletek ---------------------------------- */
+
+int open_ex(const char *path, int flags) {
+    return (int)syscall2(SYS_OPEN, (uint64_t)path, (uint64_t)flags);
+}
+
+int close(int fd) {
+    return (int)syscall1(SYS_CLOSE, (uint64_t)fd);
+}
+
+int mkdir(const char *path) {
+    return (int)syscall1(SYS_MKDIR, (uint64_t)path);
+}
+
+int unlink(const char *path) {
+    return (int)syscall1(SYS_UNLINK, (uint64_t)path);
+}
+
+int seek(int fd, uint64_t offset) {
+    return (int)syscall2(SYS_SEEK, (uint64_t)fd, offset);
+}
+
+int write_file(int fd, const void *buf, uint64_t count) {
+    return (int)syscall3(SYS_WRITE, (uint64_t)fd, (uint64_t)buf, count);
+}
+

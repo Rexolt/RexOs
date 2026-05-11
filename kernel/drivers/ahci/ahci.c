@@ -72,8 +72,9 @@
 #define FIS_TYPE_REG_D2H    0x34
 
 /* --- ATA parancsok ------------------------------------------------------- */
-#define ATA_CMD_IDENTIFY    0xEC
-#define ATA_CMD_READ_DMA_EX 0x25
+#define ATA_CMD_IDENTIFY     0xEC
+#define ATA_CMD_READ_DMA_EX  0x25
+#define ATA_CMD_WRITE_DMA_EX 0x35
 
 /* --- AHCI strukturák ----------------------------------------------------- */
 #pragma pack(push, 1)
@@ -228,7 +229,7 @@ static void port_start(int port) {
 /* --- Parancs kiadás ----------------------------------------------------- */
 
 static int issue_cmd(int port, uint8_t ata_cmd, uint64_t lba, uint16_t count,
-                     uintptr_t dma_phys, uint32_t byte_count, int is_identify) {
+                     uintptr_t dma_phys, uint32_t byte_count, int is_identify, int is_write) {
     /* PRDT entry */
     ahci_prdt_entry_t *prdt = &s_cmdtable->prdt[0];
     prdt->dba  = (uint32_t)(dma_phys & 0xFFFFFFFF);
@@ -242,7 +243,7 @@ static int issue_cmd(int port, uint8_t ata_cmd, uint64_t lba, uint16_t count,
     ahci_cmd_header_t *hdr = &s_cmdlist[0];
     hdr->cfl = sizeof(fis_reg_h2d_t) / sizeof(uint32_t);
     hdr->a = 0;
-    hdr->w = 0;   /* device-to-host (read) */
+    hdr->w = (uint8_t)(is_write ? 1 : 0);   /* 1 = host-to-device (write) */
     hdr->p = 0; hdr->r = 0; hdr->b = 0; hdr->c = 0;
     hdr->rsv0 = 0; hdr->pmp = 0;
     hdr->prdtl = 1;
@@ -329,11 +330,37 @@ static int ahci_block_read(block_device_t *dev, uint64_t lba, uint32_t count, vo
         if (chunk > max_per_cmd) chunk = max_per_cmd;
 
         if (issue_cmd(s_port, ATA_CMD_READ_DMA_EX, lba + done,
-                      (uint16_t)chunk, s_scratch_phys, chunk * 512, 0) != 0) {
+                      (uint16_t)chunk, s_scratch_phys, chunk * 512, 0, 0) != 0) {
             return (int)done;
         }
         /* Másoljuk a scratch-ből a hívó pufferébe */
         kmemcpy(out + done * 512, s_scratch, chunk * 512);
+        done += chunk;
+    }
+    return (int)done;
+}
+
+/* --- Public: block device write callback ---------------------------------- */
+
+static int ahci_block_write(block_device_t *dev, uint64_t lba, uint32_t count, const void *buf) {
+    (void)dev;
+    if (!s_abar || s_port < 0) return 0;
+
+    const uint8_t *in = (const uint8_t *)buf;
+    uint32_t done = 0;
+    uint32_t max_per_cmd = (SCRATCH_PAGES * 4096) / 512;  /* 128 szektor */
+
+    while (done < count) {
+        uint32_t chunk = count - done;
+        if (chunk > max_per_cmd) chunk = max_per_cmd;
+
+        /* Másoljuk a hívó pufferéből a scratch DMA bufferbe */
+        kmemcpy(s_scratch, in + done * 512, chunk * 512);
+
+        if (issue_cmd(s_port, ATA_CMD_WRITE_DMA_EX, lba + done,
+                      (uint16_t)chunk, s_scratch_phys, chunk * 512, 0, 1) != 0) {
+            return (int)done;
+        }
         done += chunk;
     }
     return (int)done;
@@ -461,7 +488,7 @@ bool ahci_init(void) {
     kprintf("[ahci] port started, issuing IDENTIFY...\n");
 
     /* IDENTIFY DEVICE */
-    if (issue_cmd(s_port, ATA_CMD_IDENTIFY, 0, 0, s_scratch_phys, 512, 1) != 0) {
+    if (issue_cmd(s_port, ATA_CMD_IDENTIFY, 0, 0, s_scratch_phys, 512, 1, 0) != 0) {
         kprintf("[ahci] IDENTIFY failed\n");
         return false;
     }
@@ -498,7 +525,7 @@ bool ahci_init(void) {
     bd.sector_size  = 512;
     bd.sector_count = s_sectors;
     bd.read  = ahci_block_read;
-    bd.write = NULL;
+    bd.write = ahci_block_write;
     bd.driver_data = NULL;
     block_register(&bd);
 

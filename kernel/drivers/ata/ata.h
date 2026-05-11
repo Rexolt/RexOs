@@ -19,3 +19,6 @@ uint64_t ata_sector_count(void);
 /* LBA28 olvasás: max 256 szektor egy híváson belül.
  * Visszaadott érték: ténylegesen beolvasott szektorok száma. */
 uint32_t ata_read_sectors(uint32_t lba, uint8_t count, void *buffer);
+
+/* LBA28 PIO írás. Visszaadott érték: ténylegesen kiírt szektorok száma. */
+uint32_t ata_write_sectors(uint32_t lba, uint8_t count, const void *buffer);

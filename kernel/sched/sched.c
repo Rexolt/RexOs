@@ -71,24 +71,27 @@ static task_t  *s_dead_task_list = NULL;
 static void reaper_task_entry(void *arg) {
     (void)arg;
     for (;;) {
-        while (s_dead_task_list) {
-            __asm__ volatile("cli");
-            task_t *dead = s_dead_task_list;
-            if (dead) s_dead_task_list = dead->next;
-            __asm__ volatile("sti");
-            
-            if (dead) {
-                if (dead->cr3 && dead->cr3 != vmm_kernel_pml4_phys()) {
-                    vmm_destroy_user_pml4(dead->cr3);
-                }
-                if (dead->stack_base) {
-                    kfree(dead->stack_base);
-                }
-                kfree(dead);
-                kprintf("[sched] Reaper cleaned up dead task resources.\n");
-            }
+        /* Atomikusan kivesszük a lista fejét (CLI/STI = interrupt-safe single-core).
+         * A CLI+STI közötti rész minimális: csak pointer olvasás/írás, nincs allokáció. */
+        __asm__ volatile("cli");
+        task_t *dead = s_dead_task_list;
+        if (dead) s_dead_task_list = dead->next;
+        __asm__ volatile("sti");
+
+        if (!dead) {
+            /* Nincs mit takarítani, átadjuk a CPU-t. */
+            task_yield();
+            continue;
         }
-        task_yield();
+
+        if (dead->cr3 && dead->cr3 != vmm_kernel_pml4_phys()) {
+            vmm_destroy_user_pml4(dead->cr3);
+        }
+        if (dead->stack_base) {
+            kfree(dead->stack_base);
+        }
+        kfree(dead);
+        kprintf("[sched] Reaper cleaned up dead task resources.\n");
     }
 }
 
@@ -293,12 +296,22 @@ static void user_task_launcher(void *arg) {
 }
 
 task_t *task_spawn_user(const char *name, struct vfs_node *elf_file) {
+    /* A user PML4-et MIELŐTT a taszkot a futólistára tesszük hozzuk létre,
+     * majd CLI/STI-vel megakadályozzuk, hogy a scheduler futtatja a taszkot
+     * a cr3 beállítása előtt (race condition: task futna helytelen PML4-gyel). */
+    uintptr_t user_cr3 = vmm_create_user_pml4();
+    if (!user_cr3) return NULL;
+
+    __asm__ volatile("cli");
     task_t *t = task_create(name, user_task_launcher, elf_file);
-    if (!t) return NULL;
-    
-    /* Felülírjuk a Kernel PML4-et egy dedikált új PML4-gyel */
-    t->cr3 = vmm_create_user_pml4();
-    
+    if (!t) {
+        __asm__ volatile("sti");
+        vmm_destroy_user_pml4(user_cr3);
+        return NULL;
+    }
+    t->cr3 = user_cr3;
+    __asm__ volatile("sti");
+
     return t;
 }
 

@@ -18,8 +18,14 @@ typedef struct {
 
 static vfs_mount_t s_mounts[VFS_MAX_MOUNTS];
 
+/* Lazy cache: hány natív bejegyzés van fs_root->readdir-ban?
+ * (uint32_t)-1 = még nem számoltuk meg. Egyszer számítjuk ki,
+ * mert a tarfs bejegyzések statikusak (read-only initrd). */
+static uint32_t s_root_base_count = (uint32_t)-1;
+
 void vfs_init(void) {
     fs_root = NULL;
+    s_root_base_count = (uint32_t)-1;
     for (int i = 0; i < VFS_MAX_MOUNTS; i++) s_mounts[i].used = false;
 }
 
@@ -54,17 +60,23 @@ static dirent_t s_mount_dirent;
 dirent_t *vfs_readdir(vfs_node_t *node, uint32_t index) {
     if (!node || (node->flags & 0x07) != FS_DIRECTORY) return NULL;
 
-    /* fs_root esetén előbb az alaplistát adjuk vissza, utána a mountokat. */
+    /* fs_root esetén előbb az alaplistát adjuk vissza, utána a mountokat.
+     * s_root_base_count cache-eli az alap-bejegyzések számát, így
+     * elkerüljük az O(n²) ismételt megszámlálást (lazy, egyszer számítjuk). */
     if (node == fs_root) {
-        /* Számoljuk meg az alap-bejegyzéseket */
-        uint32_t base_count = 0;
-        if (node->readdir) {
-            while (node->readdir(node, base_count) != NULL) base_count++;
+        if (s_root_base_count == (uint32_t)-1) {
+            uint32_t bc = 0;
+            if (node->readdir) {
+                while (node->readdir(node, bc) != NULL) bc++;
+            }
+            s_root_base_count = bc;
         }
-        if (index < base_count) {
+
+        if (index < s_root_base_count && node->readdir) {
             return node->readdir(node, index);
         }
-        uint32_t mi = index - base_count;
+
+        uint32_t mi = index - s_root_base_count;
         uint32_t seen = 0;
         for (int i = 0; i < VFS_MAX_MOUNTS; i++) {
             if (s_mounts[i].used) {
@@ -164,4 +176,25 @@ vfs_node_t *vfs_lookup(const char *path) {
     }
 
     return current;
+}
+
+vfs_node_t *vfs_create(vfs_node_t *dir, const char *name, uint32_t flags)
+{
+    if (!dir || (dir->flags & 0x07) != FS_DIRECTORY) return NULL;
+    if (!dir->create) return NULL;
+    return dir->create(dir, name, flags);
+}
+
+int vfs_mkdir_node(vfs_node_t *dir, const char *name)
+{
+    if (!dir || (dir->flags & 0x07) != FS_DIRECTORY) return -1;
+    if (!dir->mkdir) return -1;
+    return dir->mkdir(dir, name);
+}
+
+int vfs_unlink(vfs_node_t *dir, const char *name)
+{
+    if (!dir || (dir->flags & 0x07) != FS_DIRECTORY) return -1;
+    if (!dir->unlink) return -1;
+    return dir->unlink(dir, name);
 }
