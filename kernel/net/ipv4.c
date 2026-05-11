@@ -32,7 +32,9 @@ void ipv4_receive(net_device_t *dev, const ip4_header_t *ip, uint32_t len) {
             udp_receive(dev, ip, (const udp_header_t *)ip->payload, payload_len);
         }
     } else if (ip->protocol == IPV4_PROTO_TCP) {
-        /* TODO: TCP Receive */
+        if (payload_len >= sizeof(tcp_header_t)) {
+            tcp_receive(dev, ip, (const tcp_header_t *)ip->payload, payload_len);
+        }
     }
 }
 
@@ -71,4 +73,15 @@ void ipv4_send(net_device_t *dev, const ip4_addr_t *dest_ip, uint8_t protocol, c
                 dest_ip->ip[0], dest_ip->ip[1], dest_ip->ip[2], dest_ip->ip[3]);
         arp_request(dev, dest_ip);
     }
+}
+
+uint16_t ipv4_pseudo_checksum(const ip4_addr_t *src, const ip4_addr_t *dst, uint8_t proto, uint16_t len) {
+    uint8_t pseudo[12];
+    kmemcpy(pseudo + 0, src->ip, 4);
+    kmemcpy(pseudo + 4, dst->ip, 4);
+    pseudo[8]  = 0;
+    pseudo[9]  = proto;
+    pseudo[10] = len >> 8;
+    pseudo[11] = len & 0xFF;
+    return net_checksum(pseudo, 12);
 }

@@ -30,8 +30,20 @@ void net_register_device(net_device_t *dev) {
     dev->ip.ip[2] = 2;
     dev->ip.ip[3] = 15;
     
-    kprintf("[net] Registered device '%s' with IP %d.%d.%d.%d\n", 
-            dev->name, dev->ip.ip[0], dev->ip.ip[1], dev->ip.ip[2], dev->ip.ip[3]);
+    /* Default gateway: 10.0.2.2 (QEMU user-mode NAT gateway) */
+    dev->gateway.ip[0] = 10;
+    dev->gateway.ip[1] = 0;
+    dev->gateway.ip[2] = 2;
+    dev->gateway.ip[3] = 2;
+    
+    kprintf("[net] Registered device '%s' with IP %d.%d.%d.%d, GW %d.%d.%d.%d\n", 
+            dev->name,
+            dev->ip.ip[0], dev->ip.ip[1], dev->ip.ip[2], dev->ip.ip[3],
+            dev->gateway.ip[0], dev->gateway.ip[1], dev->gateway.ip[2], dev->gateway.ip[3]);
+}
+
+net_device_t *net_get_default_dev(void) {
+    return s_net_devices;
 }
 
 void net_receive_frame(net_device_t *dev, const void *data, uint32_t len) {
