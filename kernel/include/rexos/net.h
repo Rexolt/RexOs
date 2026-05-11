@@ -179,6 +179,11 @@ void arp_receive(net_device_t *dev, const arp_header_t *arp, uint32_t len);
 void arp_request(net_device_t *dev, const ip4_addr_t *target_ip);
 void arp_reply(net_device_t *dev, const mac_addr_t *target_mac, const ip4_addr_t *target_ip);
 bool arp_resolve(const ip4_addr_t *ip, mac_addr_t *out_mac);
+bool arp_queue_ipv4(net_device_t *dev, const ip4_addr_t *next_hop, const void *packet, uint32_t packet_len);
+
+/* DHCP (dhcp.c) */
+bool dhcp_configure(net_device_t *dev);
+void dhcp_receive(net_device_t *dev, const uint8_t *data, uint32_t len, uint16_t src_port);
 
 /* IPv4 (ipv4.c) */
 void     ipv4_receive(net_device_t *dev, const ip4_header_t *ip, uint32_t len);

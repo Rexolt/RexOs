@@ -15,10 +15,12 @@ void ipv4_receive(net_device_t *dev, const ip4_header_t *ip, uint32_t len) {
         return;
     }
     
-    /* Is it for us? */
-    if (kmemcmp(ip->dest_ip.ip, dev->ip.ip, 4) != 0) {
-        /* For now, drop packets not destined to us (no routing yet) */
-        /* Also ignore broadcast IPs for now to keep it simple */
+    /* Is it for us? Accept limited broadcast too: DHCP replies arrive before
+     * the interface owns an address, so they target 255.255.255.255. */
+    bool is_broadcast = ip->dest_ip.ip[0] == 255 && ip->dest_ip.ip[1] == 255 &&
+                        ip->dest_ip.ip[2] == 255 && ip->dest_ip.ip[3] == 255;
+    if (!is_broadcast && kmemcmp(ip->dest_ip.ip, dev->ip.ip, 4) != 0) {
+        /* For now, drop packets not destined to us (no routing yet). */
         return;
     }
     
@@ -65,12 +67,16 @@ void ipv4_send(net_device_t *dev, const ip4_addr_t *dest_ip, uint8_t protocol, c
     /* --- Routing ---
      * Ha a c\u00e9lc\u00edm nincs az egy helyi alhálózaton, az \u00e1tj\u00e1r\u00f3n (gateway) k\u00fcldj\u00fck \u00e1t.
      * Helyi: (dest_ip & netmask) == (my_ip & netmask) */
+    bool is_limited_broadcast = dest_ip->ip[0] == 255 && dest_ip->ip[1] == 255 &&
+                                dest_ip->ip[2] == 255 && dest_ip->ip[3] == 255;
     bool is_local = true;
-    for (int i = 0; i < 4; i++) {
-        if ((dest_ip->ip[i] & dev->netmask.ip[i]) !=
-            (dev->ip.ip[i]  & dev->netmask.ip[i])) {
-            is_local = false;
-            break;
+    if (!is_limited_broadcast) {
+        for (int i = 0; i < 4; i++) {
+            if ((dest_ip->ip[i] & dev->netmask.ip[i]) !=
+                (dev->ip.ip[i]  & dev->netmask.ip[i])) {
+                is_local = false;
+                break;
+            }
         }
     }
     const ip4_addr_t *next_hop = is_local ? dest_ip : &dev->gateway;
@@ -83,6 +89,7 @@ void ipv4_send(net_device_t *dev, const ip4_addr_t *dest_ip, uint8_t protocol, c
         kprintf("[ipv4] ARP miss for %d.%d.%d.%d (next_hop), requesting...\n",
                 next_hop->ip[0], next_hop->ip[1],
                 next_hop->ip[2], next_hop->ip[3]);
+        arp_queue_ipv4(dev, next_hop, buffer, total_len);
         arp_request(dev, next_hop);
     }
 }
