@@ -19,6 +19,9 @@ extern uint64_t pit_ticks(void);
 #define SYS_NET_RECV    23
 #define SYS_TIME        24
 
+#define PIT_HZ 100
+#define NET_CONNECT_TIMEOUT_TICKS (3 * PIT_HZ)
+
 #define MSR_EFER    0xC0000080
 #define MSR_STAR    0xC0000081
 #define MSR_LSTAR   0xC0000082
@@ -420,14 +423,12 @@ uint64_t syscall_handler(uint64_t nr, uint64_t arg1, uint64_t arg2, uint64_t arg
         tcp_socket_t *sock = tcp_connect(dev, &dest_ip, port);
         if (!sock) return (uint64_t)-1;
 
-        /* Várakozás valódi óra alapján: max 3 másodperc (3000 ms) */
+        /* Várakozás valódi óra alapján: max 3 másodperc a 100 Hz-es PIT-tel.
+         * Ne hozzunk létre új socketet retry-ként: az eredeti SYN ARP miss esetén
+         * pending queue-ba kerül és az ARP válasz után automatikusan kiküldődik. */
         uint64_t start_tick = pit_ticks();
-        while (pit_ticks() - start_tick < 3000 && sock->state != TCP_ESTABLISHED) {
-            if (sock->state == TCP_SYN_SENT && (pit_ticks() - start_tick > 1000)) {
-                /* Ha 1 mp után még mindig csak SYN_SENT, küldjünk egy újat (ARP miatt lehetett miss) */
-                tcp_connect(dev, &dest_ip, port);
-                start_tick = pit_ticks(); /* reset timer */
-            }
+        while (pit_ticks() - start_tick < NET_CONNECT_TIMEOUT_TICKS &&
+               sock->state == TCP_SYN_SENT) {
             __asm__ volatile("pause");
         }
 
