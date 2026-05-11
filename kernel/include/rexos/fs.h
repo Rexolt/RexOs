@@ -58,3 +58,14 @@ void vfs_open(vfs_node_t *node);
 void vfs_close(vfs_node_t *node);
 dirent_t *vfs_readdir(vfs_node_t *node, uint32_t index);
 vfs_node_t *vfs_finddir(vfs_node_t *node, const char *name);
+
+/* Útvonal feloldás: `/a/b/c` formátumú abszolút útvonalakat is feldolgoz.
+ * Visszatérési érték: a célnode, vagy NULL ha nem található.
+ * Ha path == "/" vagy üres, a `fs_root`-ot adja vissza. */
+vfs_node_t *vfs_lookup(const char *path);
+
+/* Mountpoint regisztrálása.
+ * mount_path: pl. "/mnt" -- a fs_root alatti könyvtár neve.
+ * node: A felmountolt fájlrendszer gyökér csomópontja.
+ * Egy egyszerű, fix méretű táblát használunk: max 4 mount. */
+bool vfs_mount(const char *mount_path, vfs_node_t *node);

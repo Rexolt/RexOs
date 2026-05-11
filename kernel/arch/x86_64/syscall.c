@@ -115,7 +115,8 @@ uint64_t syscall_handler(uint64_t nr, uint64_t arg1, uint64_t arg2, uint64_t arg
         return fb_vaddr;
     } else if (nr == 5) { // sys_spawn
         const char *path = (const char *)arg1;
-        vfs_node_t *node = vfs_finddir(fs_root, path);
+        vfs_node_t *node = vfs_lookup(path);
+        if (!node) node = vfs_finddir(fs_root, path);
         if (node) {
             task_t *t = task_spawn_user(path, node);
             if (t) return t->id;
@@ -124,8 +125,8 @@ uint64_t syscall_handler(uint64_t nr, uint64_t arg1, uint64_t arg2, uint64_t arg
     } else if (nr == 6) { // sys_open
         const char *path = (const char *)arg1;
         vfs_node_t *node;
-        if (path[0] == '/' && path[1] == '\0') {
-            node = fs_root;  // "/" → gyökér könyvtár
+        if (path[0] == '/') {
+            node = vfs_lookup(path);
         } else {
             node = vfs_finddir(fs_root, path);
         }

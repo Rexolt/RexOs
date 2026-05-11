@@ -96,11 +96,20 @@ A fájlkezelés Unix-szerű absztrakción alapul.
 
 ### 5.1. VFS Csomópontok (vnodes)
 Minden fájl vagy mappa egy `vfs_node_t` struktúra.
-- **Műveletek**: `read`, `write`, `open`, `getdents`.
-- **Mounting**: A rendszer indításkor felcsatolja a TarFS-t (initrd) a gyökérkönyvtárba (`/`).
+- **Műveletek**: `read`, `write`, `open`, `readdir`, `finddir`.
+- **Útvonal-feloldás**: `vfs_lookup("/a/b/c")` rekurzívan navigál a `finddir` hívásokkal.
+- **Mount tábla**: Max. 4 mount-pont a `fs_root` alatt. Indításkor a TarFS a `/`-ra, a FAT32 a `/mnt`-re kerül.
 
 ### 5.2. TarFS (Initrd)
-Mivel még nincs lemezdriverünk, egy TAR archívumot használunk fájlrendszerként. A kernel végigjárja a TAR header-eket, és virtuális fájlstruktúrát épít belőlük a memóriában. Ez tartalmazza a felhasználói programokat (`.elf`) és konfigurációs fájlokat.
+A bootloader által betöltött TAR archívumot olvassa be a memóriából. Tartalmazza a felhasználói programokat (`.elf`) és konfigurációs fájlokat. Read-only.
+
+### 5.3. FAT32 (Lemez)
+Valódi háttértároló-támogatás FAT32 fájlrendszerre:
+- **ATA PIO (LBA28)** driver primary master csatornán, polling módban (`kernel/drivers/ata`).
+- **FAT32 read-only** driver (`kernel/fs/fat32.c`), 8.3 nevek + LFN (Long File Name) támogatással, alkönyvtárak rekurzívan.
+- **MBR + sima FAT32** is támogatott (boot szektor detektálás).
+- Felmountolva a `/mnt`-re; minden FAT32 fájl elérhető a `vfs_lookup("/mnt/...")` hívással.
+- A `make disk` célt használja a `disk.img` előállítására `mtools` segítségével (nem kell root).
 
 ---
 
@@ -128,12 +137,23 @@ A felhasználói programok nem közvetlenül hívják a syscall-okat, hanem a `l
 - `spawn(path)`: Új folyamat indítása.
 - `waitpid(pid)`: Várakozás folyamat befejezésére.
 
-### 7.2. Desktop Environment
-A RexOS büszkesége a grafikus asztali környezet.
-- **Ablakok**: Támogatja a címsorral, bezáró gombbal rendelkező ablakok kirajzolását.
-- **Bitmap Font**: Egy szoftveres font-renderelő, amely 5x7 pixeles karaktereket rajzol.
-- **Kurzor**: Egy 12x16 pixeles szoftveres egérkurzor, amely a háttér mentésével és visszatöltésével mozog villogásmentesen.
-- **Élő Óra**: A tálcán folyamatosan frissülő időmérő a `sys_ticks` segítségével.
+### 7.2. Desktop Environment (v2)
+A RexOS grafikus asztali környezete teljes többablakos shell:
+- **Interaktív ablakkezelés**: címsor-húzás, bezárás (x), fókusz, kaszkád pozícionálás (max. 16 ablak).
+- **Asztali ikonok**: Bal oldalt kattintható alkalmazás-indítók (dupla kattintás).
+- **Tálca**: Start gomb, megnyitott ablakok listája, digitális óra.
+- **Start menü**: Felugró applikáció-választó panel.
+- **Beépített alkalmazások**:
+  - **Files** — fájlkezelő initrd és FAT32 (`/mnt`) támogatással, navigálható alkönyvtárakkal.
+  - **Text Viewer** — szöveges fájl megjelenítő (Files-ban kattintással nyílik).
+  - **Calculator** — 4 alapművelet, billentyűzettel és egérrel is.
+  - **Terminal** — beépített parancssor: `ls`, `cd`, `cat`, `pwd`, `run`, `uptime`, `clear`.
+  - **SysInfo** — élő rendszer-információk (uptime, méretek, mount-ok).
+  - **Clock** — nagyméretű digitális óra (kb. pixel-art számokkal).
+  - **About RexOS** — projekt leírás.
+- **Back buffer**: A teljes renderelés egy off-screen pufferben történik a villogásmentes megjelenítésért.
+- **Bitmap Font + Kurzor**: 5x7 pixeles font; 12x16 pixeles egér-kurzor a back buffer fölött rajzolva.
+- **ESC**: kilépés az asztalból.
 
 ---
 
@@ -148,19 +168,40 @@ A projekt egy komplex, de könnyen kezelhető **Makefile**-ra épül.
 4. **ISO Készítés**: Az `xorriso` és a `limine-deploy` segítségével elkészül a bootolható `rexos.iso`.
 
 ### 8.2. Futtatás QEMU-ban
-A javasolt parancs a teszteléshez:
+A javasolt parancsok:
 ```bash
-qemu-system-x86_64 -M q35 -m 256M -cdrom rexos.iso -boot d -serial stdio
+make run         # BIOS mód (-M pc, IDE primary master = disk.img)
+make run-uefi    # UEFI mód OVMF firmware-rel
 ```
+
+Manuálisan:
+```bash
+qemu-system-x86_64 -M pc -m 256M \
+    -cdrom rexos.iso \
+    -drive file=disk.img,format=raw,if=ide,index=0,media=disk \
+    -boot d -serial stdio
+```
+
+Megjegyzés: az `-M pc` szükséges a legacy IDE 0x1F0 portok miatt; az `-M q35` nem teszi elérhetővé alapból.
+
+### 8.3. Saját fájl hozzáadása a FAT32 lemezhez
+A `disk.img` fájlt bármikor szerkesztheted `mtools`-szal:
+```bash
+mcopy -i disk.img sajat.txt ::/sajat.txt
+mdir  -i disk.img ::
+```
+A RexOS legközelebbi indításkor látni fogja az új fájlt a `/mnt`-en.
 
 ---
 
 ## 🗺️ 9. Roadmap és Jövőkép
 
 A RexOS célja, hogy egy teljes értékű, tanulságos és használható operációs rendszerré váljon.
-- [ ] **SATA/AHCI**: Valódi háttértároló támogatás.
-- [ ] **FAT32**: Lemezalapú fájlrendszer.
-- [ ] **Network Stack**: Alapvető hálózati kommunikáció.
+- [x] **ATA PIO + FAT32**: Lemezalapú fájlrendszer (read-only).
+- [x] **Több ablakos desktop**: Interaktív ablakkezelés, beépített applikációkkal.
+- [ ] **FAT32 írás**: Cluster-foglalás és FAT-frissítés.
+- [ ] **AHCI**: Modern SATA tárolók támogatása PIO helyett.
+- [ ] **Network Stack**: Alapvető hálózati kommunikáció (E1000/virtio-net).
 - [ ] **Shared Memory**: Gyorsabb IPC (Inter-Process Communication).
 - [ ] **Font Smoothing**: Fejlettebb betűmegjelenítés (anti-aliasing).
 

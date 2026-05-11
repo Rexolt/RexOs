@@ -5,6 +5,7 @@
 
 KERNEL      := rexos.elf
 ISO         := rexos.iso
+DISK        := disk.img
 
 # -----------------------------------------------------------------------------
 #  Toolchain
@@ -193,29 +194,62 @@ $(ISO): $(BUILD)/$(KERNEL) $(INITRD_TAR) $(LIMINE_DIR)/limine limine.conf
 iso: $(ISO)
 
 # -----------------------------------------------------------------------------
+#  FAT32 lemezkép készítése (mtools — nem kell root)
+#  64 MB-os, FAT32 formátumú, néhány teszt fájllal a gyökerében.
+# -----------------------------------------------------------------------------
+DISK_SIZE_MB := 64
+
+$(DISK):
+	@echo "  GEN  $@ ($(DISK_SIZE_MB)MB FAT32)"
+	@dd if=/dev/zero of=$@ bs=1M count=$(DISK_SIZE_MB) status=none
+	@mformat -i $@ -F -v REXOSDATA ::
+	@mkdir -p $(BUILD)/diskroot
+	@echo "Welcome to RexOS FAT32 partition!"               > $(BUILD)/diskroot/README.TXT
+	@echo "This file lives on /mnt (FAT32 disk image)."    >> $(BUILD)/diskroot/README.TXT
+	@echo ""                                                >> $(BUILD)/diskroot/README.TXT
+	@echo "You can write any data to disk.img using mtools,">> $(BUILD)/diskroot/README.TXT
+	@echo "and RexOS will be able to read it through /mnt." >> $(BUILD)/diskroot/README.TXT
+	@echo "RexOS Notes"                                     > $(BUILD)/diskroot/NOTES.TXT
+	@echo "==========="                                    >> $(BUILD)/diskroot/NOTES.TXT
+	@echo "FAT32 driver: read-only, LFN supported."        >> $(BUILD)/diskroot/NOTES.TXT
+	@echo "ATA driver:   PIO (LBA28), primary master."     >> $(BUILD)/diskroot/NOTES.TXT
+	@printf "Lorem ipsum dolor sit amet. " > $(BUILD)/diskroot/HELLO.TXT
+	@printf "Hello from FAT32, RexOS!\n"  >> $(BUILD)/diskroot/HELLO.TXT
+	@mcopy -i $@ $(BUILD)/diskroot/README.TXT ::
+	@mcopy -i $@ $(BUILD)/diskroot/NOTES.TXT ::
+	@mcopy -i $@ $(BUILD)/diskroot/HELLO.TXT ::
+	@mmd   -i $@ ::/DOCS 2>/dev/null || true
+	@echo "Subdirectory test file." > $(BUILD)/diskroot/sub.txt
+	@mcopy -i $@ $(BUILD)/diskroot/sub.txt ::/DOCS/sub.txt
+	@echo "  DONE $@"
+
+disk: $(DISK)
+
+# -----------------------------------------------------------------------------
 #  Futtatás QEMU-ban
 # -----------------------------------------------------------------------------
 QEMU_FLAGS  := \
-    -M q35 \
+    -M pc \
     -m 256M \
     -cdrom $(ISO) \
+    -drive file=$(DISK),format=raw,if=ide,index=0,media=disk \
     -boot d \
     -serial stdio \
     -no-reboot -no-shutdown
 
-run: $(ISO)
+run: $(ISO) $(DISK)
 	qemu-system-x86_64 $(QEMU_FLAGS)
 
 # UEFI mód - az OVMF firmware útvonal disztribúció-függő.
 # CachyOS / Arch: /usr/share/edk2/x64/OVMF.4m.fd
 OVMF        := /usr/share/edk2/x64/OVMF.4m.fd
 
-run-uefi: $(ISO)
+run-uefi: $(ISO) $(DISK)
 	qemu-system-x86_64 $(QEMU_FLAGS) -bios $(OVMF)
 
 # -----------------------------------------------------------------------------
 #  Tisztítás
 # -----------------------------------------------------------------------------
 clean:
-	@rm -rf $(BUILD) $(ISO)
+	@rm -rf $(BUILD) $(ISO) $(DISK)
 	@echo "  CLEAN"
