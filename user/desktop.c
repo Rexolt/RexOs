@@ -536,6 +536,7 @@ typedef enum {
     APP_HARDWARE,
     APP_INSTALLER,
     APP_SNAKE,
+    APP_BROWSER,
 } app_kind_t;
 
 typedef struct window window_t;
@@ -1939,6 +1940,24 @@ static void app_term_key(window_t *w, char c) {
  *  Asztali ikonok
  * ========================================================================== */
 
+/* =============================================================================
+ *  APP: BROWSER (Placeholder)
+ * ========================================================================== */
+
+static void app_browser_draw(window_t *w) {
+    bb_fill_rect(w->x, w->y + TITLE_H, w->w, w->h - TITLE_H, 0x1E1E2E);
+    
+    /* Address bar */
+    bb_fill_rounded_rect(w->x + 10, w->y + TITLE_H + 10, w->w - 20, 24, 4, 0x313244);
+    bb_draw_text(w->x + 18, w->y + TITLE_H + 18, "http://rexos.local", 0xA6ADC8, 1);
+    
+    /* Content placeholder */
+    int cx = w->x + w->w / 2 - 120;
+    int cy = w->y + w->h / 2 - 20;
+    bb_draw_text(cx, cy, "RexBrowser v0.1", 0xCBA6F7, 2);
+    bb_draw_text(cx - 30, cy + 30, "Waiting for TCP/IP stack implementation...", 0x6C7086, 1);
+}
+
 typedef struct {
     const char *label;
     app_kind_t  app;
@@ -1956,6 +1975,7 @@ static const desktop_icon_t g_dt_icons[] = {
     { "Clock",     APP_CLOCK,    0x9FE0FF     },
     { "About",     APP_ABOUT,    COLOR_ACCENT },
     { "Snake",     APP_SNAKE,    0x55FF55     },
+    { "Browser",   APP_BROWSER,  0x3B82F6     },
 };
 #define DT_ICON_COUNT ((int)(sizeof(g_dt_icons) / sizeof(g_dt_icons[0])))
 
@@ -2072,6 +2092,10 @@ static void launch_app(app_kind_t app) {
         case APP_SNAKE:
             window_new(APP_SNAKE, "Snake", 300, 290,
                        app_snake_draw, NULL, app_snake_key);
+            break;
+        case APP_BROWSER:
+            window_new(APP_BROWSER, "Web Browser", 640, 480,
+                       app_browser_draw, NULL, NULL);
             break;
     }
 }

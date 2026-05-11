@@ -31,6 +31,7 @@
 #include <drivers/pci/pci.h>
 #include <drivers/usb/xhci.h>
 #include <drivers/nvme/nvme.h>
+#include <drivers/net/e1000.h>
 #include <rexos/elf.h>
 #include <arch/x86_64/syscall.h>
 
@@ -445,6 +446,9 @@ void kmain(void)
      * Az első sikeresen regisztrált block device-ot használja a FAT32.
      */
     pci_init();
+
+    /* Hálózat (Intel E1000) inicializálása */
+    e1000_init();
 
     /* NVMe prioritás: ha van NVMe kontroller, azt preferáljuk az AHCI/ATA előtt. */
     bool has_nvme = nvme_init();
