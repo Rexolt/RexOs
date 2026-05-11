@@ -3,6 +3,8 @@
 #include <lib/string.h>
 
 #define ARP_CACHE_SIZE 32
+#define ARP_PENDING_SIZE 8
+#define ARP_PENDING_PACKET_MAX 1600
 
 typedef struct {
     ip4_addr_t ip;
@@ -10,13 +12,36 @@ typedef struct {
     bool       valid;
 } arp_entry_t;
 
+typedef struct {
+    net_device_t *dev;
+    ip4_addr_t   next_hop;
+    uint16_t     len;
+    bool         valid;
+    uint8_t      packet[ARP_PENDING_PACKET_MAX];
+} arp_pending_t;
+
 static arp_entry_t s_arp_cache[ARP_CACHE_SIZE];
+static arp_pending_t s_pending[ARP_PENDING_SIZE];
+
+static void arp_flush_pending(const ip4_addr_t *ip, const mac_addr_t *mac) {
+    for (int i = 0; i < ARP_PENDING_SIZE; i++) {
+        if (!s_pending[i].valid) continue;
+        if (kmemcmp(s_pending[i].next_hop.ip, ip->ip, 4) != 0) continue;
+
+        eth_send(s_pending[i].dev, mac, ETHERTYPE_IPv4,
+                 s_pending[i].packet, s_pending[i].len);
+        s_pending[i].valid = false;
+        kprintf("[arp] Flushed pending IPv4 packet for %d.%d.%d.%d\n",
+                ip->ip[0], ip->ip[1], ip->ip[2], ip->ip[3]);
+    }
+}
 
 static void arp_cache_update(const ip4_addr_t *ip, const mac_addr_t *mac) {
     /* Update if exists */
     for (int i = 0; i < ARP_CACHE_SIZE; i++) {
         if (s_arp_cache[i].valid && kmemcmp(s_arp_cache[i].ip.ip, ip->ip, 4) == 0) {
             s_arp_cache[i].mac = *mac;
+            arp_flush_pending(ip, mac);
             return;
         }
     }
@@ -27,6 +52,7 @@ static void arp_cache_update(const ip4_addr_t *ip, const mac_addr_t *mac) {
             s_arp_cache[i].ip = *ip;
             s_arp_cache[i].mac = *mac;
             s_arp_cache[i].valid = true;
+            arp_flush_pending(ip, mac);
             return;
         }
     }
@@ -35,6 +61,27 @@ static void arp_cache_update(const ip4_addr_t *ip, const mac_addr_t *mac) {
     s_arp_cache[0].ip = *ip;
     s_arp_cache[0].mac = *mac;
     s_arp_cache[0].valid = true;
+    arp_flush_pending(ip, mac);
+}
+
+bool arp_queue_ipv4(net_device_t *dev, const ip4_addr_t *next_hop, const void *packet, uint32_t packet_len) {
+    if (!dev || !next_hop || !packet || packet_len > ARP_PENDING_PACKET_MAX) return false;
+
+    int slot = -1;
+    for (int i = 0; i < ARP_PENDING_SIZE; i++) {
+        if (!s_pending[i].valid) {
+            slot = i;
+            break;
+        }
+    }
+    if (slot < 0) slot = 0;
+
+    s_pending[slot].dev = dev;
+    s_pending[slot].next_hop = *next_hop;
+    s_pending[slot].len = (uint16_t)packet_len;
+    kmemcpy(s_pending[slot].packet, packet, packet_len);
+    s_pending[slot].valid = true;
+    return true;
 }
 
 bool arp_resolve(const ip4_addr_t *ip, mac_addr_t *out_mac) {
