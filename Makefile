@@ -249,6 +249,8 @@ QEMU_FLAGS_LEGACY := \
     -drive file=$(DISK),format=raw,if=ide,index=0,media=disk \
     -boot d \
     -serial stdio \
+    -netdev user,id=net0 \
+    -device e1000,netdev=net0 \
     -no-reboot -no-shutdown
 
 run: $(ISO) $(DISK)

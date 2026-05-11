@@ -146,8 +146,12 @@ static void e1000_init_rx(void) {
     e1000_write_reg(E1000_REG_RDT, E1000_NUM_RX_DESC - 1);
     
     rx_cur = 0;
-    /* RCTL: Enable, Broadcast Accept, Unicast Promiscuous, 8192 bytes, Strip CRC */
-    e1000_write_reg(E1000_REG_RCTL, (1 << 1) | (1 << 15) | (1 << 4) | (1 << 2) | (1 << 26) | (2 << 16));
+    /* RCTL: Enable, Broadcast Accept, Unicast Promiscuous, 8192-byte buffers,
+     * Long Packet Enable, Buffer Size Extension, Strip CRC. Without BSEX the
+     * (2 << 16) size encoding means 512 bytes, not the 8 KiB we allocate. */
+    e1000_write_reg(E1000_REG_RCTL,
+                    (1 << 1) | (1 << 15) | (1 << 4) | (1 << 2) |
+                    (1 << 25) | (1 << 26) | (2 << 16));
 }
 
 static void e1000_init_tx(void) {
