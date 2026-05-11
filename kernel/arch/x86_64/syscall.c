@@ -388,6 +388,16 @@ uint64_t syscall_handler(uint64_t nr, uint64_t arg1, uint64_t arg2, uint64_t arg
         net_device_t *dev = net_get_default_dev();
         if (!dev) return (uint64_t)-1;
 
+        /* Várakozás a DHCP-re (IP != 0.0.0.0) max 5 másodpercig */
+        uint64_t dhcp_start = pit_ticks();
+        while (dev->ip.ip[0] == 0 && pit_ticks() - dhcp_start < 5000) {
+            __asm__ volatile("pause");
+        }
+        if (dev->ip.ip[0] == 0) {
+            kprintf("[net] DHCP timeout, cannot connect.\n");
+            return (uint64_t)-1;
+        }
+
         ip4_addr_t dest_ip;
         /* Ha IP literál (kezdő szám), átalakítjuk, egyébként DNS */
         if (hostname[0] >= '0' && hostname[0] <= '9') {
@@ -445,10 +455,13 @@ uint64_t syscall_handler(uint64_t nr, uint64_t arg1, uint64_t arg2, uint64_t arg
         if (copy == 0) return 0;
         if (copy > (uint32_t)arg3) copy = (uint32_t)arg3;
         kmemcpy((void *)arg2, sock->rx_buf, copy);
-        /* Consume bytes */
+        /* Consume bytes: Safe move for overlapping regions */
         sock->rx_len -= copy;
-        if (sock->rx_len > 0)
-            kmemcpy(sock->rx_buf, sock->rx_buf + copy, sock->rx_len);
+        if (sock->rx_len > 0) {
+            for (uint32_t i = 0; i < sock->rx_len; i++) {
+                sock->rx_buf[i] = sock->rx_buf[i + copy];
+            }
+        }
         return copy;
 
     } else if (nr == 24) { /* SYS_TIME(out_ptr) */

@@ -146,8 +146,10 @@ static void e1000_init_rx(void) {
     e1000_write_reg(E1000_REG_RDT, E1000_NUM_RX_DESC - 1);
     
     rx_cur = 0;
-    /* RCTL: Enable, Broadcast Accept, Unicast Promiscuous, 8192 bytes, Strip CRC */
-    e1000_write_reg(E1000_REG_RCTL, (1 << 1) | (1 << 15) | (1 << 4) | (1 << 2) | (1 << 26) | (2 << 16));
+    rx_cur = 0;
+    /* RCTL: Enable (bit1), Broadcast Accept (bit15), Strip CRC (bit26).
+     * BSIZE = 00 (2048 bytes), BSEX = 0. */
+    e1000_write_reg(E1000_REG_RCTL, (1 << 1) | (1 << 15) | (1 << 26));
 }
 
 static void e1000_init_tx(void) {
