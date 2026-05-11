@@ -40,13 +40,19 @@ void net_register_device(net_device_t *dev) {
         dev->netmask.ip[1] = 255;
         dev->netmask.ip[2] = 255;
         dev->netmask.ip[3] = 0;
+
+        dev->dns_server.ip[0] = 10;
+        dev->dns_server.ip[1] = 0;
+        dev->dns_server.ip[2] = 2;
+        dev->dns_server.ip[3] = 3;
         kprintf("[net] DHCP failed, using static fallback for QEMU user NAT\n");
     }
 
-    kprintf("[net] Registered device '%s' with IP %d.%d.%d.%d, GW %d.%d.%d.%d\n",
+    kprintf("[net] Registered device '%s' with IP %d.%d.%d.%d, GW %d.%d.%d.%d, DNS %d.%d.%d.%d\n",
             dev->name,
             dev->ip.ip[0], dev->ip.ip[1], dev->ip.ip[2], dev->ip.ip[3],
-            dev->gateway.ip[0], dev->gateway.ip[1], dev->gateway.ip[2], dev->gateway.ip[3]);
+            dev->gateway.ip[0], dev->gateway.ip[1], dev->gateway.ip[2], dev->gateway.ip[3],
+            dev->dns_server.ip[0], dev->dns_server.ip[1], dev->dns_server.ip[2], dev->dns_server.ip[3]);
 }
 
 net_device_t *net_get_default_dev(void) {

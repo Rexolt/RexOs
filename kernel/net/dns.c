@@ -8,7 +8,6 @@
 
 #define DNS_PORT       53
 #define DNS_LOCAL_PORT 1053
-#define DNS_SERVER_IP  { 8, 8, 8, 8 }   /* Google Public DNS */
 #define PIT_HZ         100
 #define DNS_TIMEOUT_TICKS (2 * PIT_HZ)   /* 2 seconds at the 100 Hz PIT rate */
 
@@ -26,6 +25,17 @@ typedef struct {
 static ip4_addr_t s_resolved_ip;
 static bool       s_resolved = false;
 static uint16_t   s_query_id = 0xBEEF;
+
+static bool ip4_is_zero(const ip4_addr_t *ip) {
+    return ip->ip[0] == 0 && ip->ip[1] == 0 && ip->ip[2] == 0 && ip->ip[3] == 0;
+}
+
+static ip4_addr_t dns_server_for_device(const net_device_t *dev) {
+    if (dev && !ip4_is_zero(&dev->dns_server)) return dev->dns_server;
+
+    ip4_addr_t fallback = { {8, 8, 8, 8} };
+    return fallback;
+}
 
 /* ---- Encode hostname into DNS wire format -------------------------------- */
 /* "example.com" -> \x07example\x03com\x00  */
@@ -64,9 +74,12 @@ static void dns_send_query(net_device_t *dev, const char *hostname) {
     packet[pos++] = 0x00; packet[pos++] = 0x01;
     packet[pos++] = 0x00; packet[pos++] = 0x01;
 
-    ip4_addr_t dns_server = { DNS_SERVER_IP };
+    ip4_addr_t dns_server = dns_server_for_device(dev);
     udp_send(dev, &dns_server, DNS_LOCAL_PORT, DNS_PORT, packet, pos);
-    kprintf("[dns] Query sent for '%s' (id=0x%x)\n", hostname, s_query_id);
+    kprintf("[dns] Query sent for '%s' via %d.%d.%d.%d (id=0x%x)\n",
+            hostname,
+            dns_server.ip[0], dns_server.ip[1], dns_server.ip[2], dns_server.ip[3],
+            s_query_id);
 }
 
 /* ---- Parse DNS response -------------------------------------------------- */
