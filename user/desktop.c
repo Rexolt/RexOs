@@ -495,6 +495,12 @@ static int sstrcmp(const char *a, const char *b) {
     while (*a && (*a == *b)) { a++; b++; }
     return *(const unsigned char *)a - *(const unsigned char *)b;
 }
+static int sstrcmp_n(const char *a, const char *b, int n) {
+    for (int i = 0; i < n; i++) {
+        if (!a[i] || a[i] != b[i]) return (unsigned char)a[i] - (unsigned char)b[i];
+    }
+    return 0;
+}
 static int sstrlen(const char *s) { int n = 0; while (s[n]) n++; return n; }
 static void sstrcpy(char *d, const char *s) { while ((*d++ = *s++)); }
 static void sstrcat(char *d, const char *s) {
@@ -2057,51 +2063,72 @@ static void browser_do_fetch(browser_state_t *st) {
     }
 }
 
-/* Nyers szöveg renderelése HTML tagek kihagyásával */
+/* Nyers szöveg renderelése HTML tagek kihagyásával és alap formázással */
 static void browser_render_text(window_t *w, browser_state_t *st) {
     int cx = w->x + 8;
     int cy = w->y + TITLE_H + 50; /* fejléc + URL bar alá */
     int max_y = w->y + w->h - 10;
     int line_h = 10;
     int col = 0;
-    int max_col = (w->w - 16) / 6;
+    int max_col = (w->w - 24) / 6;
 
-    /* Görgetés figyelembevétele */
     int skip_lines = st->scroll;
     int cur_line = 0;
 
     const char *p = st->content;
     int in_tag = 0;
+    int skip_content = 0; /* 1: style, 2: script */
 
     while (*p && cy < max_y) {
-        char c = *p++;
-        if (c == '<') { in_tag = 1; continue; }
-        if (c == '>') { in_tag = 0;
-            /* Sortörés H1/P/BR tageknél */
-            col = 0;
-            if (cur_line >= skip_lines) {
-                cy += line_h;
-            } else { cur_line++; }
+        char c = *p;
+
+        /* Tag kezelés */
+        if (c == '<') {
+            in_tag = 1;
+            /* Speciális tartalom-kihagyás detektálása */
+            if (sstrcmp_n(p, "<style", 6) == 0) skip_content = 1;
+            if (sstrcmp_n(p, "<script", 7) == 0) skip_content = 2;
+            
+            /* Lezáró tagek detektálása a tartalom-visszakapcsoláshoz */
+            if (skip_content == 1 && sstrcmp_n(p, "</style>", 8) == 0) { skip_content = 0; p += 8; in_tag = 0; continue; }
+            if (skip_content == 2 && sstrcmp_n(p, "</script>", 9) == 0) { skip_content = 0; p += 9; in_tag = 0; continue; }
+
+            /* Alap formázó tagek után sortörés */
+            if (sstrcmp_n(p, "<p", 2) == 0 || sstrcmp_n(p, "<div", 4) == 0 || 
+                sstrcmp_n(p, "<h1", 3) == 0 || sstrcmp_n(p, "<br", 3) == 0 ||
+                sstrcmp_n(p, "<li", 3) == 0 || sstrcmp_n(p, "</p", 3) == 0) {
+                if (col > 0) {
+                    col = 0;
+                    if (cur_line >= skip_lines) cy += line_h; else cur_line++;
+                }
+            }
+            p++;
             continue;
         }
-        if (in_tag) continue;
+        if (c == '>') { in_tag = 0; p++; continue; }
+        
+        if (in_tag) { p++; continue; }
+        if (skip_content) { p++; continue; }
 
+        /* Megjelenítendő karakter */
         if (c == '\n' || col >= max_col) {
             col = 0;
-            if (cur_line >= skip_lines) {
-                cy += line_h;
-            } else { cur_line++; }
+            if (cur_line >= skip_lines) cy += line_h; else cur_line++;
+            p++;
             if (c == '\n') continue;
         }
-        if (c == '\r') continue;
+        if (c == '\r' || c == '\t') { p++; continue; }
 
-        if (cur_line < skip_lines) { col++; continue; }
-
-        if (cy < max_y && col < max_col) {
-            char buf[2] = { c, 0 };
-            bb_draw_text(cx + col * 6, cy, buf, 0xCDD6F4, 1);
+        if (cur_line >= skip_lines) {
+            if (cy < max_y && col < max_col) {
+                char buf[2] = { c, 0 };
+                bb_draw_text(cx + col * 6, cy, buf, 0xCDD6F4, 1);
+                col++;
+            }
+        } else {
             col++;
         }
+        p++;
     }
 }
 
