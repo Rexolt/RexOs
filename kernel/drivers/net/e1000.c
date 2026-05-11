@@ -36,24 +36,40 @@ static void e1000_write_reg(uint16_t reg, uint32_t value) {
 static uint16_t e1000_eeprom_read(uint8_t addr) {
     uint32_t temp = 0;
     e1000_write_reg(E1000_REG_EEPROM, 1 | ((uint32_t)addr << 8));
-    while (!((temp = e1000_read_reg(E1000_REG_EEPROM)) & (1 << 4))) {
-        /* Várakozás, amíg a DONE bit (bit 4) beáll */
+    /* Timeout: ne ragadjon bele végtelen ciklusba */
+    for (int i = 0; i < 1000000; i++) {
+        temp = e1000_read_reg(E1000_REG_EEPROM);
+        if (temp & (1 << 4)) break;
     }
     return (uint16_t)((temp >> 16) & 0xFFFF);
 }
 
 static void e1000_read_mac(void) {
-    /* Olvassuk ki az első 3 szót (6 bájt) az EEPROM-ból */
+    /* Először próbáljuk az EEPROM-ot */
     uint16_t t0 = e1000_eeprom_read(0);
     uint16_t t1 = e1000_eeprom_read(1);
     uint16_t t2 = e1000_eeprom_read(2);
 
-    s_net_dev.mac.mac[0] = t0 & 0xFF;
-    s_net_dev.mac.mac[1] = t0 >> 8;
-    s_net_dev.mac.mac[2] = t1 & 0xFF;
-    s_net_dev.mac.mac[3] = t1 >> 8;
-    s_net_dev.mac.mac[4] = t2 & 0xFF;
-    s_net_dev.mac.mac[5] = t2 >> 8;
+    /* Ha az EEPROM nem adott valid adatot (mind null vagy 0xFF), */
+    /* akkor olvassuk ki a RAL/RAH regiszterekből (ezek a QEMU-ban működnek) */
+    if ((t0 | t1 | t2) == 0 || (t0 == 0xFFFF && t1 == 0xFFFF)) {
+        uint32_t ral = e1000_read_reg(E1000_REG_RAL);
+        uint32_t rah = e1000_read_reg(E1000_REG_RAH);
+        s_net_dev.mac.mac[0] = (ral >>  0) & 0xFF;
+        s_net_dev.mac.mac[1] = (ral >>  8) & 0xFF;
+        s_net_dev.mac.mac[2] = (ral >> 16) & 0xFF;
+        s_net_dev.mac.mac[3] = (ral >> 24) & 0xFF;
+        s_net_dev.mac.mac[4] = (rah >>  0) & 0xFF;
+        s_net_dev.mac.mac[5] = (rah >>  8) & 0xFF;
+        kprintf("[e1000] MAC from RAL/RAH registers\n");
+    } else {
+        s_net_dev.mac.mac[0] = t0 & 0xFF;
+        s_net_dev.mac.mac[1] = t0 >> 8;
+        s_net_dev.mac.mac[2] = t1 & 0xFF;
+        s_net_dev.mac.mac[3] = t1 >> 8;
+        s_net_dev.mac.mac[4] = t2 & 0xFF;
+        s_net_dev.mac.mac[5] = t2 >> 8;
+    }
 
     kprintf("[e1000] MAC Address: %02x:%02x:%02x:%02x:%02x:%02x\n",
             s_net_dev.mac.mac[0], s_net_dev.mac.mac[1], s_net_dev.mac.mac[2],
@@ -169,10 +185,19 @@ bool e1000_init(void) {
 
     /* Olvassuk be a BAR0-át (MMIO base) */
     uint64_t bar0 = pci_get_bar(s_e1000_pci, 0);
-    s_mmio_base = (uint8_t *)(bar0 + hhdm_offset()); /* Fizikai -> Virtuális cím */
+    if (!bar0) {
+        kprintf("[e1000] BAR0 is null, aborting init\n");
+        return false;
+    }
+    s_mmio_base = (uint8_t *)(bar0 + hhdm_offset());
 
     /* Engedélyezzük a DMA-t és az MMIO-t a PCI command regiszterben */
     pci_enable_busmaster(s_e1000_pci);
+
+    /* Eszköz reset */
+    e1000_write_reg(E1000_REG_CTRL, e1000_read_reg(E1000_REG_CTRL) | (1 << 26));
+    /* Várjunk a reset befejeződésére */
+    for (volatile int i = 0; i < 100000; i++);
 
     /* Hálózat absztrakció beállítása */
     kstrcpy(s_net_dev.name, "eth0");
@@ -182,16 +207,19 @@ bool e1000_init(void) {
     e1000_init_rx();
     e1000_init_tx();
 
-    /* Register IRQ handler */
+    /* IRQ regisztrálás - ellenőrizzük hogy érvényes (0-15) */
     uint8_t irq = pci_cfg_read8(s_e1000_pci->bus, s_e1000_pci->dev, s_e1000_pci->func, 0x3C);
-    kprintf("[e1000] Registered IRQ: %u\n", irq);
-    irq_register(irq, e1000_interrupt);
-    
-    /* Enable Receive Timer (RXT0) and Link Status Change (LSC) interrupts */
-    e1000_write_reg(E1000_REG_IMS, (1 << 7) | (1 << 2));
+    if (irq < 16) {
+        kprintf("[e1000] Registering IRQ %u\n", irq);
+        irq_register(irq, e1000_interrupt);
+        /* Enable Receive Timer (RXT0) and Link Status Change (LSC) interrupts */
+        e1000_write_reg(E1000_REG_IMS, (1 << 7) | (1 << 2));
+    } else {
+        kprintf("[e1000] IRQ=0x%02x invalid or not assigned, polling mode only\n", irq);
+    }
 
     net_register_device(&s_net_dev);
 
-    kprintf("[e1000] Initialization complete (Base: 0x%lx).\n", (uint64_t)s_mmio_base);
+    kprintf("[e1000] Initialization complete (MMIO: 0x%lx).\n", (uint64_t)s_mmio_base);
     return true;
 }

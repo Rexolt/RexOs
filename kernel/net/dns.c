@@ -145,19 +145,31 @@ void dns_receive(net_device_t *dev, const uint8_t *data, uint32_t len, uint16_t 
 }
 
 /* ---- Public: blocking DNS resolve --------------------------------------- */
+extern uint64_t pit_ticks(void);
+
 bool dns_resolve(net_device_t *dev, const char *hostname, ip4_addr_t *out_ip) {
-    s_resolved = false;
-    dns_send_query(dev, hostname);
+    if (!hostname || hostname[0] == 0) return false;
 
-    /* Simple busy-wait for the response (interrupt-driven rx fills the buffer) */
-    for (int i = 0; i < DNS_MAX_WAIT && !s_resolved; i++) {
-        __asm__ volatile("pause");
+    for (int attempt = 0; attempt < 3; attempt++) {
+        s_resolved = false;
+        dns_send_query(dev, hostname);
+
+        /* Várakozás valódi óra alapján: 2 másodperc (2000 ms) */
+        uint64_t start_tick = pit_ticks();
+        uint64_t timeout_ms = 2000; 
+
+        while (pit_ticks() - start_tick < timeout_ms) {
+            if (s_resolved) break;
+            __asm__ volatile("pause");
+        }
+
+        if (s_resolved) {
+            *out_ip = s_resolved_ip;
+            return true;
+        }
+        kprintf("[dns] Attempt %d failed (timeout)...\n", attempt + 1);
     }
 
-    if (s_resolved) {
-        *out_ip = s_resolved_ip;
-        return true;
-    }
-    kprintf("[dns] Timeout resolving '%s'\n", hostname);
+    kprintf("[dns] DNS resolution failed for '%s'\n", hostname);
     return false;
 }
