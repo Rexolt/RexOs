@@ -9,7 +9,8 @@
 #define DNS_PORT       53
 #define DNS_LOCAL_PORT 1053
 #define DNS_SERVER_IP  { 8, 8, 8, 8 }   /* Google Public DNS */
-#define DNS_MAX_WAIT   1000000           /* Busy-wait iterations */
+#define PIT_HZ         100
+#define DNS_TIMEOUT_TICKS (2 * PIT_HZ)   /* 2 seconds at the 100 Hz PIT rate */
 
 /* DNS Header structure */
 typedef struct {
@@ -154,11 +155,10 @@ bool dns_resolve(net_device_t *dev, const char *hostname, ip4_addr_t *out_ip) {
         s_resolved = false;
         dns_send_query(dev, hostname);
 
-        /* Várakozás: 2 másodperc. PIT = 100 Hz → 1 tick = 10 ms → 200 tick = 2 s */
-        uint64_t start_tick    = pit_ticks();
-        uint64_t timeout_ticks = 200;  /* 200 × 10ms = 2 s */
+        /* Várakozás valódi óra alapján: 2 másodperc a 100 Hz-es PIT-tel. */
+        uint64_t start_tick = pit_ticks();
 
-        while (pit_ticks() - start_tick < timeout_ticks) {
+        while (pit_ticks() - start_tick < DNS_TIMEOUT_TICKS) {
             if (s_resolved) break;
             __asm__ volatile("pause");
         }
