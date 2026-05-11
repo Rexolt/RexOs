@@ -228,7 +228,19 @@ disk: $(DISK)
 # -----------------------------------------------------------------------------
 #  Futtatás QEMU-ban
 # -----------------------------------------------------------------------------
+# --- Modern q35 AHCI mód (alapértelmezett) ---
 QEMU_FLAGS  := \
+    -M q35 \
+    -m 256M \
+    -cdrom $(ISO) \
+    -drive id=disk0,file=$(DISK),format=raw,if=none \
+    -device ide-hd,bus=ide.0,drive=disk0 \
+    -boot d \
+    -serial stdio \
+    -no-reboot -no-shutdown
+
+# --- Legacy PC mód (IDE PIO 0x1F0) ---
+QEMU_FLAGS_LEGACY := \
     -M pc \
     -m 256M \
     -cdrom $(ISO) \
@@ -239,6 +251,19 @@ QEMU_FLAGS  := \
 
 run: $(ISO) $(DISK)
 	qemu-system-x86_64 $(QEMU_FLAGS)
+
+run-legacy: $(ISO) $(DISK)
+	qemu-system-x86_64 $(QEMU_FLAGS_LEGACY)
+
+# --- Full modern mode: AHCI + xHCI USB keyboard/mouse ---
+# Ez a legjobban közelíti egy valódi modern gép hardvere: nincs legacy IDE
+# (csak az ide-hd, amit AHCI-n keresztül érünk el), és az összes input
+# USB-n érkezik. Ha ez működik, a physical HW-n is jó esélyed van.
+run-usb: $(ISO) $(DISK)
+	qemu-system-x86_64 $(QEMU_FLAGS) \
+	    -device qemu-xhci,id=xhci \
+	    -device usb-kbd,bus=xhci.0 \
+	    -device usb-mouse,bus=xhci.0
 
 # UEFI mód - az OVMF firmware útvonal disztribúció-függő.
 # CachyOS / Arch: /usr/share/edk2/x64/OVMF.4m.fd

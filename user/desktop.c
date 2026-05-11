@@ -255,6 +255,8 @@ typedef enum {
     APP_CLOCK,
     APP_TERMINAL,
     APP_ABOUT,
+    APP_HARDWARE,
+    APP_INSTALLER,
 } app_kind_t;
 
 typedef struct window window_t;
@@ -411,7 +413,9 @@ static void app_about_draw(window_t *w) {
         " * PS/2 keyboard + mouse drivers",
         " * Framebuffer console + this desktop",
         " * VFS with mount points",
-        " * Initrd (TAR) + FAT32 (ATA PIO)",
+        " * PCI bus enumeration",
+        " * AHCI SATA + legacy ATA PIO (block layer)",
+        " * FAT32 read-only fs (initrd + disk)",
         NULL,
     };
     for (int i = 0; feats[i]; i++) {
@@ -420,6 +424,240 @@ static void app_about_draw(window_t *w) {
     }
     cy += 8;
     bb_draw_text(cx, cy, "Press the close button or ESC to exit.", COLOR_TEXT_DIM, 1);
+}
+
+/* =============================================================================
+ *  APP: HARDWARE  (PCI + block device lista)
+ * ========================================================================== */
+
+static const char *pci_class_label(uint8_t c, uint8_t s) {
+    switch (c) {
+        case 0x01:
+            switch (s) {
+                case 0x01: return "IDE";
+                case 0x06: return "SATA AHCI";
+                case 0x08: return "NVMe";
+                default:   return "Storage";
+            }
+        case 0x02: return "Network";
+        case 0x03: return "Display";
+        case 0x04: return "Multimedia";
+        case 0x06:
+            switch (s) {
+                case 0x00: return "Host bridge";
+                case 0x01: return "ISA bridge";
+                case 0x04: return "PCI bridge";
+                default:   return "Bridge";
+            }
+        case 0x0C:
+            switch (s) {
+                case 0x03: return "USB";
+                default:   return "Serial bus";
+            }
+        default: return "Other";
+    }
+}
+
+static void hex4(uint16_t v, char *out) {
+    const char *H = "0123456789ABCDEF";
+    out[0] = H[(v >> 12) & 0xF];
+    out[1] = H[(v >>  8) & 0xF];
+    out[2] = H[(v >>  4) & 0xF];
+    out[3] = H[ v        & 0xF];
+    out[4] = 0;
+}
+static void hex2(uint8_t v, char *out) {
+    const char *H = "0123456789ABCDEF";
+    out[0] = H[(v >> 4) & 0xF];
+    out[1] = H[ v       & 0xF];
+    out[2] = 0;
+}
+
+static void app_hardware_draw(window_t *w) {
+    int cx = w->x + 14, cy = w->y + TITLE_H + 12;
+    bb_draw_text(cx, cy, "Hardware Inventory", 0x9FE0FF, 2); cy += 24;
+
+    bb_draw_text(cx, cy, "Block devices", COLOR_ACCENT, 1); cy += 14;
+    int nblk = block_dev_count();
+    if (nblk == 0) {
+        bb_draw_text(cx + 10, cy, "(none)", COLOR_TEXT_DIM, 1); cy += 14;
+    }
+    for (int i = 0; i < nblk; i++) {
+        block_info_t bi;
+        if (block_dev_info(i, &bi) != 0) continue;
+        char line[96];
+        sstrcpy(line, "  ");
+        sstrcat(line, bi.name);
+        sstrcat(line, "  ");
+        char nb[24];
+        uint64_t mb = (bi.sector_count * bi.sector_size) / (1024 * 1024);
+        utoa10(mb, nb);
+        sstrcat(line, nb);
+        sstrcat(line, " MB  ");
+        sstrcat(line, bi.writable ? "[RW]" : "[RO]");
+        bb_draw_text(cx + 6, cy, line, COLOR_TEXT, 1); cy += 13;
+    }
+
+    cy += 6;
+    bb_draw_text(cx, cy, "PCI devices", COLOR_ACCENT, 1); cy += 14;
+    int npci = pci_dev_count();
+    for (int i = 0; i < npci; i++) {
+        pci_info_t pi;
+        if (pci_dev_info(i, &pi) != 0) continue;
+
+        char line[128];
+        char s[8];
+        sstrcpy(line, "  ");
+        hex2(pi.bus,  s); sstrcat(line, s); sstrcat(line, ":");
+        hex2(pi.dev,  s); sstrcat(line, s); sstrcat(line, ".");
+        s[0] = '0' + (pi.func & 0x7); s[1] = 0;
+        sstrcat(line, s);
+        sstrcat(line, "  ");
+        hex4(pi.vendor, s); sstrcat(line, s); sstrcat(line, ":");
+        hex4(pi.device, s); sstrcat(line, s);
+        sstrcat(line, "  ");
+        sstrcat(line, pci_class_label(pi.class_code, pi.subclass));
+        bb_draw_text(cx + 6, cy, line, COLOR_TEXT_DIM, 1); cy += 13;
+        if (cy > w->y + w->h - 20) break;
+    }
+}
+
+/* =============================================================================
+ *  APP: INSTALLER  (MVP: elérhető target-ek és placeholder)
+ * ========================================================================== */
+
+typedef struct {
+    int selected;         /* kiválasztott block device index */
+    int confirm_stage;    /* 0 = normál, 1 = megerősítés */
+    int status_msg;       /* 0 = nincs; 1 = ok; 2 = hiba */
+    int btn_install_x, btn_install_y, btn_install_w, btn_install_h;
+    int dev_list_x, dev_list_y, dev_list_w, dev_row_h;
+} installer_state_t;
+
+static void app_installer_draw(window_t *w) {
+    installer_state_t *st = (installer_state_t *)w->priv;
+
+    int cx = w->x + 20, cy = w->y + TITLE_H + 14;
+    bb_draw_text(cx, cy, "RexOS Installer", 0x9FE0FF, 2); cy += 24;
+    bb_draw_text(cx, cy,
+        "Select a target disk. The installer will create a FAT32",
+        COLOR_TEXT_DIM, 1); cy += 13;
+    bb_draw_text(cx, cy,
+        "partition and copy the kernel + initrd + bootloader.",
+        COLOR_TEXT_DIM, 1); cy += 18;
+
+    bb_draw_text(cx, cy, "Available disks:", COLOR_ACCENT, 1); cy += 16;
+
+    st->dev_list_x = cx + 6;
+    st->dev_list_y = cy;
+    st->dev_list_w = w->w - 50;
+    st->dev_row_h  = 20;
+
+    int nblk = block_dev_count();
+    if (nblk == 0) {
+        bb_draw_text(cx + 10, cy, "(no block devices detected)",
+                     COLOR_TEXT_DIM, 1);
+        cy += 20;
+    }
+    for (int i = 0; i < nblk; i++) {
+        block_info_t bi;
+        if (block_dev_info(i, &bi) != 0) continue;
+
+        uint32_t bg = (i == st->selected) ? 0x2A4A78 : 0x1F2A40;
+        bb_fill_rect(st->dev_list_x, cy - 2, st->dev_list_w, st->dev_row_h - 2, bg);
+
+        char line[96];
+        sstrcpy(line, "  ");
+        sstrcat(line, bi.name);
+        sstrcat(line, "   ");
+        char nb[24];
+        uint64_t mb = (bi.sector_count * bi.sector_size) / (1024 * 1024);
+        utoa10(mb, nb);
+        sstrcat(line, nb);
+        sstrcat(line, " MB   ");
+        sstrcat(line, bi.writable ? "[writable]" : "[READ-ONLY - cannot install]");
+        bb_draw_text(st->dev_list_x + 4, cy + 2, line, COLOR_TEXT, 1);
+        cy += st->dev_row_h;
+    }
+
+    cy += 16;
+    bb_hline(cx, cy, w->w - 40, COLOR_FRAME); cy += 10;
+
+    /* Install gomb */
+    st->btn_install_x = cx;
+    st->btn_install_y = cy;
+    st->btn_install_w = 160;
+    st->btn_install_h = 28;
+
+    uint32_t btn_bg = 0x2E7D32;
+    if (st->confirm_stage == 1) btn_bg = 0xC62828;
+    bb_fill_rect(st->btn_install_x, st->btn_install_y,
+                 st->btn_install_w, st->btn_install_h, btn_bg);
+    bb_frame(st->btn_install_x, st->btn_install_y,
+             st->btn_install_w, st->btn_install_h, COLOR_FRAME);
+
+    const char *lbl = (st->confirm_stage == 1)
+        ? "Click to CONFIRM"
+        : "Install RexOS";
+    bb_draw_text(st->btn_install_x + 18, st->btn_install_y + 8,
+                 lbl, 0xFFFFFF, 1);
+
+    cy += 36;
+
+    /* Státusz */
+    if (st->status_msg == 1) {
+        bb_draw_text(cx, cy,
+                     "NOTE: disk writes require FAT32 write support",
+                     0xFFD54F, 1); cy += 13;
+        bb_draw_text(cx, cy,
+                     "(planned in next iteration). Install stubbed.",
+                     0xFFD54F, 1);
+    } else if (st->status_msg == 2) {
+        bb_draw_text(cx, cy, "ERROR: no writable target available.",
+                     0xFF6B6B, 1);
+    } else {
+        bb_draw_text(cx, cy,
+                     "Tip: USB & persistent storage support coming soon.",
+                     COLOR_TEXT_DIM, 1);
+    }
+}
+
+static void app_installer_event(window_t *w, int x, int y, int btn) {
+    if (!(btn & 1)) return;
+    installer_state_t *st = (installer_state_t *)w->priv;
+
+    /* Device list kattintás */
+    if (x >= st->dev_list_x && x < st->dev_list_x + st->dev_list_w) {
+        int dy = y - st->dev_list_y;
+        if (dy >= 0) {
+            int idx = dy / st->dev_row_h;
+            if (idx >= 0 && idx < block_dev_count()) {
+                st->selected = idx;
+                st->confirm_stage = 0;
+                st->status_msg = 0;
+                return;
+            }
+        }
+    }
+
+    /* Install gomb */
+    if (x >= st->btn_install_x && x < st->btn_install_x + st->btn_install_w &&
+        y >= st->btn_install_y && y < st->btn_install_y + st->btn_install_h) {
+        block_info_t bi;
+        if (block_dev_info(st->selected, &bi) != 0 || !bi.writable) {
+            st->status_msg = 2;
+            st->confirm_stage = 0;
+            return;
+        }
+        if (st->confirm_stage == 0) {
+            st->confirm_stage = 1;
+            st->status_msg = 0;
+        } else {
+            /* MVP: FAT32 write még nincs implementálva — placeholder */
+            st->confirm_stage = 0;
+            st->status_msg = 1;
+        }
+    }
 }
 
 /* =============================================================================
@@ -467,12 +705,40 @@ static void app_sysinfo_draw(window_t *w) {
     bb_draw_text(cx, cy, "Initrd /", COLOR_TEXT_DIM, 1);
     bb_draw_text(cx + 90, cy, "tarfs (read-only)", COLOR_TEXT, 1); cy += 14;
 
-    bb_draw_text(cx, cy, "Disk /mnt", COLOR_TEXT_DIM, 1);
-    bb_draw_text(cx + 90, cy, "FAT32 over ATA PIO", COLOR_TEXT, 1); cy += 14;
+    int nblk = block_dev_count();
+    int npci = pci_dev_count();
+
+    char nb[32];
+    bb_draw_text(cx, cy, "Block devices:", COLOR_TEXT_DIM, 1);
+    utoa10((uint64_t)nblk, nb);
+    bb_draw_text(cx + 110, cy, nb, COLOR_TEXT, 1); cy += 14;
+
+    bb_draw_text(cx, cy, "PCI devices:", COLOR_TEXT_DIM, 1);
+    utoa10((uint64_t)npci, nb);
+    bb_draw_text(cx + 110, cy, nb, COLOR_TEXT, 1); cy += 14;
+
+    if (nblk > 0) {
+        block_info_t bi;
+        if (block_dev_info(0, &bi) == 0) {
+            char line[80];
+            sstrcpy(line, "  -> ");
+            sstrcat(line, bi.name);
+            sstrcat(line, " (");
+            uint64_t mb = (bi.sector_count * bi.sector_size) / (1024 * 1024);
+            utoa10(mb, nb);
+            sstrcat(line, nb);
+            sstrcat(line, " MB, ");
+            sstrcat(line, bi.writable ? "RW" : "RO");
+            sstrcat(line, ")");
+            bb_draw_text(cx, cy, line, COLOR_TEXT_DIM, 1); cy += 14;
+        }
+    }
 
     cy += 6;
     bb_hline(cx, cy, w->w - 40, COLOR_FRAME); cy += 8;
-    bb_draw_text(cx, cy, "Tip: Click 'Start' on the taskbar to launch apps.",
+    bb_draw_text(cx, cy, "Tip: Open 'Hardware' for PCI/disk details,",
+                 COLOR_TEXT_DIM, 1); cy += 14;
+    bb_draw_text(cx, cy, "or 'Installer' to install RexOS to disk.",
                  COLOR_TEXT_DIM, 1);
 }
 
@@ -1209,6 +1475,8 @@ static const desktop_icon_t g_dt_icons[] = {
     { "Calc",      APP_CALC,     0xA0E0FF     },
     { "Terminal",  APP_TERMINAL, 0xCFE7B0     },
     { "SysInfo",   APP_SYSINFO,  0xFFD080     },
+    { "Hardware",  APP_HARDWARE, 0xB0CFFF     },
+    { "Install",   APP_INSTALLER,0x81C784     },
     { "Clock",     APP_CLOCK,    0x9FE0FF     },
     { "About",     APP_ABOUT,    COLOR_ACCENT },
 };
@@ -1278,9 +1546,24 @@ static void launch_app(app_kind_t app) {
                        app_term_draw, NULL, app_term_key);
             break;
         case APP_ABOUT:
-            window_new(APP_ABOUT, "About RexOS", 460, 320,
+            window_new(APP_ABOUT, "About RexOS", 460, 340,
                        app_about_draw, NULL, NULL);
             break;
+        case APP_HARDWARE:
+            window_new(APP_HARDWARE, "Hardware", 560, 420,
+                       app_hardware_draw, NULL, NULL);
+            break;
+        case APP_INSTALLER: {
+            int idx = window_new(APP_INSTALLER, "RexOS Installer", 540, 400,
+                       app_installer_draw, app_installer_event, NULL);
+            if (idx >= 0) {
+                installer_state_t *st = (installer_state_t *)g_windows[idx].priv;
+                st->selected = 0;
+                st->confirm_stage = 0;
+                st->status_msg = 0;
+            }
+            break;
+        }
     }
 }
 

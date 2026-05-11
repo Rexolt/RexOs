@@ -3,6 +3,7 @@
  * ========================================================================== */
 
 #include <drivers/mouse/mouse.h>
+#include <drivers/usb/xhci.h>
 #include <arch/x86_64/irq.h>
 #include <rexos/io.h>
 #include <lib/printf.h>
@@ -104,6 +105,23 @@ void mouse_init(void) {
 }
 
 void mouse_get_state(mouse_state_t *out) {
+    /* USB HID egér delta-k integrálása */
+    xhci_poll();
+    int ux = 0, uy = 0;
+    uint8_t ubtn = 0;
+    if (xhci_mouse_take(&ux, &uy, &ubtn) || ubtn != 0) {
+        int32_t nx = s_x + ux;
+        int32_t ny = s_y + uy;
+        if (nx < 0) nx = 0;
+        if (ny < 0) ny = 0;
+        if ((uint32_t)nx >= s_max_x) nx = s_max_x - 1;
+        if ((uint32_t)ny >= s_max_y) ny = s_max_y - 1;
+        s_x = nx;
+        s_y = ny;
+        /* Ha az USB valaha gombot nyomott, azt használjuk, különben PS/2 marad */
+        s_buttons = ubtn;
+    }
+
     out->x = s_x;
     out->y = s_y;
     out->buttons = s_buttons;

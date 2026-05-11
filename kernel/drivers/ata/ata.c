@@ -6,6 +6,7 @@
  */
 
 #include <drivers/ata/ata.h>
+#include <drivers/block/block.h>
 #include <rexos/io.h>
 #include <lib/printf.h>
 #include <lib/string.h>
@@ -32,6 +33,9 @@
 
 static bool s_present = false;
 static uint64_t s_sectors = 0;
+
+/* Forward */
+static int ata_block_read(block_device_t *dev, uint64_t lba, uint32_t count, void *buf);
 
 static void ata_io_delay(void) {
     /* 400 ns "alternate status" olvasás 4x — IDE szabványos várakozás */
@@ -114,7 +118,36 @@ bool ata_init(void) {
     kprintf("[ata] Drive: %s, sectors=%lu (%lu MB)\n",
             model, s_sectors, (s_sectors * 512) / (1024 * 1024));
 
+    /* Block device regisztráció */
+    block_device_t bd;
+    for (int i = 0; i < 32; i++) bd.name[i] = 0;
+    bd.name[0] = 'a'; bd.name[1] = 't'; bd.name[2] = 'a'; bd.name[3] = '0';
+    bd.sector_size = 512;
+    bd.sector_count = s_sectors;
+    bd.read  = ata_block_read;
+    bd.write = NULL;
+    bd.driver_data = NULL;
+    block_register(&bd);
+
     return true;
+}
+
+/* Block device read callback: a meglévő ata_read_sectors-ra hív át,
+ * 256-os szelekciónkbontva (LBA28 max). */
+static int ata_block_read(block_device_t *dev, uint64_t lba, uint32_t count, void *buf) {
+    (void)dev;
+    uint8_t *p = (uint8_t *)buf;
+    uint32_t done = 0;
+    while (done < count) {
+        uint32_t chunk = count - done;
+        if (chunk > 255) chunk = 255;  /* LBA28 + 8-bit seccount korlát */
+        uint32_t r = ata_read_sectors((uint32_t)(lba + done),
+                                      (uint8_t)chunk,
+                                      p + done * 512);
+        if (r == 0) return (int)done;
+        done += r;
+    }
+    return (int)done;
 }
 
 uint64_t ata_sector_count(void) { return s_sectors; }

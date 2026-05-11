@@ -27,6 +27,9 @@
 #include <fs/tarfs.h>
 #include <fs/fat32.h>
 #include <drivers/ata/ata.h>
+#include <drivers/ahci/ahci.h>
+#include <drivers/pci/pci.h>
+#include <drivers/usb/xhci.h>
 #include <rexos/elf.h>
 #include <arch/x86_64/syscall.h>
 
@@ -434,22 +437,37 @@ void kmain(void)
         kprintf("[vfs] No modules found from bootloader!\n");
     }
 
-    /* --- FAT32 mount (ATA primary master) ----------------------------- */
-    if (ata_init()) {
-        vfs_node_t *fat_root = fat32_init();
-        if (fat_root) {
-            vfs_mount("/mnt", fat_root);
+    /* --- Storage stack: PCI -> AHCI/ATA -> Block -> FAT32 ----------------
+     * Először a PCI buszt enumeráljuk. Ezután priorizáljuk:
+     *   1. AHCI SATA (modern q35, valódi gépek)
+     *   2. Legacy IDE ATA PIO (régi gépek / qemu -M pc)
+     * Az első sikeresen regisztrált block device-ot használja a FAT32.
+     */
+    pci_init();
 
-            /* Önteszt: olvassunk egy fájlt a FAT32-ről, hogy lássuk működik */
-            vfs_node_t *test = vfs_lookup("/mnt/README.TXT");
-            if (!test) test = vfs_lookup("/mnt/readme.txt");
-            if (test && test->length > 0 && test->length < 256) {
-                uint8_t tbuf[256];
-                uint64_t n = vfs_read(test, 0, test->length, tbuf);
-                tbuf[n < 255 ? n : 255] = 0;
-                kprintf("[fat32] read self-test (/mnt/README.TXT, %lu bytes): %s\n",
-                        n, (const char *)tbuf);
-            }
+    if (!ahci_init()) {
+        kprintf("[storage] no AHCI; falling back to legacy ATA PIO\n");
+        ata_init();
+    }
+
+    /* USB stack: xHCI controller + HID devices */
+    if (xhci_init()) {
+        xhci_enumerate_ports();
+    }
+
+    vfs_node_t *fat_root = fat32_init();
+    if (fat_root) {
+        vfs_mount("/mnt", fat_root);
+
+        /* Önteszt: olvassunk egy fájlt a FAT32-ről, hogy lássuk működik */
+        vfs_node_t *test = vfs_lookup("/mnt/README.TXT");
+        if (!test) test = vfs_lookup("/mnt/readme.txt");
+        if (test && test->length > 0 && test->length < 256) {
+            uint8_t tbuf[256];
+            uint64_t n = vfs_read(test, 0, test->length, tbuf);
+            tbuf[n < 255 ? n : 255] = 0;
+            kprintf("[fat32] read self-test (/mnt/README.TXT, %lu bytes): %s\n",
+                    n, (const char *)tbuf);
         }
     }
 

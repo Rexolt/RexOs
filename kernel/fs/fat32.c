@@ -14,7 +14,7 @@
  */
 
 #include <fs/fat32.h>
-#include <drivers/ata/ata.h>
+#include <drivers/block/block.h>
 #include <mm/heap.h>
 #include <lib/string.h>
 #include <lib/printf.h>
@@ -108,7 +108,8 @@ typedef struct {
 /* --- Globális FAT állapot --------------------------------------------- */
 
 static struct {
-    bool     mounted;
+    bool             mounted;
+    block_device_t  *bdev;       /* alacsonyabb szintű blokk eszköz */
     uint32_t partition_lba;     /* a FAT32 boot szektor offsetje LBA-ban */
     uint32_t fat_start_lba;     /* első FAT első szektora */
     uint32_t cluster_begin_lba; /* data area kezdő szektora */
@@ -117,6 +118,12 @@ static struct {
     uint32_t root_cluster;
     uint32_t fat_size;          /* szektorokban */
 } g_fat;
+
+/* Helper: szektor olvasás a kiválasztott block device-ról. */
+static int read_blocks(uint64_t lba, uint32_t count, void *buf) {
+    if (!g_fat.bdev || !g_fat.bdev->read) return 0;
+    return g_fat.bdev->read(g_fat.bdev, lba, count, buf);
+}
 
 /* --- FAT cluster lánc --------------------------------------------------- */
 
@@ -131,7 +138,7 @@ static uint32_t fat_next_cluster(uint32_t cluster) {
     uint32_t fat_sector    = g_fat.fat_start_lba + (fat_offset / SECTOR_SIZE);
     uint32_t ent_offset    = (fat_offset % SECTOR_SIZE) / 4;
     static uint8_t buf[SECTOR_SIZE];
-    if (ata_read_sectors(fat_sector, 1, buf) != 1) return 0x0FFFFFFF;
+    if (read_blocks(fat_sector, 1, buf) != 1) return 0x0FFFFFFF;
     uint32_t *entries = (uint32_t *)buf;
     return entries[ent_offset] & 0x0FFFFFFF;
 }
@@ -146,7 +153,7 @@ static uint8_t *read_cluster(uint32_t cluster) {
     uint8_t *p = buf;
     while (remaining > 0) {
         uint32_t chunk = remaining > 32 ? 32 : remaining;
-        if (ata_read_sectors(lba, (uint8_t)chunk, p) != chunk) {
+        if ((uint32_t)read_blocks(lba, chunk, p) != chunk) {
             kfree(buf);
             return NULL;
         }
@@ -402,7 +409,7 @@ static uint32_t find_fat32_partition(void) {
      * akkor a teljes lemez egy FAT32 fájlrendszer (LBA 0-tól indul).
      * Egyébként MBR-t feltételezünk és keresünk egy FAT32 partíciót. */
     uint8_t buf[SECTOR_SIZE];
-    if (ata_read_sectors(0, 1, buf) != 1) return 0xFFFFFFFF;
+    if (read_blocks(0, 1, buf) != 1) return 0xFFFFFFFF;
 
     fat32_bpb_t *bpb = (fat32_bpb_t *)buf;
     if (bpb->signature == 0xAA55 &&
@@ -425,10 +432,12 @@ static uint32_t find_fat32_partition(void) {
 }
 
 vfs_node_t *fat32_init(void) {
-    if (!ata_sector_count()) {
-        kprintf("[fat32] No disk available\n");
+    g_fat.bdev = block_get_first();
+    if (!g_fat.bdev) {
+        kprintf("[fat32] No block device available\n");
         return NULL;
     }
+    kprintf("[fat32] using block device '%s'\n", g_fat.bdev->name);
 
     uint32_t part_lba = find_fat32_partition();
     if (part_lba == 0xFFFFFFFF) {
@@ -437,7 +446,7 @@ vfs_node_t *fat32_init(void) {
     }
 
     uint8_t bs_buf[SECTOR_SIZE];
-    if (ata_read_sectors(part_lba, 1, bs_buf) != 1) {
+    if (read_blocks(part_lba, 1, bs_buf) != 1) {
         kprintf("[fat32] Failed to read boot sector at LBA %u\n", part_lba);
         return NULL;
     }

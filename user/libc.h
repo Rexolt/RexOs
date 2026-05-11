@@ -14,6 +14,10 @@
 #define SYS_TICKS      10
 #define SYS_KBD_POLL   11
 #define SYS_MOUSE      12
+#define SYS_BLOCK_COUNT 13
+#define SYS_BLOCK_INFO  14
+#define SYS_PCI_COUNT   15
+#define SYS_PCI_INFO    16
 
 typedef struct {
     char name[128];
@@ -47,3 +51,24 @@ void free(void *ptr);
 uint64_t get_ticks(void);
 char kbd_poll(void);
 void get_mouse(uint32_t *x, uint32_t *y, uint32_t *buttons);
+
+/* Hardware introspection */
+typedef struct {
+    char     name[32];
+    uint64_t sector_count;
+    uint32_t sector_size;
+    uint8_t  writable;
+    uint8_t  _pad[3];
+} block_info_t;
+
+typedef struct {
+    uint8_t  bus, dev, func;
+    uint8_t  class_code, subclass, prog_if;
+    uint16_t vendor;
+    uint16_t device;
+} pci_info_t;
+
+int  block_dev_count(void);
+int  block_dev_info(int idx, block_info_t *out);
+int  pci_dev_count(void);
+int  pci_dev_info(int idx, pci_info_t *out);

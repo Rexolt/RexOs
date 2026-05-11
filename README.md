@@ -103,11 +103,22 @@ Minden fájl vagy mappa egy `vfs_node_t` struktúra.
 ### 5.2. TarFS (Initrd)
 A bootloader által betöltött TAR archívumot olvassa be a memóriából. Tartalmazza a felhasználói programokat (`.elf`) és konfigurációs fájlokat. Read-only.
 
-### 5.3. FAT32 (Lemez)
+### 5.3. Block Device Réteg
+Egységes absztrakció a tároló-driverekhez (`kernel/drivers/block/block.h`). Egy `block_device_t` exportja: `name`, `sector_size`, `sector_count`, `read()`, `write()`. A felsőbb fs-k (FAT32) erről olvasnak, nem ismerik a konkrét hardvert.
+
+### 5.4. PCI Bus
+`kernel/drivers/pci` a legacy I/O port config space (0xCF8 / 0xCFC) alapján enumerálja az összes PCI eszközt. Minden eszközről vendor/device ID, class/subclass/prog_if, BAR0..5 elkérhető. Ez a fundamentális réteg minden modern hardver driver alá (AHCI, USB, hálózat, NVMe).
+
+### 5.5. Tároló driverek
+- **AHCI SATA** (`kernel/drivers/ahci`): modern PCI SATA controller-ek támogatása. PCI scan -> BAR5 (ABAR MMIO) -> HBA reset -> port COMRESET -> IDENTIFY -> READ DMA EXT (LBA48). Polling, egy port egyszerre.
+- **Legacy ATA PIO** (`kernel/drivers/ata`): fallback a régi IDE 0x1F0 portokra, amikor nincs AHCI (pl. qemu `-M pc`).
+- Mindkettő **block device-ként regisztrál** (`ahci0` / `ata0`), így a FAT32 bármelyikkel működik.
+
+### 5.6. FAT32 (Lemez)
 Valódi háttértároló-támogatás FAT32 fájlrendszerre:
-- **ATA PIO (LBA28)** driver primary master csatornán, polling módban (`kernel/drivers/ata`).
 - **FAT32 read-only** driver (`kernel/fs/fat32.c`), 8.3 nevek + LFN (Long File Name) támogatással, alkönyvtárak rekurzívan.
 - **MBR + sima FAT32** is támogatott (boot szektor detektálás).
+- Bármilyen regisztrált block device-ról olvas.
 - Felmountolva a `/mnt`-re; minden FAT32 fájl elérhető a `vfs_lookup("/mnt/...")` hívással.
 - A `make disk` célt használja a `disk.img` előállítására `mtools` segítségével (nem kell root).
 
@@ -118,12 +129,30 @@ Valódi háttértároló-támogatás FAT32 fájlrendszerre:
 ### 6.1. PIT (Timer)
 A **Programmable Interval Timer** felelős az időalapért és az ütemezésért. 1.193182 MHz-es alapfrekvenciával rendelkezik, amelyet a kernel 100 Hz-re oszt le.
 
-### 6.2. PS/2 Keyboard & Mouse
+### 6.2. PS/2 Keyboard & Mouse (legacy)
 A két eszköz ugyanazon a PS/2 kontrolleren osztozik, de külön megszakításokat használnak:
 - **Keyboard (IRQ1)**: Scancode-okat küld a 0x60 porton. A driver tartalmaz egy scancode-to-ASCII táblázatot.
 - **Mouse (IRQ12)**: 3-bájtos csomagokat küld. Az első bájt a gombok állapotát és a delta előjeleket tartalmazza, a második és harmadik bájt pedig az X és Y elmozdulást. A driver kezeli a csomag-szinkronizációt is.
+- **Fallback**: a PS/2 driver mindig fut, de a `keyboard_has_data()` és `mouse_get_state()` API-k az USB HID adatokat is beolvassák, így a PS/2 port hiányakor is van input.
 
-### 6.3. Framebuffer
+### 6.3. USB xHCI + HID
+Modern gepeken a billentyűzet + egér az USB-n keresztul jelenik meg. A teljes stack:
+- **PCI discovery** (`class=0x0C subclass=0x03 prog_if=0x30`): xHCI controller detektálása.
+- **MMIO (BAR0 → HHDM)**: Capability / Operational / Runtime / Doorbell regiszterek.
+- **HC reset + run**: stop → HCRST → wait CNR=0 → RUN=1.
+- **Command Ring + Event Ring + ERST**: 256 TRB-s ringek, 4 KB oldalakon, cycle-bit és Link TRB a ring végén.
+- **Scratchpad buffer-ek**: ha a HCSPARAMS2 kéri, aláfoglaljuk.
+- **Port enumeráció**: minden csatlakoztatott portra COMRESET → `Enable Slot` command → Input + Device Context építés → `Address Device`.
+- **Control transfer (EP0)**: `GET_DESCRIPTOR(Device)`, `GET_DESCRIPTOR(Config)`, `SET_CONFIGURATION` három-stage TRB sorozattal (Setup + Data + Status).
+- **HID osztály detektálása**: Interface descriptor `class=3` (HID), Interrupt IN endpoint descriptor kikeresése.
+- **Configure Endpoint**: HID EP-hez új TR ring, Input Control Context (A0 + EP flag), `Configure Endpoint` command.
+- **Report polling**: a fizikai egér-/billentyű mozdulat minden egyes HID report-ot egy Transfer Event ként Event Ring-re tesz; a `xhci_poll()` minden belőpéskor feldolgozza és újra küldi a Normal TRB-t.
+- **HID Boot Protocol**: keyboard = 8 bájtos report (mod + 6 keycode), mouse = 3 bájtos report (buttons, dx, dy). ASCII konverzió a 104-128 usage ID-s tartományból.
+- **Integráció**: a `keyboard_has_data()`/`keyboard_getc()` és a `mouse_get_state()` transzparensen elfogadja az USB forrást — a userland app-ok semmit sem érzékelnek a váltásból.
+- **Polling mód**: nincs IRQ még, a `xhci_poll()` minden input-syscallból fut le (1-2 μs). IRQ-s változat később.
+- **Limitáció**: egyetlen xHCI controller, max 8 USB device, USB hub nincs. Néhány BIOS a PCI enumerálásnál a hub miatt megsokszorozza a xHCI-t — az elsőt használjuk.
+
+### 6.4. Framebuffer
 A Limine által biztosított lineáris memóriaterület. A kernel és a GUI közvetlenül pixeladatokat ír ide (32-bit bpp, ARGB formátum).
 
 ---
@@ -148,7 +177,9 @@ A RexOS grafikus asztali környezete teljes többablakos shell:
   - **Text Viewer** — szöveges fájl megjelenítő (Files-ban kattintással nyílik).
   - **Calculator** — 4 alapművelet, billentyűzettel és egérrel is.
   - **Terminal** — beépített parancssor: `ls`, `cd`, `cat`, `pwd`, `run`, `uptime`, `clear`.
-  - **SysInfo** — élő rendszer-információk (uptime, méretek, mount-ok).
+  - **SysInfo** — élő rendszer-információk (uptime, block + PCI device szám).
+  - **Hardware** — részletes PCI + block device lista vendor/device ID-kkel.
+  - **Installer** — RexOS telepítő (target disk választó, confirm flow; a tényleges írás várja a FAT32 write és USB-MSC támogatást).
   - **Clock** — nagyméretű digitális óra (kb. pixel-art számokkal).
   - **About RexOS** — projekt leírás.
 - **Back buffer**: A teljes renderelés egy off-screen pufferben történik a villogásmentes megjelenítésért.
@@ -170,19 +201,22 @@ A projekt egy komplex, de könnyen kezelhető **Makefile**-ra épül.
 ### 8.2. Futtatás QEMU-ban
 A javasolt parancsok:
 ```bash
-make run         # BIOS mód (-M pc, IDE primary master = disk.img)
-make run-uefi    # UEFI mód OVMF firmware-rel
+make run         # Modern q35 chipset + AHCI SATA (alapértelmezett)
+make run-legacy  # Régi -M pc chipset + IDE PIO (fallback)
+make run-uefi    # UEFI mód OVMF firmware-rel (AHCI)
+make run-usb     # q35 + AHCI + xHCI + USB kbd/mouse (valos géphez közel)
 ```
 
-Manuálisan:
+A RexOS boot közben automatikusan választ: először PCI-n megpróbálja az AHCI controllert (q35, valódi gépek), és ha nem talál, visszaesik a legacy IDE PIO-ra (régi gépek / `-M pc`).
+
+Manuálisan modern módban:
 ```bash
-qemu-system-x86_64 -M pc -m 256M \
+qemu-system-x86_64 -M q35 -m 256M \
     -cdrom rexos.iso \
-    -drive file=disk.img,format=raw,if=ide,index=0,media=disk \
+    -drive id=disk0,file=disk.img,format=raw,if=none \
+    -device ide-hd,bus=ide.0,drive=disk0 \
     -boot d -serial stdio
 ```
-
-Megjegyzés: az `-M pc` szükséges a legacy IDE 0x1F0 portok miatt; az `-M q35` nem teszi elérhetővé alapból.
 
 ### 8.3. Saját fájl hozzáadása a FAT32 lemezhez
 A `disk.img` fájlt bármikor szerkesztheted `mtools`-szal:
@@ -192,18 +226,58 @@ mdir  -i disk.img ::
 ```
 A RexOS legközelebbi indításkor látni fogja az új fájlt a `/mnt`-en.
 
+### 8.4. Live USB fizikai gépre
+A `rexos.iso` hibrid bootolható (BIOS + UEFI). Pendrive készítés:
+```bash
+sudo dd if=rexos.iso of=/dev/sdX bs=4M conv=fsync status=progress
+sync
+```
+(A `/dev/sdX` a pendrive eszközneve — **előtte ellenőrizd `lsblk`-val**.)
+
+A BIOS-ban kapcsold ki a **Secure Boot**-ot, és ha nem indul modern módban, állítsd **Legacy/CSM** bootra. Ha a gép csak xHCI-t biztosít USB-re (ami ma szinte minden gép), a RexOS az újonnan hozzáadott USB stack miatt továbbra is kap billentyűzetet/egeret.
+
+**Mi működik ma valós gépen:**
+- ✅ Framebuffer (UEFI GOP / BIOS VBE)
+- ✅ Kernel boot, scheduler, memóriakezelés
+- ✅ AHCI SATA (olvasás) — `/mnt` FAT32
+- ✅ USB billentyűzet + egér (xHCI + HID boot)
+- ✅ PS/2 fallback ha a BIOS emulál
+
+**Mi NEM működik (még):**
+- ❌ USB Mass Storage (a pendrive csak bootra lesz jó, a RexOS-on belül nem jelenik meg block device-ként)
+- ❌ Telepítés (FAT32 write hiányzik)
+- ❌ Hálózat
+- ❌ NVMe (ha csak NVMe van a gépben, nem lesz `/mnt`)
+
 ---
 
 ## 🗺️ 9. Roadmap és Jövőkép
 
-A RexOS célja, hogy egy teljes értékű, tanulságos és használható operációs rendszerré váljon.
-- [x] **ATA PIO + FAT32**: Lemezalapú fájlrendszer (read-only).
-- [x] **Több ablakos desktop**: Interaktív ablakkezelés, beépített applikációkkal.
-- [ ] **FAT32 írás**: Cluster-foglalás és FAT-frissítés.
-- [ ] **AHCI**: Modern SATA tárolók támogatása PIO helyett.
-- [ ] **Network Stack**: Alapvető hálózati kommunikáció (E1000/virtio-net).
-- [ ] **Shared Memory**: Gyorsabb IPC (Inter-Process Communication).
-- [ ] **Font Smoothing**: Fejlettebb betűmegjelenítés (anti-aliasing).
+A RexOS célja, hogy egy teljes értékű, tanulságos és használható live + telepíthető operációs rendszerré váljon.
+
+**Kész:**
+- [x] **PCI enumeráció**: modern hardver driver-fundament.
+- [x] **Block device réteg**: absztrakt `block_device_t` interfész.
+- [x] **AHCI SATA**: modern PCI SATA tárolók olvasása.
+- [x] **Legacy ATA PIO**: fallback régi gépekre.
+- [x] **FAT32 read-only**: lemezalapú fájlrendszer.
+- [x] **Több ablakos desktop**: interaktív ablakkezelés, 9 beépített app, Hardware + Installer UI.
+
+**Folyamatban (live rendszer + telepítő útvonal):**
+- [x] **USB xHCI controller**: modern gépeken USB bekapcsolása (2025-11-es úttal).
+- [x] **USB HID**: USB billentyűzet + egér driver, transzparens integráció.
+- [ ] **USB Mass Storage**: boot pendrive-ról, második block device.
+- [ ] **FAT32 írás**: cluster-foglalás, FAT-frissítés, directory entry alloc.
+- [ ] **Installer logika**: partició + FAT32 formáz + kernel/initrd másolás + Limine setup.
+- [ ] **USB hub támogatás**: több device egy porton.
+- [ ] **ACPI shutdown / reboot**: S5 állapot triple-fault helyett.
+
+**Távoli célok:**
+- [ ] **NVMe**: modern SSD-k.
+- [ ] **Network Stack**: E1000/virtio-net + TCP/IP.
+- [ ] **APIC + SMP**: több magos CPU.
+- [ ] **Shared Memory IPC**.
+- [ ] **Font Smoothing / TrueType**.
 
 ---
 *RexOS - The Awakening of a New Kernel.*
