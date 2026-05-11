@@ -11,6 +11,13 @@
 #include <drivers/mouse/mouse.h>
 #include <drivers/block/block.h>
 #include <drivers/pci/pci.h>
+#include <rexos/net.h>
+#include <rexos/rtc.h>
+
+extern uint64_t pit_ticks(void);
+
+#define SYS_NET_RECV    23
+#define SYS_TIME        24
 
 #define MSR_EFER    0xC0000080
 #define MSR_STAR    0xC0000081
@@ -248,7 +255,6 @@ uint64_t syscall_handler(uint64_t nr, uint64_t arg1, uint64_t arg2, uint64_t arg
         t->brk_current = new_brk;
         return new_brk;
     } else if (nr == 10) { // sys_ticks
-        extern uint64_t pit_ticks(void);
         return pit_ticks();
     } else if (nr == 11) { // sys_kbd_poll (non-blocking keyboard read)
         if (keyboard_has_data()) {
@@ -373,6 +379,82 @@ uint64_t syscall_handler(uint64_t nr, uint64_t arg1, uint64_t arg2, uint64_t arg
             }
         }
         return (uint64_t)-1;
+
+    } else if (nr == 21) { /* SYS_NET_CONNECT(hostname_ptr, port) -> socket_id */
+        if (!uptr_ok(arg1, 1)) return (uint64_t)-1;
+        const char *hostname = (const char *)arg1;
+        uint16_t port = (uint16_t)arg2;
+
+        net_device_t *dev = net_get_default_dev();
+        if (!dev) return (uint64_t)-1;
+
+        ip4_addr_t dest_ip;
+        /* Ha IP literál (kezdő szám), átalakítjuk, egyébként DNS */
+        if (hostname[0] >= '0' && hostname[0] <= '9') {
+            /* Gyors IPv4 parse: "a.b.c.d" */
+            uint8_t a = 0, b = 0, c = 0, d = 0;
+            const char *p = hostname;
+            while (*p >= '0' && *p <= '9') a = a * 10 + (*p++ - '0');
+            if (*p == '.') p++;
+            while (*p >= '0' && *p <= '9') b = b * 10 + (*p++ - '0');
+            if (*p == '.') p++;
+            while (*p >= '0' && *p <= '9') c = c * 10 + (*p++ - '0');
+            if (*p == '.') p++;
+            while (*p >= '0' && *p <= '9') d = d * 10 + (*p++ - '0');
+            dest_ip.ip[0] = a; dest_ip.ip[1] = b;
+            dest_ip.ip[2] = c; dest_ip.ip[3] = d;
+        } else {
+            if (!dns_resolve(dev, hostname, &dest_ip)) return (uint64_t)-1;
+        }
+
+        tcp_socket_t *sock = tcp_connect(dev, &dest_ip, port);
+        if (!sock) return (uint64_t)-1;
+
+        /* Várakozás valódi óra alapján: max 3 másodperc (3000 ms) */
+        uint64_t start_tick = pit_ticks();
+        while (pit_ticks() - start_tick < 3000 && sock->state != TCP_ESTABLISHED) {
+            if (sock->state == TCP_SYN_SENT && (pit_ticks() - start_tick > 1000)) {
+                /* Ha 1 mp után még mindig csak SYN_SENT, küldjünk egy újat (ARP miatt lehetett miss) */
+                tcp_connect(dev, &dest_ip, port);
+                start_tick = pit_ticks(); /* reset timer */
+            }
+            __asm__ volatile("pause");
+        }
+
+        if (sock->state != TCP_ESTABLISHED) return (uint64_t)-1;
+
+        /* socket pointer-t uint64-ként adjuk vissza; user csak token-ként kezeli */
+        return (uint64_t)(uintptr_t)sock;
+
+    } else if (nr == 22) { /* SYS_NET_SEND(socket_id, buf, len) */
+        tcp_socket_t *sock = (tcp_socket_t *)(uintptr_t)arg1;
+        if (!uptr_ok(arg2, arg3)) return (uint64_t)-1;
+        tcp_send_data(sock, (const void *)arg2, (uint32_t)arg3);
+        return arg3;
+
+    } else if (nr == 23) { /* SYS_NET_RECV(socket_id, buf, max_len) -> bytes */
+        tcp_socket_t *sock = (tcp_socket_t *)(uintptr_t)arg1;
+        if (!uptr_ok(arg2, arg3)) return (uint64_t)-1;
+
+        /* Busy-wait á max 5M iterációig adatértre */
+        for (int i = 0; i < 5000000 && sock->rx_len == 0 &&
+             sock->state == TCP_ESTABLISHED; i++)
+            __asm__ volatile("pause");
+
+        uint32_t copy = sock->rx_len;
+        if (copy == 0) return 0;
+        if (copy > (uint32_t)arg3) copy = (uint32_t)arg3;
+        kmemcpy((void *)arg2, sock->rx_buf, copy);
+        /* Consume bytes */
+        sock->rx_len -= copy;
+        if (sock->rx_len > 0)
+            kmemcpy(sock->rx_buf, sock->rx_buf + copy, sock->rx_len);
+        return copy;
+
+    } else if (nr == 24) { /* SYS_TIME(out_ptr) */
+        if (!uptr_ok(arg1, sizeof(rtc_time_t))) return (uint64_t)-1;
+        rtc_get_time((rtc_time_t *)arg1);
+        return 0;
     }
 
     kprintf("[syscall] Unknown syscall %lu from task '%s'\n", nr, task_current()->name);

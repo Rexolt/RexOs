@@ -237,6 +237,8 @@ QEMU_FLAGS  := \
     -device ide-hd,bus=ide.0,drive=disk0 \
     -boot d \
     -serial stdio \
+    -netdev user,id=net0 \
+    -device e1000,netdev=net0 \
     -no-reboot -no-shutdown
 
 # --- Legacy PC mód (IDE PIO 0x1F0) ---

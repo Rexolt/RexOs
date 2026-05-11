@@ -35,6 +35,12 @@ void net_register_device(net_device_t *dev) {
     dev->gateway.ip[1] = 0;
     dev->gateway.ip[2] = 2;
     dev->gateway.ip[3] = 2;
+
+    /* Netmask: 255.255.255.0 */
+    dev->netmask.ip[0] = 255;
+    dev->netmask.ip[1] = 255;
+    dev->netmask.ip[2] = 255;
+    dev->netmask.ip[3] = 0;
     
     kprintf("[net] Registered device '%s' with IP %d.%d.%d.%d, GW %d.%d.%d.%d\n", 
             dev->name,

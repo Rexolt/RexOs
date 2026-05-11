@@ -1941,22 +1941,272 @@ static void app_term_key(window_t *w, char c) {
  * ========================================================================== */
 
 /* =============================================================================
- *  APP: BROWSER (Placeholder)
+ *  APP: REXBROWSER - Interaktív HTTP Böngésző
  * ========================================================================== */
 
-static void app_browser_draw(window_t *w) {
-    bb_fill_rect(w->x, w->y + TITLE_H, w->w, w->h - TITLE_H, 0x1E1E2E);
-    
-    /* Address bar */
-    bb_fill_rounded_rect(w->x + 10, w->y + TITLE_H + 10, w->w - 20, 24, 4, 0x313244);
-    bb_draw_text(w->x + 18, w->y + TITLE_H + 18, "http://rexos.local", 0xA6ADC8, 1);
-    
-    /* Content placeholder */
-    int cx = w->x + w->w / 2 - 120;
-    int cy = w->y + w->h / 2 - 20;
-    bb_draw_text(cx, cy, "RexBrowser v0.1", 0xCBA6F7, 2);
-    bb_draw_text(cx - 30, cy + 30, "Waiting for TCP/IP stack implementation...", 0x6C7086, 1);
+#define BROWSER_URL_MAX  256
+#define BROWSER_BUF_MAX  3700
+
+typedef struct {
+    char    url[BROWSER_URL_MAX];   /* pl. "example.com/path" */
+    char    content[BROWSER_BUF_MAX]; /* nyers HTTP válasz szövege (HTML) */
+    int     url_focused;            /* 1 ha a URL bar aktív */
+    int     url_len;
+    int     scroll;                 /* tartalom görgetése soronként */
+    int     loading;                /* 1 = betöltés folyamatban */
+    int     error;                  /* 1 = kapcsolati hiba */
+    char    status[64];             /* státus szöveg */
+} browser_state_t;
+
+/* Egyszerű string segédek (libc nélkül) */
+static void b_strcpy(char *d, const char *s) { while((*d++=*s++)); }
+static int b_strncmp(const char *a, const char *b, int n) {
+    for(int i=0;i<n;i++) { if(a[i]!=b[i]) return a[i]-b[i]; if(!a[i]) return 0; } return 0;
 }
+
+/* HTTP GET küldése */
+static void browser_do_fetch(browser_state_t *st) {
+    st->loading = 1;
+    st->error   = 0;
+    st->content[0] = 0;
+    b_strcpy(st->status, "Connecting...");
+
+    /* URL parse: "host/path" vagy "http://host/path" */
+    const char *url = st->url;
+    if (b_strncmp(url, "http://", 7) == 0) url += 7;
+    if (b_strncmp(url, "https://", 8) == 0) {
+        b_strcpy(st->status, "HTTPS not supported yet (no TLS)");
+        st->error = 1; st->loading = 0;
+        return;
+    }
+
+    /* Szétválasztjuk host és path részre */
+    char host[128]; char path[128];
+    int hi = 0, pi = 0;
+    int in_path = 0;
+    for (int i = 0; url[i] && hi < 127; i++) {
+        if (!in_path && url[i] == '/') { in_path = 1; path[pi++] = url[i]; continue; }
+        if (in_path) path[pi++] = url[i];
+        else         host[hi++] = url[i];
+    }
+    host[hi] = 0;
+    if (pi == 0) { path[0] = '/'; path[1] = 0; }
+    else          path[pi] = 0;
+
+    /* TCP kapcsolat: port 80 */
+    uint64_t sock = net_connect(host, 80);
+    if (sock == (uint64_t)-1 || sock == 0) {
+        b_strcpy(st->status, "Connection failed (DNS/TCP error)");
+        st->error = 1; st->loading = 0;
+        return;
+    }
+
+    b_strcpy(st->status, "Sending HTTP GET...");
+
+    /* HTTP/1.0 kérés összeállítása */
+    char req[512];
+    int rlen = 0;
+    /* "GET /path HTTP/1.0\r\nHost: host\r\n\r\n" */
+    const char *method = "GET ";
+    for(int i=0;method[i];i++) req[rlen++]=method[i];
+    for(int i=0;path[i];i++)   req[rlen++]=path[i];
+    const char *ver = " HTTP/1.0\r\nHost: ";
+    for(int i=0;ver[i];i++) req[rlen++]=ver[i];
+    for(int i=0;host[i];i++) req[rlen++]=host[i];
+    const char *end = "\r\nConnection: close\r\n\r\n";
+    for(int i=0;end[i];i++) req[rlen++]=end[i];
+
+    net_send(sock, req, rlen);
+    b_strcpy(st->status, "Waiting for response...");
+
+    /* Fogadjuk a választ */
+    int total = 0;
+    char chunk[512];
+    int bytes;
+    while ((bytes = net_recv(sock, chunk, 511)) > 0 && total < BROWSER_BUF_MAX - 1) {
+        int copy = bytes;
+        if (total + copy >= BROWSER_BUF_MAX - 1) copy = BROWSER_BUF_MAX - 1 - total;
+        for(int i=0;i<copy;i++) st->content[total++] = chunk[i];
+    }
+    st->content[total] = 0;
+    /* net_close(sock); -- Jelenleg még nincs, de a szerver lezárja a kapcsolatot (Connection: close) */
+
+    /* HTTP fejléc kihagyása: keressük a \r\n\r\n-t */
+    char *body = st->content;
+    for (int i = 0; i < total - 3; i++) {
+        if (body[i]=='\r'&&body[i+1]=='\n'&&body[i+2]=='\r'&&body[i+3]=='\n') {
+            body = body + i + 4;
+            break;
+        }
+    }
+    /* Ha a body nem az elejétől indul, toljuk előre */
+    if (body != st->content) {
+        int blen = 0;
+        char *p = body;
+        while(*p) { st->content[blen++] = *p++; }
+        st->content[blen] = 0;
+    }
+
+    st->scroll = 0;
+    st->loading = 0;
+    if (total == 0) {
+        b_strcpy(st->status, "Empty response");
+        st->error = 1;
+    } else {
+        b_strcpy(st->status, "OK");
+    }
+}
+
+/* Nyers szöveg renderelése HTML tagek kihagyásával */
+static void browser_render_text(window_t *w, browser_state_t *st) {
+    int cx = w->x + 8;
+    int cy = w->y + TITLE_H + 50; /* fejléc + URL bar alá */
+    int max_y = w->y + w->h - 10;
+    int line_h = 10;
+    int col = 0;
+    int max_col = (w->w - 16) / 6;
+
+    /* Görgetés figyelembevétele */
+    int skip_lines = st->scroll;
+    int cur_line = 0;
+
+    const char *p = st->content;
+    int in_tag = 0;
+
+    while (*p && cy < max_y) {
+        char c = *p++;
+        if (c == '<') { in_tag = 1; continue; }
+        if (c == '>') { in_tag = 0;
+            /* Sortörés H1/P/BR tageknél */
+            col = 0;
+            if (cur_line >= skip_lines) {
+                cy += line_h;
+            } else { cur_line++; }
+            continue;
+        }
+        if (in_tag) continue;
+
+        if (c == '\n' || col >= max_col) {
+            col = 0;
+            if (cur_line >= skip_lines) {
+                cy += line_h;
+            } else { cur_line++; }
+            if (c == '\n') continue;
+        }
+        if (c == '\r') continue;
+
+        if (cur_line < skip_lines) { col++; continue; }
+
+        if (cy < max_y && col < max_col) {
+            char buf[2] = { c, 0 };
+            bb_draw_text(cx + col * 6, cy, buf, 0xCDD6F4, 1);
+            col++;
+        }
+    }
+}
+
+static void app_browser_draw(window_t *w) {
+    browser_state_t *st = (browser_state_t *)w->priv;
+
+    /* Háttér */
+    bb_fill_rect(w->x, w->y + TITLE_H, w->w, w->h - TITLE_H, 0x1E1E2E);
+
+    /* --- URL bar ---------------------------------------- */
+    uint32_t bar_col = st->url_focused ? 0x45475A : 0x313244;
+    bb_fill_rounded_rect(w->x + 8, w->y + TITLE_H + 8, w->w - 16, 22, 4, bar_col);
+
+    /* Lock ikon (egyszerű szöveg) */
+    bb_draw_text(w->x + 14, w->y + TITLE_H + 15, "http://", 0x6C7086, 1);
+
+    char display_url[BROWSER_URL_MAX + 8];
+    int dlen = 0;
+    const char *u = st->url;
+    while(*u && dlen < 60) display_url[dlen++] = *u++;
+    if (st->url_focused) display_url[dlen++] = '_'; /* kurzor */
+    display_url[dlen] = 0;
+    bb_draw_text(w->x + 14 + 6*7, w->y + TITLE_H + 15, display_url, 0xCDD6F4, 1);
+
+    /* GO gomb */
+    uint32_t go_col = 0x89B4FA;
+    bb_fill_rounded_rect(w->x + w->w - 42, w->y + TITLE_H + 8, 34, 22, 4, go_col);
+    bb_draw_text(w->x + w->w - 34, w->y + TITLE_H + 15, "GO", 0x1E1E2E, 1);
+
+    /* --- Status bar ------------------------------------- */
+    bb_fill_rect(w->x, w->y + TITLE_H + 34, w->w, 12, 0x181825);
+    uint32_t sc = st->error ? 0xFF5555 : (st->loading ? 0xF9E2AF : 0xA6E3A1);
+    bb_draw_text(w->x + 8, w->y + TITLE_H + 37, st->status, sc, 1);
+
+    /* --- Tartalom --------------------------------------- */
+    if (st->loading) {
+        bb_draw_text(w->x + w->w/2 - 42, w->y + TITLE_H + 60, "Loading...", 0x89B4FA, 2);
+    } else if (st->error) {
+        bb_draw_text(w->x + 10, w->y + TITLE_H + 60, "Could not load page.", 0xFF5555, 1);
+        bb_draw_text(w->x + 10, w->y + TITLE_H + 74, st->status, 0x6C7086, 1);
+    } else if (st->content[0] == 0) {
+        int cx = w->x + w->w / 2 - 80;
+        int cy = w->y + TITLE_H + 70;
+        bb_draw_text(cx, cy,      "RexBrowser v0.1", 0xCBA6F7, 2);
+        bb_draw_text(cx - 20, cy + 24, "Type a URL and press GO or Enter", 0x6C7086, 1);
+        bb_draw_text(cx - 20, cy + 36, "TCP/IP stack: ACTIVE", 0xA6E3A1, 1);
+    } else {
+        browser_render_text(w, st);
+
+        /* Görgetés hint */
+        bb_draw_text(w->x + w->w - 80, w->y + TITLE_H + 37, "UP/DOWN", 0x45475A, 1);
+    }
+}
+
+static void app_browser_click(window_t *w, int x, int y, int btn) {
+    browser_state_t *st = (browser_state_t *)w->priv;
+    (void)btn;
+
+    /* GO gomb */
+    if (x >= w->x + w->w - 42 && x <= w->x + w->w - 8 &&
+        y >= w->y + TITLE_H + 8 && y <= w->y + TITLE_H + 30) {
+        browser_do_fetch(st);
+        dirty_mark(w->x, w->y, w->w, w->h);
+        return;
+    }
+
+    /* URL bar */
+    if (x >= w->x + 8 && x <= w->x + w->w - 50 &&
+        y >= w->y + TITLE_H + 8 && y <= w->y + TITLE_H + 30) {
+        st->url_focused = 1;
+    } else {
+        st->url_focused = 0;
+    }
+    dirty_mark(w->x, w->y, w->w, w->h);
+}
+
+static void app_browser_key(window_t *w, char key) {
+    browser_state_t *st = (browser_state_t *)w->priv;
+
+    if (!st->url_focused) {
+        /* Tartalom görgetése */
+        if (key == 'u' || key == 'U') { if (st->scroll > 0) st->scroll--; dirty_mark(w->x, w->y, w->w, w->h); return; }
+        if (key == 'd' || key == 'D') { st->scroll++; dirty_mark(w->x, w->y, w->w, w->h); return; }
+        return;
+    }
+
+    if (key == '\n' || key == '\r') {
+        st->url_focused = 0;
+        browser_do_fetch(st);
+        dirty_mark(w->x, w->y, w->w, w->h);
+        return;
+    }
+    if (key == '\b' && st->url_len > 0) {
+        st->url_len--;
+        st->url[st->url_len] = 0;
+        dirty_mark(w->x, w->y + TITLE_H, w->w, 40);
+        return;
+    }
+    if (key >= 32 && key < 127 && st->url_len < BROWSER_URL_MAX - 1) {
+        st->url[st->url_len++] = key;
+        st->url[st->url_len] = 0;
+        dirty_mark(w->x, w->y + TITLE_H, w->w, 40);
+    }
+}
+
 
 typedef struct {
     const char *label;
@@ -2093,10 +2343,26 @@ static void launch_app(app_kind_t app) {
             window_new(APP_SNAKE, "Snake", 300, 290,
                        app_snake_draw, NULL, app_snake_key);
             break;
-        case APP_BROWSER:
-            window_new(APP_BROWSER, "Web Browser", 640, 480,
-                       app_browser_draw, NULL, NULL);
+        case APP_BROWSER: {
+            int idx = window_new(APP_BROWSER, "RexBrowser", 680, 500,
+                       app_browser_draw, app_browser_click, app_browser_key);
+            if (idx >= 0) {
+                browser_state_t *bs = (browser_state_t *)g_windows[idx].priv;
+                bs->url[0]     = 0;
+                bs->url_len    = 0;
+                bs->url_focused = 1;
+                bs->content[0] = 0;
+                bs->loading    = 0;
+                bs->error      = 0;
+                bs->scroll     = 0;
+                /* Alapértelmezett státus */
+                const char *ready = "TCP/IP Stack active. Type a URL and press Enter.";
+                int ri = 0;
+                while(ready[ri] && ri < 63) { bs->status[ri] = ready[ri]; ri++; }
+                bs->status[ri] = 0;
+            }
             break;
+        }
     }
 }
 
@@ -2157,15 +2423,14 @@ static void draw_taskbar(uint64_t ticks, int mx, int my) {
     /* Power ikon: viszonylag kicsi a gombhoz képest */
     bb_power_icon(px + 10, py + (ph - 10) / 2, 0xFFFFFF);
 
-    /* Óra: pill alakú, kék szín */
-    uint64_t sec = ticks / 100;
-    int hr = (int)((sec / 3600) % 24);
-    int mn = (int)((sec / 60) % 60);
-    int sc = (int)(sec % 60);
+    /* Óra: valódi RTC idő használata */
+    rtc_time_t rt;
+    get_time(&rt);
     char clk[12], p[4];
-    pad2(p, hr); sstrcpy(clk, p); sstrcat(clk, ":");
-    pad2(p, mn); sstrcat(clk, p); sstrcat(clk, ":");
-    pad2(p, sc); sstrcat(clk, p);
+    pad2(p, rt.hour); sstrcpy(clk, p); sstrcat(clk, ":");
+    pad2(p, rt.minute); sstrcat(clk, p); sstrcat(clk, ":");
+    pad2(p, rt.second); sstrcat(clk, p);
+    
     int clk_x = px - 96;
     bb_fill_rounded_rect(clk_x - 4, ty + 5, 88, TASKBAR_H - 10, 5, 0x0F1A2E);
     bb_fill_rect_alpha(clk_x - 4, ty + 5, 88, 1, 0x60A5FA, 60);

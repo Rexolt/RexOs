@@ -22,6 +22,10 @@
 #define SYS_UNLINK      18
 #define SYS_CLOSE       19
 #define SYS_SEEK        20
+#define SYS_NET_CONNECT 21
+#define SYS_NET_SEND    22
+#define SYS_NET_RECV    23
+#define SYS_TIME        24
 
 #define O_RDONLY  0
 #define O_WRONLY  1
@@ -32,6 +36,15 @@ typedef struct {
     char name[128];
     uint32_t ino;
 } dirent_t;
+
+typedef struct {
+    uint8_t second;
+    uint8_t minute;
+    uint8_t hour;
+    uint8_t day;
+    uint8_t month;
+    uint32_t year;
+} rtc_time_t;
 
 uint64_t syscall1(uint64_t nr, uint64_t arg1);
 uint64_t syscall2(uint64_t nr, uint64_t arg1, uint64_t arg2);
@@ -89,3 +102,19 @@ int mkdir(const char *path);
 int unlink(const char *path);
 int seek(int fd, uint64_t offset);
 int write_file(int fd, const void *buf, uint64_t count);
+
+/* Hálózat */
+static inline uint64_t net_connect(const char *hostname, uint16_t port) {
+    return syscall2(SYS_NET_CONNECT, (uint64_t)hostname, port);
+}
+static inline int net_send(uint64_t sock, const void *buf, uint64_t len) {
+    return (int)syscall3(SYS_NET_SEND, sock, (uint64_t)buf, len);
+}
+static inline int net_recv(uint64_t sock, void *buf, uint64_t max_len) {
+    return (int)syscall3(SYS_NET_RECV, sock, (uint64_t)buf, max_len);
+}
+
+/* Idő */
+static inline void get_time(rtc_time_t *out) {
+    syscall1(SYS_TIME, (uint64_t)out);
+}

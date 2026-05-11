@@ -61,17 +61,29 @@ void ipv4_send(net_device_t *dev, const ip4_addr_t *dest_ip, uint8_t protocol, c
     ip->checksum = net_checksum(ip, sizeof(ip4_header_t));
     
     kmemcpy(ip->payload, payload, payload_len);
-    
+
+    /* --- Routing ---
+     * Ha a c\u00e9lc\u00edm nincs az egy helyi alhálózaton, az \u00e1tj\u00e1r\u00f3n (gateway) k\u00fcldj\u00fck \u00e1t.
+     * Helyi: (dest_ip & netmask) == (my_ip & netmask) */
+    bool is_local = true;
+    for (int i = 0; i < 4; i++) {
+        if ((dest_ip->ip[i] & dev->netmask.ip[i]) !=
+            (dev->ip.ip[i]  & dev->netmask.ip[i])) {
+            is_local = false;
+            break;
+        }
+    }
+    const ip4_addr_t *next_hop = is_local ? dest_ip : &dev->gateway;
+
     mac_addr_t dest_mac;
-    if (arp_resolve(dest_ip, &dest_mac)) {
+    if (arp_resolve(next_hop, &dest_mac)) {
         eth_send(dev, &dest_mac, ETHERTYPE_IPv4, buffer, total_len);
     } else {
-        /* Not in cache! Send an ARP request. 
-         * For a simple stack, we drop this packet and rely on the upper 
-         * layer (TCP/Ping) to retry after the ARP reply arrives. */
-        kprintf("[ipv4] MAC not known for %d.%d.%d.%d, sending ARP request...\n",
-                dest_ip->ip[0], dest_ip->ip[1], dest_ip->ip[2], dest_ip->ip[3]);
-        arp_request(dev, dest_ip);
+        /* Nincs MAC a cache-ben: k\u00fcldj\u00fcnk ARP Request-et a next_hop-ra */
+        kprintf("[ipv4] ARP miss for %d.%d.%d.%d (next_hop), requesting...\n",
+                next_hop->ip[0], next_hop->ip[1],
+                next_hop->ip[2], next_hop->ip[3]);
+        arp_request(dev, next_hop);
     }
 }
 
