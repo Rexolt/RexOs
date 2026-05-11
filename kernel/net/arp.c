@@ -2,6 +2,9 @@
 #include <lib/printf.h>
 #include <lib/string.h>
 
+/* Forward: ipv4.c implementálja, az ARP reply megérkezésekor hívódik */
+extern void arp_flush_pending(const ip4_addr_t *resolved_ip, const mac_addr_t *resolved_mac);
+
 #define ARP_CACHE_SIZE 32
 
 typedef struct {
@@ -17,24 +20,27 @@ static void arp_cache_update(const ip4_addr_t *ip, const mac_addr_t *mac) {
     for (int i = 0; i < ARP_CACHE_SIZE; i++) {
         if (s_arp_cache[i].valid && kmemcmp(s_arp_cache[i].ip.ip, ip->ip, 4) == 0) {
             s_arp_cache[i].mac = *mac;
+            arp_flush_pending(ip, mac);  /* pending csomagok kiküldése */
             return;
         }
     }
-    
+
     /* Find empty slot */
     for (int i = 0; i < ARP_CACHE_SIZE; i++) {
         if (!s_arp_cache[i].valid) {
-            s_arp_cache[i].ip = *ip;
-            s_arp_cache[i].mac = *mac;
+            s_arp_cache[i].ip    = *ip;
+            s_arp_cache[i].mac   = *mac;
             s_arp_cache[i].valid = true;
+            arp_flush_pending(ip, mac);  /* pending csomagok kiküldése */
             return;
         }
     }
-    
-    /* If full, just overwrite the first one (simple FIFO-like without tracking) */
-    s_arp_cache[0].ip = *ip;
-    s_arp_cache[0].mac = *mac;
+
+    /* Full: overwrite first slot */
+    s_arp_cache[0].ip    = *ip;
+    s_arp_cache[0].mac   = *mac;
     s_arp_cache[0].valid = true;
+    arp_flush_pending(ip, mac);
 }
 
 bool arp_resolve(const ip4_addr_t *ip, mac_addr_t *out_mac) {

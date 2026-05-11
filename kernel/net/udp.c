@@ -26,6 +26,11 @@ void udp_receive(net_device_t *dev, const ip4_header_t *ip_hdr, const udp_header
         return;
     }
 
+    if (dest_port == 68) {
+        dhcp_receive(dev, payload, payload_len);
+        return;
+    }
+
     /* Később itt adhatjuk át a csomagot a porton figyelő alkalmazásnak */
     (void)payload;
 }

@@ -154,11 +154,11 @@ bool dns_resolve(net_device_t *dev, const char *hostname, ip4_addr_t *out_ip) {
         s_resolved = false;
         dns_send_query(dev, hostname);
 
-        /* Várakozás valódi óra alapján: 2 másodperc (2000 ms) */
-        uint64_t start_tick = pit_ticks();
-        uint64_t timeout_ms = 2000; 
+        /* Várakozás: 2 másodperc. PIT = 100 Hz → 1 tick = 10 ms → 200 tick = 2 s */
+        uint64_t start_tick    = pit_ticks();
+        uint64_t timeout_ticks = 200;  /* 200 × 10ms = 2 s */
 
-        while (pit_ticks() - start_tick < timeout_ms) {
+        while (pit_ticks() - start_tick < timeout_ticks) {
             if (s_resolved) break;
             __asm__ volatile("pause");
         }

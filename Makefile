@@ -237,9 +237,9 @@ QEMU_FLAGS  := \
     -device ide-hd,bus=ide.0,drive=disk0 \
     -boot d \
     -serial stdio \
+    -no-reboot -no-shutdown \
     -netdev user,id=net0 \
-    -device e1000,netdev=net0 \
-    -no-reboot -no-shutdown
+    -device e1000,netdev=net0
 
 # --- Legacy PC mód (IDE PIO 0x1F0) ---
 QEMU_FLAGS_LEGACY := \
@@ -249,7 +249,9 @@ QEMU_FLAGS_LEGACY := \
     -drive file=$(DISK),format=raw,if=ide,index=0,media=disk \
     -boot d \
     -serial stdio \
-    -no-reboot -no-shutdown
+    -no-reboot -no-shutdown \
+    -netdev user,id=net0 \
+    -device e1000,netdev=net0
 
 run: $(ISO) $(DISK)
 	qemu-system-x86_64 $(QEMU_FLAGS)

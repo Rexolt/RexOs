@@ -39,7 +39,7 @@ static void pit_irq_handler(uint8_t irq, struct interrupt_frame *f)
 
 void pit_init(uint32_t hz)
 {
-    if (hz == 0) hz = 100;
+    if (hz == 0) hz = 1000;
     uint32_t divisor = PIT_BASE_FREQ / hz;
     if (divisor > 0xFFFF) divisor = 0xFFFF;  /* min ~18.2 Hz */
     if (divisor < 1)      divisor = 1;

@@ -16,10 +16,15 @@ void ipv4_receive(net_device_t *dev, const ip4_header_t *ip, uint32_t len) {
     }
     
     /* Is it for us? */
-    if (kmemcmp(ip->dest_ip.ip, dev->ip.ip, 4) != 0) {
-        /* For now, drop packets not destined to us (no routing yet) */
-        /* Also ignore broadcast IPs for now to keep it simple */
-        return;
+    bool is_bcast = true;
+    for(int i=0; i<4; i++) if(ip->dest_ip.ip[i] != 255) is_bcast = false;
+
+    if (kmemcmp(ip->dest_ip.ip, dev->ip.ip, 4) != 0 && !is_bcast) {
+        /* If we have no IP (0.0.0.0), accept broadcast for DHCP */
+        bool no_ip = true;
+        for(int i=0; i<4; i++) if(dev->ip.ip[i] != 0) no_ip = false;
+        
+        if (!no_ip) return;
     }
     
     uint32_t payload_len = ntohs(ip->length) - header_len;
@@ -38,51 +43,76 @@ void ipv4_receive(net_device_t *dev, const ip4_header_t *ip, uint32_t len) {
     }
 }
 
+/* --- ARP Pending Queue --- */
 static uint16_t s_ip_id = 0;
+typedef struct {
+    ip4_addr_t  target_ip;
+    uint8_t     data[2048];
+    uint32_t    len;
+    net_device_t *dev;
+    bool        active;
+} arp_pending_t;
+
+#define MAX_PENDING 4
+static arp_pending_t s_pending[MAX_PENDING];
+
+void arp_flush_pending(const ip4_addr_t *resolved_ip, const mac_addr_t *resolved_mac) {
+    for (int i = 0; i < MAX_PENDING; i++) {
+        if (s_pending[i].active && kmemcmp(s_pending[i].target_ip.ip, resolved_ip->ip, 4) == 0) {
+            eth_send(s_pending[i].dev, resolved_mac, ETHERTYPE_IPv4, s_pending[i].data, s_pending[i].len);
+            s_pending[i].active = false;
+        }
+    }
+}
 
 void ipv4_send(net_device_t *dev, const ip4_addr_t *dest_ip, uint8_t protocol, const void *payload, uint32_t payload_len) {
     uint32_t total_len = sizeof(ip4_header_t) + payload_len;
-    
     uint8_t buffer[2048];
     if (total_len > sizeof(buffer)) return;
     
     ip4_header_t *ip = (ip4_header_t *)buffer;
-    ip->version = 4;
-    ip->ihl = 5;
-    ip->tos = 0;
+    ip->version = 4; ip->ihl = 5; ip->tos = 0;
     ip->length = htons(total_len);
     ip->id = htons(s_ip_id++);
-    ip->frag_off = 0;
-    ip->ttl = 64;
+    ip->frag_off = 0; ip->ttl = 64;
     ip->protocol = protocol;
     ip->src_ip = dev->ip;
     ip->dest_ip = *dest_ip;
     ip->checksum = 0;
     ip->checksum = net_checksum(ip, sizeof(ip4_header_t));
-    
     kmemcpy(ip->payload, payload, payload_len);
 
-    /* --- Routing ---
-     * Ha a c\u00e9lc\u00edm nincs az egy helyi alhálózaton, az \u00e1tj\u00e1r\u00f3n (gateway) k\u00fcldj\u00fck \u00e1t.
-     * Helyi: (dest_ip & netmask) == (my_ip & netmask) */
+    /* Routing */
     bool is_local = true;
     for (int i = 0; i < 4; i++) {
-        if ((dest_ip->ip[i] & dev->netmask.ip[i]) !=
-            (dev->ip.ip[i]  & dev->netmask.ip[i])) {
-            is_local = false;
-            break;
+        if ((dest_ip->ip[i] & dev->netmask.ip[i]) != (dev->ip.ip[i] & dev->netmask.ip[i])) {
+            is_local = false; break;
         }
     }
     const ip4_addr_t *next_hop = is_local ? dest_ip : &dev->gateway;
 
+    /* Broadcast check */
+    bool is_bcast = true;
+    for(int i=0; i<4; i++) if(dest_ip->ip[i] != 255) is_bcast = false;
+
     mac_addr_t dest_mac;
-    if (arp_resolve(next_hop, &dest_mac)) {
+    if (is_bcast) {
+        kmemset(dest_mac.mac, 0xFF, 6);
+        eth_send(dev, &dest_mac, ETHERTYPE_IPv4, buffer, total_len);
+    } else if (arp_resolve(next_hop, &dest_mac)) {
         eth_send(dev, &dest_mac, ETHERTYPE_IPv4, buffer, total_len);
     } else {
-        /* Nincs MAC a cache-ben: k\u00fcldj\u00fcnk ARP Request-et a next_hop-ra */
-        kprintf("[ipv4] ARP miss for %d.%d.%d.%d (next_hop), requesting...\n",
-                next_hop->ip[0], next_hop->ip[1],
-                next_hop->ip[2], next_hop->ip[3]);
+        /* Queue packet and send ARP request */
+        for (int i = 0; i < MAX_PENDING; i++) {
+            if (!s_pending[i].active) {
+                s_pending[i].target_ip = *next_hop;
+                s_pending[i].dev = dev;
+                s_pending[i].len = total_len;
+                kmemcpy(s_pending[i].data, buffer, total_len);
+                s_pending[i].active = true;
+                break;
+            }
+        }
         arp_request(dev, next_hop);
     }
 }
