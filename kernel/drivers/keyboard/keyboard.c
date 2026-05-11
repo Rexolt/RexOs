@@ -12,6 +12,7 @@
  * ========================================================================== */
 
 #include <drivers/keyboard/keyboard.h>
+#include <drivers/usb/xhci.h>
 #include <arch/x86_64/irq.h>
 #include <rexos/io.h>
 #include <lib/printf.h>
@@ -67,13 +68,21 @@ void keyboard_init(void)
 
 bool keyboard_has_data(void)
 {
-    return s_head != s_tail;
+    /* PS/2 buffer elsőbbsége, de USB HID is működik (ha van), így mindkét
+     * forrás elfogadott. Az xhci_poll() frissíti az USB puffert. */
+    xhci_poll();
+    if (s_head != s_tail) return true;
+    return xhci_kbd_has_data();
 }
 
 char keyboard_getc(void)
 {
-    if (s_head == s_tail) return 0;
-    char c = s_buf[s_tail];
-    s_tail = (s_tail + 1) % BUFFER_SIZE;
-    return c;
+    xhci_poll();
+    if (s_head != s_tail) {
+        char c = s_buf[s_tail];
+        s_tail = (s_tail + 1) % BUFFER_SIZE;
+        return c;
+    }
+    if (xhci_kbd_has_data()) return xhci_kbd_getc();
+    return 0;
 }

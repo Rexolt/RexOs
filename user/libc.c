@@ -95,6 +95,24 @@ void get_mouse(uint32_t *x, uint32_t *y, uint32_t *buttons) {
     *x = buf[0]; *y = buf[1]; *buttons = buf[2];
 }
 
+/* --- Hardware introspection --- */
+
+int block_dev_count(void) {
+    return (int)syscall1(SYS_BLOCK_COUNT, 0);
+}
+
+int block_dev_info(int idx, block_info_t *out) {
+    return (int)syscall2(SYS_BLOCK_INFO, (uint64_t)idx, (uint64_t)out);
+}
+
+int pci_dev_count(void) {
+    return (int)syscall1(SYS_PCI_COUNT, 0);
+}
+
+int pci_dev_info(int idx, pci_info_t *out) {
+    return (int)syscall2(SYS_PCI_INFO, (uint64_t)idx, (uint64_t)out);
+}
+
 /* --- Memóriakezelés (malloc / free) --- */
 
 void *sbrk(int64_t increment) {

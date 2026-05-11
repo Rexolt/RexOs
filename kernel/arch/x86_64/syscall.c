@@ -9,6 +9,8 @@
 #include <rexos/fs.h>
 #include <lib/string.h>
 #include <drivers/mouse/mouse.h>
+#include <drivers/block/block.h>
+#include <drivers/pci/pci.h>
 
 #define MSR_EFER    0xC0000080
 #define MSR_STAR    0xC0000081
@@ -201,6 +203,46 @@ uint64_t syscall_handler(uint64_t nr, uint64_t arg1, uint64_t arg2, uint64_t arg
         out[0] = (uint32_t)ms.x;
         out[1] = (uint32_t)ms.y;
         out[2] = (uint32_t)ms.buttons;
+        return 0;
+    } else if (nr == 13) { // sys_block_count
+        return (uint64_t)block_count();
+    } else if (nr == 14) {
+        /* sys_block_info(idx, out):
+         *   out[0..31]    = name (32 byte)
+         *   out[32..39]   = sector_count (u64)
+         *   out[40..43]   = sector_size  (u32)
+         *   out[44]       = writable (u8: 0/1)
+         */
+        size_t idx = (size_t)arg1;
+        block_device_t *bd = block_at(idx);
+        if (!bd) return (uint64_t)-1;
+        uint8_t *out = (uint8_t *)arg2;
+        for (int i = 0; i < 32; i++) out[i] = (uint8_t)bd->name[i];
+        *(uint64_t *)(out + 32) = bd->sector_count;
+        *(uint32_t *)(out + 40) = bd->sector_size;
+        out[44] = bd->write ? 1 : 0;
+        return 0;
+    } else if (nr == 15) { // sys_pci_count
+        return (uint64_t)pci_device_count();
+    } else if (nr == 16) {
+        /* sys_pci_info(idx, out):
+         *   out[0]  = bus
+         *   out[1]  = dev
+         *   out[2]  = func
+         *   out[3]  = class
+         *   out[4]  = subclass
+         *   out[5]  = prog_if
+         *   out[6..7]   = vendor (u16)
+         *   out[8..9]   = device (u16)
+         */
+        size_t idx = (size_t)arg1;
+        const pci_device_t *p = pci_device_at(idx);
+        if (!p) return (uint64_t)-1;
+        uint8_t *out = (uint8_t *)arg2;
+        out[0] = p->bus; out[1] = p->dev; out[2] = p->func;
+        out[3] = p->class_code; out[4] = p->subclass; out[5] = p->prog_if;
+        *(uint16_t *)(out + 6) = p->vendor;
+        *(uint16_t *)(out + 8) = p->device;
         return 0;
     }
     
