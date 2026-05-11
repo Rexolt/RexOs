@@ -228,30 +228,24 @@ disk: $(DISK)
 # -----------------------------------------------------------------------------
 #  Futtatás QEMU-ban
 # -----------------------------------------------------------------------------
+# Split the QEMU flags into small variables instead of line-continuation lists.
+# That keeps make from parsing a following flag as a top-level statement if a
+# continuation backslash picks up stray whitespace ("missing separator").
+QEMU_MEMORY_FLAGS := -m 256M
+QEMU_BOOT_FLAGS   := -cdrom $(ISO) -boot d
+QEMU_SERIAL_FLAGS := -serial stdio
+QEMU_NET_FLAGS    := -netdev user,id=net0 -device e1000,netdev=net0
+QEMU_EXIT_FLAGS   := -no-reboot -no-shutdown
+
 # --- Modern q35 AHCI mód (alapértelmezett) ---
-QEMU_FLAGS  := \
-    -M q35 \
-    -m 256M \
-    -cdrom $(ISO) \
-    -drive id=disk0,file=$(DISK),format=raw,if=none \
-    -device ide-hd,bus=ide.0,drive=disk0 \
-    -boot d \
-    -serial stdio \
-    -netdev user,id=net0 \
-    -device e1000,netdev=net0 \
-    -no-reboot -no-shutdown
+QEMU_MACHINE_FLAGS := -M q35
+QEMU_DISK_FLAGS    := -drive id=disk0,file=$(DISK),format=raw,if=none -device ide-hd,bus=ide.0,drive=disk0
+QEMU_FLAGS         := $(QEMU_MACHINE_FLAGS) $(QEMU_MEMORY_FLAGS) $(QEMU_BOOT_FLAGS) $(QEMU_DISK_FLAGS) $(QEMU_SERIAL_FLAGS) $(QEMU_NET_FLAGS) $(QEMU_EXIT_FLAGS)
 
 # --- Legacy PC mód (IDE PIO 0x1F0) ---
-QEMU_FLAGS_LEGACY := \
-    -M pc \
-    -m 256M \
-    -cdrom $(ISO) \
-    -drive file=$(DISK),format=raw,if=ide,index=0,media=disk \
-    -boot d \
-    -serial stdio \
-    -netdev user,id=net0 \
-    -device e1000,netdev=net0 \
-    -no-reboot -no-shutdown
+QEMU_LEGACY_MACHINE_FLAGS := -M pc
+QEMU_LEGACY_DISK_FLAGS    := -drive file=$(DISK),format=raw,if=ide,index=0,media=disk
+QEMU_FLAGS_LEGACY         := $(QEMU_LEGACY_MACHINE_FLAGS) $(QEMU_MEMORY_FLAGS) $(QEMU_BOOT_FLAGS) $(QEMU_LEGACY_DISK_FLAGS) $(QEMU_SERIAL_FLAGS) $(QEMU_NET_FLAGS) $(QEMU_EXIT_FLAGS)
 
 run: $(ISO) $(DISK)
 	qemu-system-x86_64 $(QEMU_FLAGS)
