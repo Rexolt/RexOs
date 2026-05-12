@@ -18,6 +18,7 @@ extern uint64_t pit_ticks(void);
 
 #define SYS_NET_RECV    23
 #define SYS_TIME        24
+#define SYS_NET_CLOSE   25
 
 #define PIT_HZ 100
 #define NET_CONNECT_TIMEOUT_TICKS (3 * PIT_HZ)
@@ -432,19 +433,24 @@ uint64_t syscall_handler(uint64_t nr, uint64_t arg1, uint64_t arg2, uint64_t arg
             __asm__ volatile("pause");
         }
 
-        if (sock->state != TCP_ESTABLISHED) return (uint64_t)-1;
+        if (sock->state != TCP_ESTABLISHED) {
+            tcp_release(sock);
+            return (uint64_t)-1;
+        }
 
         /* socket pointer-t uint64-ként adjuk vissza; user csak token-ként kezeli */
         return (uint64_t)(uintptr_t)sock;
 
     } else if (nr == 22) { /* SYS_NET_SEND(socket_id, buf, len) */
         tcp_socket_t *sock = (tcp_socket_t *)(uintptr_t)arg1;
+        if (!tcp_socket_is_valid(sock)) return (uint64_t)-1;
         if (!uptr_ok(arg2, arg3)) return (uint64_t)-1;
         tcp_send_data(sock, (const void *)arg2, (uint32_t)arg3);
         return arg3;
 
     } else if (nr == 23) { /* SYS_NET_RECV(socket_id, buf, max_len) -> bytes */
         tcp_socket_t *sock = (tcp_socket_t *)(uintptr_t)arg1;
+        if (!tcp_socket_is_valid(sock)) return (uint64_t)-1;
         if (!uptr_ok(arg2, arg3)) return (uint64_t)-1;
 
         /* Busy-wait á max 5M iterációig adatértre */
@@ -468,6 +474,12 @@ uint64_t syscall_handler(uint64_t nr, uint64_t arg1, uint64_t arg2, uint64_t arg
     } else if (nr == 24) { /* SYS_TIME(out_ptr) */
         if (!uptr_ok(arg1, sizeof(rtc_time_t))) return (uint64_t)-1;
         rtc_get_time((rtc_time_t *)arg1);
+        return 0;
+
+    } else if (nr == SYS_NET_CLOSE) { /* SYS_NET_CLOSE(socket_id) */
+        tcp_socket_t *sock = (tcp_socket_t *)(uintptr_t)arg1;
+        if (!tcp_socket_is_valid(sock)) return (uint64_t)-1;
+        tcp_release(sock);
         return 0;
     }
 
