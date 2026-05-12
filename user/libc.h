@@ -26,6 +26,7 @@
 #define SYS_NET_SEND    22
 #define SYS_NET_RECV    23
 #define SYS_TIME        24
+#define SYS_NET_CLOSE   25
 
 #define O_RDONLY  0
 #define O_WRONLY  1
@@ -112,6 +113,9 @@ static inline int net_send(uint64_t sock, const void *buf, uint64_t len) {
 }
 static inline int net_recv(uint64_t sock, void *buf, uint64_t max_len) {
     return (int)syscall3(SYS_NET_RECV, sock, (uint64_t)buf, max_len);
+}
+static inline int net_close(uint64_t sock) {
+    return (int)syscall1(SYS_NET_CLOSE, sock);
 }
 
 /* Idő */
