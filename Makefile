@@ -147,10 +147,15 @@ $(BUILD)/memtest.elf: user/memtest.c $(BUILD)/libc.o
 	@echo "  CC   user/memtest.c"
 	@$(CC) $(USER_CFLAGS) -static -Wl,-e,_start -Wl,--build-id=none user/memtest.c $(BUILD)/libc.o -o $@
 
-$(BUILD)/desktop.elf: user/desktop.c $(BUILD)/libc.o
+$(BUILD)/http.o: user/http.c user/http.h user/libc.h
+	@mkdir -p $(BUILD)
+	@echo "  CC   user/http.c"
+	@$(CC) $(USER_CFLAGS) -c user/http.c -o $@
+
+$(BUILD)/desktop.elf: user/desktop.c user/http.h $(BUILD)/libc.o $(BUILD)/http.o
 	@mkdir -p $(BUILD)
 	@echo "  CC   user/desktop.c"
-	@$(CC) $(USER_CFLAGS) -static -Wl,-e,_start -Wl,--build-id=none user/desktop.c $(BUILD)/libc.o -o $@
+	@$(CC) $(USER_CFLAGS) -static -Wl,-e,_start -Wl,--build-id=none user/desktop.c $(BUILD)/libc.o $(BUILD)/http.o -o $@
 
 # -----------------------------------------------------------------------------
 #  Initrd (TAR) összerakása
