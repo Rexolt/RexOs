@@ -1949,12 +1949,12 @@ static void app_term_key(window_t *w, char c) {
  * ========================================================================== */
 
 #define BROWSER_URL_MAX       256
-#define BROWSER_CONTENT_MAX   16384
+#define BROWSER_CONTENT_MAX   65536
 #define BROWSER_LINK_URL_MAX  160
 #define BROWSER_MAX_LINKS      16
 #define BROWSER_MAX_RESOURCES  16
 #define BROWSER_FETCH_LIMIT     4
-#define BROWSER_FETCH_BUF_SIZE  2048
+#define BROWSER_FETCH_BUF_SIZE  8192
 
 typedef enum {
     BROWSER_RES_IMAGE,
@@ -2051,15 +2051,14 @@ static void browser_scan_resources(browser_state_t *st);
 static void browser_fetch_resources(browser_state_t *st);
 
 static int browser_ensure_content(browser_state_t *st) {
-    if (st->content && st->content_cap >= BROWSER_CONTENT_MAX) return 1;
-    browser_free_content(st);
-    st->content = (char *)malloc(BROWSER_CONTENT_MAX);
+    if (st->content) return 1;
+    st->content = (char *)malloc(1);
     if (!st->content) {
         b_strcpy(st->status, "Out of memory for page buffer");
         st->content_cap = 0;
         return 0;
     }
-    st->content_cap = BROWSER_CONTENT_MAX;
+    st->content_cap = 1;
     st->content[0] = 0;
     return 1;
 }
@@ -2070,24 +2069,24 @@ static void browser_do_fetch(browser_state_t *st) {
     st->error   = 0;
     st->link_count = 0;
     st->resource_count = 0;
-    if (!browser_ensure_content(st)) {
-        st->error = 1;
-        st->loading = 0;
-        return;
-    }
-    st->content[0] = 0;
+    browser_free_content(st);
     b_strcpy(st->status, "Loading HTTP page...");
 
     http_response_t resp;
-    int rc = http_get(st->url, st->content, st->content_cap, &resp);
+    char *body = 0;
+    int rc = http_get_alloc(st->url, &body, BROWSER_CONTENT_MAX, &resp);
 
     st->scroll = 0;
     st->loading = 0;
     if (rc != HTTP_OK) {
+        if (body) free(body);
+        browser_ensure_content(st);
         b_strcpy(st->status, resp.status[0] ? resp.status : "HTTP request failed");
         st->error = 1;
         return;
     }
+    st->content = body;
+    st->content_cap = (uint64_t)resp.body_len + 1;
     b_strncpy0(st->current_url, resp.final_url[0] ? resp.final_url : st->url, BROWSER_URL_MAX);
 
     if (resp.body_len == 0) {
@@ -2428,22 +2427,19 @@ static const char *browser_resource_label(browser_resource_kind_t kind) {
 static void browser_fetch_resources(browser_state_t *st) {
     if (!st || st->resource_count == 0) return;
 
-    char *buf = (char *)malloc(BROWSER_FETCH_BUF_SIZE);
-    if (!buf) return;
-
     int limit = st->resource_count;
     if (limit > BROWSER_FETCH_LIMIT) limit = BROWSER_FETCH_LIMIT;
     for (int i = 0; i < limit; i++) {
         browser_resource_t *res = &st->resources[i];
         http_response_t resp;
-        int rc = http_get(res->url, buf, BROWSER_FETCH_BUF_SIZE, &resp);
+        char *body = 0;
+        int rc = http_get_alloc(res->url, &body, BROWSER_FETCH_BUF_SIZE, &resp);
         res->fetched = 1;
         res->status_code = (rc == HTTP_OK) ? resp.status_code : rc;
         res->size = (rc == HTTP_OK) ? resp.body_len : 0;
         res->truncated = (rc == HTTP_OK) ? resp.truncated : 0;
+        if (body) free(body);
     }
-
-    free(buf);
 }
 
 static void browser_resource_status_text(const browser_resource_t *res, char *out, int out_max) {

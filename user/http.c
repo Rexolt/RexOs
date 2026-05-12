@@ -3,7 +3,9 @@
 
 #define HTTP_HOST_MAX 128
 #define HTTP_PATH_MAX 256
-#define HTTP_RAW_MAX  16384
+#define HTTP_RAW_INITIAL 4096
+#define HTTP_HEADER_SLOP 8192
+#define HTTP_RESPONSE_MAX 131072
 #define HTTP_RECV_CHUNK 512
 #define HTTP_IDLE_TIMEOUT_TICKS 300
 #define HTTP_TOTAL_TIMEOUT_TICKS 1000
@@ -25,6 +27,11 @@ static void h_memzero(void *p, uint64_t n) {
     for (uint64_t i = 0; i < n; i++) b[i] = 0;
 }
 
+static void h_memcpy(void *dst, const void *src, uint64_t n) {
+    uint8_t *d = (uint8_t *)dst;
+    const uint8_t *s = (const uint8_t *)src;
+    for (uint64_t i = 0; i < n; i++) d[i] = s[i];
+}
 
 static void h_strncpy0(char *dst, const char *src, int max) {
     int i = 0;
@@ -305,14 +312,37 @@ static int h_build_request(const http_url_t *url, char *req, int req_max) {
     return h_strlen(req);
 }
 
-static int h_read_response(uint64_t sock, char *raw, int raw_max, int *out_len, int *header_len, int *content_len) {
+static int h_grow_raw(char **raw, int *raw_cap, int needed, int raw_limit) {
+    if (needed < *raw_cap) return 1;
+    int new_cap = *raw_cap;
+    while (needed >= new_cap && new_cap < raw_limit) {
+        int next = new_cap * 2;
+        if (next <= new_cap || next > raw_limit) next = raw_limit;
+        new_cap = next;
+    }
+    if (needed >= new_cap) return 0;
+
+    char *grown = (char *)malloc((uint64_t)new_cap);
+    if (!grown) return 0;
+    h_memcpy(grown, *raw, (uint64_t)*raw_cap);
+    free(*raw);
+    *raw = grown;
+    *raw_cap = new_cap;
+    return 1;
+}
+
+static int h_read_response(uint64_t sock, char **raw_io, int *raw_cap_io, int raw_limit,
+                           int *out_len, int *header_len, int *content_len, int *hit_limit) {
     int total = 0;
     int hdr_len = -1;
     int clen = -1;
     uint64_t start_tick = get_ticks();
     uint64_t last_data_tick = start_tick;
+    char *raw = *raw_io;
+    int raw_cap = *raw_cap_io;
+    *hit_limit = 0;
 
-    while (total < raw_max - 1) {
+    while (1) {
         char chunk[HTTP_RECV_CHUNK];
         int bytes = net_recv(sock, chunk, HTTP_RECV_CHUNK);
         uint64_t now = get_ticks();
@@ -325,12 +355,20 @@ static int h_read_response(uint64_t sock, char *raw, int raw_max, int *out_len, 
             continue;
         }
         last_data_tick = now;
-        for (int i = 0; i < bytes && total < raw_max - 1; i++) raw[total++] = chunk[i];
+        if (!h_grow_raw(&raw, &raw_cap, total + bytes + 1, raw_limit)) {
+            bytes = raw_cap - total - 1;
+            if (bytes < 0) bytes = 0;
+            *hit_limit = 1;
+        }
+        for (int i = 0; i < bytes; i++) raw[total++] = chunk[i];
         raw[total] = 0;
+        *raw_io = raw;
+        *raw_cap_io = raw_cap;
         if (hdr_len < 0) {
             hdr_len = h_find_header_end(raw, total);
             if (hdr_len >= 0) clen = h_header_content_length(raw, hdr_len);
         }
+        if (*hit_limit) break;
         if (hdr_len >= 0 && clen >= 0 && total - hdr_len >= clen) break;
     }
 
@@ -371,15 +409,47 @@ static int h_make_absolute_url(const char *base_url, const char *location, char 
     return HTTP_OK;
 }
 
-int http_get(const char *url, char *out, uint64_t out_max, http_response_t *resp) {
+static int h_body_cap_from(uint64_t desired) {
+    if (desired == 0 || desired > HTTP_RESPONSE_MAX) return HTTP_RESPONSE_MAX;
+    return (int)desired;
+}
+
+static int h_finish_alloc_body(const char *body, int body_len, int is_chunked,
+                               uint64_t max_body, char **out_body, http_response_t *resp) {
+    uint64_t cap_body = max_body;
+    if (cap_body == 0 || cap_body > HTTP_RESPONSE_MAX) cap_body = HTTP_RESPONSE_MAX;
+    char *body_buf = (char *)malloc(cap_body + 1);
+    if (!body_buf) {
+        h_set_status(resp, "Out of memory");
+        return HTTP_ERR_NO_MEMORY;
+    }
+    int copied = is_chunked
+        ? h_decode_chunked(body, body_len, body_buf, cap_body + 1, resp)
+        : h_copy_body(body, body_len, body_buf, cap_body + 1, resp);
+    if (!is_chunked && (uint64_t)body_len > cap_body && resp) resp->truncated = 1;
+    *out_body = body_buf;
+    return copied;
+}
+
+static int h_http_get_impl(const char *url, char *fixed_out, uint64_t fixed_out_max,
+                           char **alloc_out, uint64_t alloc_max, http_response_t *resp) {
     h_clear_response(resp);
-    if (!url || !out || out_max == 0) return HTTP_ERR_BAD_URL;
-    out[0] = 0;
+    if (!url || (!fixed_out && !alloc_out)) return HTTP_ERR_BAD_URL;
+    if (fixed_out) {
+        if (fixed_out_max == 0) return HTTP_ERR_BAD_URL;
+        fixed_out[0] = 0;
+    }
+    if (alloc_out) *alloc_out = 0;
 
     char current_url[HTTP_URL_MAX];
     h_strncpy0(current_url, url, HTTP_URL_MAX);
 
-    char *raw = (char *)malloc(HTTP_RAW_MAX);
+    int desired_body = alloc_out ? h_body_cap_from(alloc_max) : h_body_cap_from(fixed_out_max ? fixed_out_max - 1 : 0);
+    int raw_limit = desired_body + HTTP_HEADER_SLOP;
+    if (raw_limit > HTTP_RESPONSE_MAX + HTTP_HEADER_SLOP) raw_limit = HTTP_RESPONSE_MAX + HTTP_HEADER_SLOP;
+    int raw_cap = HTTP_RAW_INITIAL;
+    if (raw_cap > raw_limit) raw_cap = raw_limit;
+    char *raw = (char *)malloc((uint64_t)raw_cap);
     if (!raw) {
         h_set_status(resp, "Out of memory");
         return HTTP_ERR_NO_MEMORY;
@@ -415,14 +485,15 @@ int http_get(const char *url, char *out, uint64_t out_max, http_response_t *resp
         int raw_len = 0;
         int header_len = -1;
         int content_len = -1;
-        int rr = h_read_response(sock, raw, HTTP_RAW_MAX, &raw_len, &header_len, &content_len);
+        int hit_limit = 0;
+        int rr = h_read_response(sock, &raw, &raw_cap, raw_limit, &raw_len, &header_len, &content_len, &hit_limit);
         if (rr != HTTP_OK) {
             h_set_status(resp, "HTTP receive failed");
             h_close_socket(sock);
             free(raw);
             return rr;
         }
-        if (raw_len >= HTTP_RAW_MAX - 1 && resp) resp->truncated = 1;
+        if (hit_limit && resp) resp->truncated = 1;
         if (header_len <= 0) {
             h_set_status(resp, "Invalid HTTP response");
             h_close_socket(sock);
@@ -458,9 +529,20 @@ int http_get(const char *url, char *out, uint64_t out_max, http_response_t *resp
         int body_len = raw_len - header_len;
         if (content_len >= 0 && body_len > content_len) body_len = content_len;
 
-        int copied = is_chunked
-            ? h_decode_chunked(body, body_len, out, out_max, resp)
-            : h_copy_body(body, body_len, out, out_max, resp);
+        int copied;
+        if (alloc_out) {
+            int fr = h_finish_alloc_body(body, body_len, is_chunked, alloc_max, alloc_out, resp);
+            if (fr < 0) {
+                h_close_socket(sock);
+                free(raw);
+                return fr;
+            }
+            copied = fr;
+        } else {
+            copied = is_chunked
+                ? h_decode_chunked(body, body_len, fixed_out, fixed_out_max, resp)
+                : h_copy_body(body, body_len, fixed_out, fixed_out_max, resp);
+        }
 
         if (resp) {
             resp->body_len = copied;
@@ -478,4 +560,12 @@ int http_get(const char *url, char *out, uint64_t out_max, http_response_t *resp
     h_set_status(resp, "Too many redirects");
     free(raw);
     return HTTP_ERR_TOO_MANY_REDIRECTS;
+}
+
+int http_get(const char *url, char *out, uint64_t out_max, http_response_t *resp) {
+    return h_http_get_impl(url, out, out_max, 0, 0, resp);
+}
+
+int http_get_alloc(const char *url, char **out_body, uint64_t max_body, http_response_t *resp) {
+    return h_http_get_impl(url, 0, 0, out_body, max_body, resp);
 }

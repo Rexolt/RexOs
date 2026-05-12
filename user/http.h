@@ -26,3 +26,4 @@ typedef struct {
 } http_response_t;
 
 int http_get(const char *url, char *out, uint64_t out_max, http_response_t *resp);
+int http_get_alloc(const char *url, char **out_body, uint64_t max_body, http_response_t *resp);
