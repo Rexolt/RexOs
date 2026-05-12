@@ -122,6 +122,28 @@ void tcp_close(tcp_socket_t *s) {
     s->state = TCP_FIN_WAIT_1;
 }
 
+bool tcp_socket_is_valid(tcp_socket_t *sock) {
+    for (tcp_socket_t *s = s_sockets; s; s = s->next) {
+        if (s == sock) return true;
+    }
+    return false;
+}
+
+void tcp_release(tcp_socket_t *sock) {
+    if (!sock) return;
+
+    tcp_socket_t **link = &s_sockets;
+    while (*link && *link != sock) link = &(*link)->next;
+    if (!*link) return;
+
+    if (sock->state == TCP_ESTABLISHED || sock->state == TCP_CLOSE_WAIT) {
+        tcp_close(sock);
+    }
+    *link = sock->next;
+    sock->next = NULL;
+    kfree(sock);
+}
+
 void tcp_receive(net_device_t *dev, const ip4_header_t *ip_hdr, const tcp_header_t *tcp, uint32_t len) {
     uint16_t local_port  = ntohs(tcp->dest_port);
     uint16_t remote_port = ntohs(tcp->src_port);
