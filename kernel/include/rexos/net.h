@@ -204,6 +204,8 @@ void          tcp_receive(net_device_t *dev, const ip4_header_t *ip_hdr, const t
 tcp_socket_t *tcp_connect(net_device_t *dev, const ip4_addr_t *dest_ip, uint16_t dest_port);
 void          tcp_send_data(tcp_socket_t *sock, const void *data, uint32_t len);
 void          tcp_close(tcp_socket_t *sock);
+bool          tcp_socket_is_valid(tcp_socket_t *sock);
+void          tcp_release(tcp_socket_t *sock);
 
 /* DNS (dns.c) */
 bool dns_resolve(net_device_t *dev, const char *hostname, ip4_addr_t *out_ip);
