@@ -1990,8 +1990,12 @@ typedef struct {
     browser_link_t links[BROWSER_MAX_LINKS];
     int     resource_count;         /* img/css/script resource lista */
     browser_resource_t resources[BROWSER_MAX_RESOURCES];
+    int     last_error;             /* HTTP_ERR_* kód a barátságos hibaképernyőkhöz */
     char    status[64];             /* státus szöveg */
 } browser_state_t;
+
+#define BROWSER_HOME_URL "rex://home"
+
 
 /* Egyszerű string segédek a böngészőhöz */
 static void b_strcpy(char *d, const char *s) { while((*d++=*s++)); }
@@ -2049,6 +2053,9 @@ static void browser_window_cleanup(window_t *w) {
 
 static void browser_scan_resources(browser_state_t *st);
 static void browser_fetch_resources(browser_state_t *st);
+static int browser_str_eq(const char *a, const char *b);
+static int browser_is_home_url(const char *url);
+static void browser_load_home(browser_state_t *st);
 
 static int browser_ensure_content(browser_state_t *st) {
     if (st->content) return 1;
@@ -2063,13 +2070,40 @@ static int browser_ensure_content(browser_state_t *st) {
     return 1;
 }
 
+static int browser_is_home_url(const char *url) {
+    return browser_str_eq(url, BROWSER_HOME_URL) || browser_str_eq(url, "about:home") ||
+           browser_str_eq(url, "home") || browser_str_eq(url, "rex");
+}
+
+static void browser_load_home(browser_state_t *st) {
+    st->loading = 0;
+    st->error = 0;
+    st->last_error = HTTP_OK;
+    st->scroll = 0;
+    st->link_count = 0;
+    st->resource_count = 0;
+    browser_free_content(st);
+    browser_ensure_content(st);
+    b_strncpy0(st->url, BROWSER_HOME_URL, BROWSER_URL_MAX);
+    st->url_len = b_strlen(st->url);
+    b_strncpy0(st->current_url, BROWSER_HOME_URL, BROWSER_URL_MAX);
+    b_strcpy(st->status, "Modern local page ready. HTTP links are clickable.");
+}
+
 /* HTTP GET küldése */
 static void browser_do_fetch(browser_state_t *st) {
     st->loading = 1;
     st->error   = 0;
+    st->last_error = HTTP_OK;
     st->link_count = 0;
     st->resource_count = 0;
     browser_free_content(st);
+
+    if (st->url[0] == 0 || browser_is_home_url(st->url)) {
+        browser_load_home(st);
+        return;
+    }
+
     b_strcpy(st->status, "Loading HTTP page...");
 
     http_response_t resp;
@@ -2081,7 +2115,12 @@ static void browser_do_fetch(browser_state_t *st) {
     if (rc != HTTP_OK) {
         if (body) free(body);
         browser_ensure_content(st);
-        b_strcpy(st->status, resp.status[0] ? resp.status : "HTTP request failed");
+        st->last_error = rc;
+        if (rc == HTTP_ERR_HTTPS) {
+            b_strcpy(st->status, "HTTPS requires TLS; this browser is HTTP-only today.");
+        } else {
+            b_strcpy(st->status, resp.status[0] ? resp.status : "HTTP request failed");
+        }
         st->error = 1;
         return;
     }
@@ -2091,6 +2130,7 @@ static void browser_do_fetch(browser_state_t *st) {
 
     if (resp.body_len == 0) {
         b_strcpy(st->status, "Empty response");
+        st->last_error = HTTP_ERR_RESPONSE;
         st->error = 1;
     } else {
         browser_scan_resources(st);
@@ -2705,6 +2745,99 @@ static void browser_render_text(window_t *w, browser_state_t *st) {
     }
 }
 
+static void browser_home_link(browser_state_t *st, const char *url, int x, int y, int w, int h) {
+    browser_record_link_rect(st, url, x, y, w, h);
+}
+
+static void browser_draw_home_card(int x, int y, int w, int h, uint32_t accent,
+                                   const char *title, const char *body, const char *url,
+                                   browser_state_t *st) {
+    bb_fill_rounded_rect_alpha(x + 3, y + 4, w, h, 10, 0x000000, 70);
+    bb_fill_rounded_rect(x, y, w, h, 10, 0x111827);
+    bb_fill_rect_alpha(x + 1, y + 1, w - 2, 1, 0xFFFFFF, 18);
+    bb_fill_rounded_rect(x + 12, y + 12, 28, 28, 7, accent);
+    bb_fill_rect_alpha(x + 13, y + 13, 26, 6, 0xFFFFFF, 35);
+    bb_draw_text(x + 50, y + 14, title, 0xF8FAFC, 1);
+    bb_draw_text(x + 50, y + 30, body, 0x94A3B8, 1);
+    bb_draw_text(x + 12, y + h - 20, "Open", accent, 1);
+    bb_draw_text(x + 44, y + h - 20, url, 0x64748B, 1);
+    browser_home_link(st, url, x, y, w, h);
+}
+
+static void browser_draw_home_page(window_t *w, browser_state_t *st) {
+    int x = w->x + 10;
+    int y = w->y + TITLE_H + 54;
+    int ww = w->w - 20;
+    int hh = w->h - TITLE_H - 68;
+    st->link_count = 0;
+
+    bb_fill_rounded_rect(x, y, ww, hh, 14, 0x0F172A);
+    bb_fill_rect_alpha(x + 1, y + 1, ww - 2, 1, 0xFFFFFF, 22);
+    bb_fill_rounded_rect_alpha(x + 18, y + 14, ww - 36, 98, 16, 0x2563EB, 62);
+    bb_fill_rounded_rect_alpha(x + ww - 170, y + 8, 130, 92, 20, 0x7C3AED, 80);
+    bb_fill_rounded_rect_alpha(x + 34, y + 80, 160, 76, 18, 0x06B6D4, 44);
+
+    bb_draw_text(x + 30, y + 26, "RexOS Modern Web", 0xF8FAFC, 2);
+    bb_draw_text(x + 32, y + 54, "Local landing page running inside RexBrowser.", 0xCBD5E1, 1);
+    bb_draw_text(x + 32, y + 68, "Use HTTP links below or type any address in the bar.", 0xCBD5E1, 1);
+
+    bb_fill_rounded_rect(x + ww - 152, y + 32, 112, 34, 9, 0x0B1220);
+    bb_draw_text(x + ww - 136, y + 43, "LIVE", 0x22C55E, 2);
+    bb_fill_rounded_rect(x + ww - 62, y + 42, 10, 10, 5, 0x22C55E);
+
+    int stat_y = y + 122;
+    int stat_w = (ww - 64) / 3;
+    const char *stats[][2] = {
+        {"HTTP", "network ready"},
+        {"CSS/JS", "assets fetched"},
+        {"LINKS", "click cards"},
+    };
+    for (int i = 0; i < 3; i++) {
+        int sx = x + 20 + i * (stat_w + 12);
+        bb_fill_rounded_rect_alpha(sx, stat_y, stat_w, 44, 8, 0x020617, 160);
+        bb_draw_text(sx + 12, stat_y + 10, stats[i][0], 0xA78BFA, 1);
+        bb_draw_text(sx + 12, stat_y + 25, stats[i][1], 0x94A3B8, 1);
+    }
+
+    int card_y = stat_y + 64;
+    int card_w = (ww - 54) / 3;
+    browser_draw_home_card(x + 18, card_y, card_w, 96, 0x38BDF8,
+                           "First site", "classic web test", "http://info.cern.ch/", st);
+    browser_draw_home_card(x + 30 + card_w, card_y, card_w, 96, 0xA78BFA,
+                           "Example", "small sample page", "http://example.com/", st);
+    browser_draw_home_card(x + 42 + card_w * 2, card_y, card_w, 96, 0x34D399,
+                           "No TLS", "HTTP connectivity", "http://neverssl.com/", st);
+
+    int cta_y = y + hh - 48;
+    bb_fill_rounded_rect_alpha(x + 20, cta_y, ww - 40, 28, 8, 0x1D4ED8, 125);
+    bb_draw_text(x + 36, cta_y + 10, "Tip: write rex://home anytime to return to this modern page.", 0xE0F2FE, 1);
+}
+
+static void browser_draw_https_required_page(window_t *w, browser_state_t *st) {
+    int x = w->x + 18;
+    int y = w->y + TITLE_H + 62;
+    int ww = w->w - 36;
+
+    st->link_count = 0;
+    bb_fill_rounded_rect(x, y, ww, 218, 14, 0x111827);
+    bb_fill_rect_alpha(x + 1, y + 1, ww - 2, 1, 0xFFFFFF, 20);
+    bb_fill_rounded_rect(x + 22, y + 22, 48, 48, 12, 0xF97316);
+    bb_draw_text(x + 38, y + 38, "TLS", 0xFFFFFF, 1);
+
+    bb_draw_text(x + 88, y + 24, "This site needs HTTPS", 0xF8FAFC, 2);
+    bb_draw_text(x + 90, y + 54, "Sites like google.com redirect from HTTP to HTTPS.", 0xCBD5E1, 1);
+    bb_draw_text(x + 90, y + 68, "RexBrowser can fetch HTTP pages, but TLS is not implemented yet.", 0xCBD5E1, 1);
+    bb_draw_text(x + 90, y + 82, "So Google cannot be opened safely until the OS has TLS support.", 0xCBD5E1, 1);
+
+    int bx = x + 28;
+    int by = y + 118;
+    int bw = (ww - 72) / 2;
+    browser_draw_home_card(bx, by, bw, 72, 0x38BDF8,
+                           "Use HTTP test", "works without TLS", "http://neverssl.com/", st);
+    browser_draw_home_card(bx + bw + 16, by, bw, 72, 0xA78BFA,
+                           "Back home", "local modern page", BROWSER_HOME_URL, st);
+}
+
 static void app_browser_draw(window_t *w) {
     browser_state_t *st = (browser_state_t *)w->priv;
 
@@ -2715,8 +2848,8 @@ static void app_browser_draw(window_t *w) {
     uint32_t bar_col = st->url_focused ? 0x45475A : 0x313244;
     bb_fill_rounded_rect(w->x + 8, w->y + TITLE_H + 8, w->w - 16, 22, 4, bar_col);
 
-    /* Lock ikon (egyszerű szöveg) */
-    bb_draw_text(w->x + 14, w->y + TITLE_H + 15, "http://", 0x6C7086, 1);
+    const char *scheme_label = browser_has_scheme(st->url) ? "" : "http://";
+    bb_draw_text(w->x + 14, w->y + TITLE_H + 15, scheme_label, 0x6C7086, 1);
 
     char display_url[BROWSER_URL_MAX + 8];
     int dlen = 0;
@@ -2724,7 +2857,7 @@ static void app_browser_draw(window_t *w) {
     while(*u && dlen < 60) display_url[dlen++] = *u++;
     if (st->url_focused) display_url[dlen++] = '_'; /* kurzor */
     display_url[dlen] = 0;
-    bb_draw_text(w->x + 14 + 6*7, w->y + TITLE_H + 15, display_url, 0xCDD6F4, 1);
+    bb_draw_text(w->x + 14 + 6*b_strlen(scheme_label), w->y + TITLE_H + 15, display_url, 0xCDD6F4, 1);
 
     /* GO gomb */
     uint32_t go_col = 0x89B4FA;
@@ -2740,12 +2873,18 @@ static void app_browser_draw(window_t *w) {
     if (st->loading) {
         bb_draw_text(w->x + w->w/2 - 42, w->y + TITLE_H + 60, "Loading...", 0x89B4FA, 2);
     } else if (st->error) {
-        bb_draw_text(w->x + 10, w->y + TITLE_H + 60, "Could not load page.", 0xFF5555, 1);
-        bb_draw_text(w->x + 10, w->y + TITLE_H + 74, st->status, 0x6C7086, 1);
+        if (st->last_error == HTTP_ERR_HTTPS) {
+            browser_draw_https_required_page(w, st);
+        } else {
+            bb_draw_text(w->x + 10, w->y + TITLE_H + 60, "Could not load page.", 0xFF5555, 1);
+            bb_draw_text(w->x + 10, w->y + TITLE_H + 74, st->status, 0x6C7086, 1);
+        }
+    } else if (browser_is_home_url(st->current_url) || browser_is_home_url(st->url)) {
+        browser_draw_home_page(w, st);
     } else if (!st->content || st->content[0] == 0) {
         int cx = w->x + w->w / 2 - 80;
         int cy = w->y + TITLE_H + 70;
-        bb_draw_text(cx, cy,      "RexBrowser v0.1", 0xCBA6F7, 2);
+        bb_draw_text(cx, cy,      "RexBrowser v0.2", 0xCBA6F7, 2);
         bb_draw_text(cx - 20, cy + 24, "Type a URL and press GO or Enter", 0x6C7086, 1);
         bb_draw_text(cx - 20, cy + 36, "TCP/IP stack: ACTIVE", 0xA6E3A1, 1);
     } else {
@@ -2979,21 +3118,9 @@ static void launch_app(app_kind_t app) {
                 bs->url[0]     = 0;
                 bs->current_url[0] = 0;
                 bs->url_len    = 0;
-                bs->url_focused = 1;
-                browser_free_content(bs);
-                int content_ok = browser_ensure_content(bs);
-                bs->loading    = 0;
-                bs->error      = content_ok ? 0 : 1;
-                bs->scroll     = 0;
-                bs->link_count = 0;
-                bs->resource_count = 0;
-                if (content_ok) {
-                    /* Alapértelmezett státus */
-                    const char *ready = "TCP/IP Stack active. Type a URL and press Enter.";
-                    int ri = 0;
-                    while(ready[ri] && ri < 63) { bs->status[ri] = ready[ri]; ri++; }
-                    bs->status[ri] = 0;
-                }
+                bs->url_focused = 0;
+                browser_load_home(bs);
+                if (!bs->content) bs->error = 1;
             }
             break;
         }
@@ -3175,9 +3302,10 @@ void _start(void) {
     /* Ikon hover állapotok nullázása */
     for (int i = 0; i < 16; i++) g_icon_hover_alpha[i] = 0;
 
-    /* Initial sysinfo window */
+    /* Initial windows: include the modern RexBrowser landing page. */
     launch_app(APP_ABOUT);
     launch_app(APP_FILES);
+    launch_app(APP_BROWSER);
 
     uint64_t last_draw = 0;
     int running = 1;
