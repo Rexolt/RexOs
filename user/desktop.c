@@ -15,6 +15,7 @@
  * ========================================================================== */
 
 #include "libc.h"
+#include "http.h"
 
 #ifndef NULL
 #define NULL ((void*)0)
@@ -495,12 +496,6 @@ static int sstrcmp(const char *a, const char *b) {
     while (*a && (*a == *b)) { a++; b++; }
     return *(const unsigned char *)a - *(const unsigned char *)b;
 }
-static int sstrcmp_n(const char *a, const char *b, int n) {
-    for (int i = 0; i < n; i++) {
-        if (!a[i] || a[i] != b[i]) return (unsigned char)a[i] - (unsigned char)b[i];
-    }
-    return 0;
-}
 static int sstrlen(const char *s) { int n = 0; while (s[n]) n++; return n; }
 static void sstrcpy(char *d, const char *s) { while ((*d++ = *s++)); }
 static void sstrcat(char *d, const char *s) {
@@ -655,8 +650,11 @@ static int window_new(app_kind_t app, const char *title, int w, int h,
     return slot;
 }
 
+static void browser_window_cleanup(window_t *w);
+
 static void window_close(int idx) {
     if (idx < 0 || idx >= g_window_count) return;
+    if (g_windows[idx].app == APP_BROWSER) browser_window_cleanup(&g_windows[idx]);
     g_windows[idx].open = 0;
     if (g_focus == idx) {
         g_focus = -1;
@@ -1950,185 +1948,764 @@ static void app_term_key(window_t *w, char c) {
  *  APP: REXBROWSER - Interaktív HTTP Böngésző
  * ========================================================================== */
 
-#define BROWSER_URL_MAX  256
-#define BROWSER_BUF_MAX  3700
+#define BROWSER_URL_MAX       256
+#define BROWSER_CONTENT_MAX   16384
+#define BROWSER_LINK_URL_MAX  160
+#define BROWSER_MAX_LINKS      16
+#define BROWSER_MAX_RESOURCES  16
+#define BROWSER_FETCH_LIMIT     4
+#define BROWSER_FETCH_BUF_SIZE  2048
+
+typedef enum {
+    BROWSER_RES_IMAGE,
+    BROWSER_RES_STYLE,
+    BROWSER_RES_SCRIPT,
+} browser_resource_kind_t;
+
+typedef struct {
+    browser_resource_kind_t kind;
+    char url[BROWSER_LINK_URL_MAX];
+    int fetched;
+    int status_code;
+    int size;
+    int truncated;
+} browser_resource_t;
+
+typedef struct {
+    int  x, y, w, h;
+    char url[BROWSER_LINK_URL_MAX];
+} browser_link_t;
 
 typedef struct {
     char    url[BROWSER_URL_MAX];   /* pl. "example.com/path" */
-    char    content[BROWSER_BUF_MAX]; /* nyers HTTP válasz szövege (HTML) */
+    char    current_url[BROWSER_URL_MAX]; /* normalizált végső oldal URL */
+    char   *content;                /* heapen tárolt HTML body */
+    uint64_t content_cap;           /* content buffer mérete */
     int     url_focused;            /* 1 ha a URL bar aktív */
     int     url_len;
     int     scroll;                 /* tartalom görgetése soronként */
     int     loading;                /* 1 = betöltés folyamatban */
     int     error;                  /* 1 = kapcsolati hiba */
+    int     link_count;             /* aktuálisan látható kattintható link régiók */
+    browser_link_t links[BROWSER_MAX_LINKS];
+    int     resource_count;         /* img/css/script resource lista */
+    browser_resource_t resources[BROWSER_MAX_RESOURCES];
     char    status[64];             /* státus szöveg */
 } browser_state_t;
 
-/* Egyszerű string segédek (libc nélkül) */
+/* Egyszerű string segédek a böngészőhöz */
 static void b_strcpy(char *d, const char *s) { while((*d++=*s++)); }
-static int b_strncmp(const char *a, const char *b, int n) {
-    for(int i=0;i<n;i++) { if(a[i]!=b[i]) return a[i]-b[i]; if(!a[i]) return 0; } return 0;
+static int b_strlen(const char *s) {
+    int len = 0;
+    while (s && s[len]) len++;
+    return len;
+}
+static void b_strncpy0(char *d, const char *s, int max) {
+    int i = 0;
+    if (max <= 0) return;
+    for (; s && s[i] && i < max - 1; i++) d[i] = s[i];
+    d[i] = 0;
+}
+static void b_strcat_limit(char *d, const char *s, int max) {
+    int pos = b_strlen(d);
+    int i = 0;
+    if (max <= 0 || pos >= max) return;
+    while (s && s[i] && pos < max - 1) d[pos++] = s[i++];
+    d[pos] = 0;
+}
+static void b_append_int(char *d, int value, int max) {
+    char tmp[16];
+    int n = 0;
+    if (value < 0) {
+        b_strcat_limit(d, "-", max);
+        value = -value;
+    }
+    if (value == 0) {
+        b_strcat_limit(d, "0", max);
+        return;
+    }
+    while (value > 0 && n < (int)sizeof(tmp)) {
+        tmp[n++] = (char)('0' + (value % 10));
+        value /= 10;
+    }
+    while (n > 0) {
+        char one[2] = { tmp[--n], 0 };
+        b_strcat_limit(d, one, max);
+    }
+}
+
+static void browser_free_content(browser_state_t *st) {
+    if (st->content) {
+        free(st->content);
+        st->content = 0;
+    }
+    st->content_cap = 0;
+}
+
+static void browser_window_cleanup(window_t *w) {
+    browser_state_t *st = (browser_state_t *)w->priv;
+    browser_free_content(st);
+}
+
+static void browser_scan_resources(browser_state_t *st);
+static void browser_fetch_resources(browser_state_t *st);
+
+static int browser_ensure_content(browser_state_t *st) {
+    if (st->content && st->content_cap >= BROWSER_CONTENT_MAX) return 1;
+    browser_free_content(st);
+    st->content = (char *)malloc(BROWSER_CONTENT_MAX);
+    if (!st->content) {
+        b_strcpy(st->status, "Out of memory for page buffer");
+        st->content_cap = 0;
+        return 0;
+    }
+    st->content_cap = BROWSER_CONTENT_MAX;
+    st->content[0] = 0;
+    return 1;
 }
 
 /* HTTP GET küldése */
 static void browser_do_fetch(browser_state_t *st) {
     st->loading = 1;
     st->error   = 0;
+    st->link_count = 0;
+    st->resource_count = 0;
+    if (!browser_ensure_content(st)) {
+        st->error = 1;
+        st->loading = 0;
+        return;
+    }
     st->content[0] = 0;
-    b_strcpy(st->status, "Connecting...");
+    b_strcpy(st->status, "Loading HTTP page...");
 
-    /* URL parse: "host/path" vagy "http://host/path" */
-    const char *url = st->url;
-    if (b_strncmp(url, "http://", 7) == 0) url += 7;
-    if (b_strncmp(url, "https://", 8) == 0) {
-        b_strcpy(st->status, "HTTPS not supported yet (no TLS)");
-        st->error = 1; st->loading = 0;
-        return;
-    }
-
-    /* Szétválasztjuk host és path részre */
-    char host[128]; char path[128];
-    int hi = 0, pi = 0;
-    int in_path = 0;
-    for (int i = 0; url[i] && hi < 127; i++) {
-        if (!in_path && url[i] == '/') { in_path = 1; path[pi++] = url[i]; continue; }
-        if (in_path) path[pi++] = url[i];
-        else         host[hi++] = url[i];
-    }
-    host[hi] = 0;
-    if (pi == 0) { path[0] = '/'; path[1] = 0; }
-    else          path[pi] = 0;
-
-    /* TCP kapcsolat: port 80 */
-    uint64_t sock = net_connect(host, 80);
-    if (sock == (uint64_t)-1 || sock == 0) {
-        b_strcpy(st->status, "Connection failed (DNS/TCP error)");
-        st->error = 1; st->loading = 0;
-        return;
-    }
-
-    b_strcpy(st->status, "Sending HTTP GET...");
-
-    /* HTTP/1.0 kérés összeállítása */
-    char req[512];
-    int rlen = 0;
-    /* "GET /path HTTP/1.0\r\nHost: host\r\n\r\n" */
-    const char *method = "GET ";
-    for(int i=0;method[i];i++) req[rlen++]=method[i];
-    for(int i=0;path[i];i++)   req[rlen++]=path[i];
-    const char *ver = " HTTP/1.0\r\nHost: ";
-    for(int i=0;ver[i];i++) req[rlen++]=ver[i];
-    for(int i=0;host[i];i++) req[rlen++]=host[i];
-    const char *end = "\r\nConnection: close\r\n\r\n";
-    for(int i=0;end[i];i++) req[rlen++]=end[i];
-
-    net_send(sock, req, rlen);
-    b_strcpy(st->status, "Waiting for response...");
-
-    /* Fogadjuk a választ */
-    int total = 0;
-    char chunk[512];
-    int bytes;
-    while ((bytes = net_recv(sock, chunk, 511)) > 0 && total < BROWSER_BUF_MAX - 1) {
-        int copy = bytes;
-        if (total + copy >= BROWSER_BUF_MAX - 1) copy = BROWSER_BUF_MAX - 1 - total;
-        for(int i=0;i<copy;i++) st->content[total++] = chunk[i];
-    }
-    st->content[total] = 0;
-    /* net_close(sock); -- Jelenleg még nincs, de a szerver lezárja a kapcsolatot (Connection: close) */
-
-    /* HTTP fejléc kihagyása: keressük a \r\n\r\n-t */
-    char *body = st->content;
-    for (int i = 0; i < total - 3; i++) {
-        if (body[i]=='\r'&&body[i+1]=='\n'&&body[i+2]=='\r'&&body[i+3]=='\n') {
-            body = body + i + 4;
-            break;
-        }
-    }
-    /* Ha a body nem az elejétől indul, toljuk előre */
-    if (body != st->content) {
-        int blen = 0;
-        char *p = body;
-        while(*p) { st->content[blen++] = *p++; }
-        st->content[blen] = 0;
-    }
+    http_response_t resp;
+    int rc = http_get(st->url, st->content, st->content_cap, &resp);
 
     st->scroll = 0;
     st->loading = 0;
-    if (total == 0) {
+    if (rc != HTTP_OK) {
+        b_strcpy(st->status, resp.status[0] ? resp.status : "HTTP request failed");
+        st->error = 1;
+        return;
+    }
+    b_strncpy0(st->current_url, resp.final_url[0] ? resp.final_url : st->url, BROWSER_URL_MAX);
+
+    if (resp.body_len == 0) {
         b_strcpy(st->status, "Empty response");
         st->error = 1;
     } else {
-        b_strcpy(st->status, "OK");
+        browser_scan_resources(st);
+        browser_fetch_resources(st);
+        b_strcpy(st->status, resp.status[0] ? resp.status : "HTTP OK");
+        st->error = 0;
     }
 }
 
-/* Nyers szöveg renderelése HTML tagek kihagyásával és alap formázással */
+static char browser_lower(char c) {
+    if (c >= 'A' && c <= 'Z') return (char)(c + ('a' - 'A'));
+    return c;
+}
+
+static int browser_tag_eq(const char *tag, const char *name) {
+    int i = 0;
+    while (tag[i] == ' ' || tag[i] == '\t' || tag[i] == '\r' || tag[i] == '\n') i++;
+    if (tag[i] == '/') i++;
+    while (tag[i] == ' ' || tag[i] == '\t' || tag[i] == '\r' || tag[i] == '\n') i++;
+
+    int j = 0;
+    while (name[j]) {
+        if (browser_lower(tag[i + j]) != name[j]) return 0;
+        j++;
+    }
+
+    char end = tag[i + j];
+    return end == 0 || end == '>' || end == '/' || end == ' ' ||
+           end == '\t' || end == '\r' || end == '\n';
+}
+
+static int browser_is_block_tag(const char *tag) {
+    return browser_tag_eq(tag, "p") || browser_tag_eq(tag, "div") ||
+           browser_tag_eq(tag, "section") || browser_tag_eq(tag, "article") ||
+           browser_tag_eq(tag, "header") || browser_tag_eq(tag, "footer") ||
+           browser_tag_eq(tag, "main") || browser_tag_eq(tag, "nav") ||
+           browser_tag_eq(tag, "ul") || browser_tag_eq(tag, "ol") ||
+           browser_tag_eq(tag, "li") || browser_tag_eq(tag, "table") ||
+           browser_tag_eq(tag, "tr") || browser_tag_eq(tag, "blockquote") ||
+           browser_tag_eq(tag, "h1") || browser_tag_eq(tag, "h2") ||
+           browser_tag_eq(tag, "h3") || browser_tag_eq(tag, "h4") ||
+           browser_tag_eq(tag, "h5") || browser_tag_eq(tag, "h6");
+}
+
+static int browser_match_close_tag(const char *p, const char *name) {
+    if (p[0] != '<' || p[1] != '/') return 0;
+    return browser_tag_eq(p + 2, name);
+}
+
+static int browser_tag_is_closing(const char *tag, const char *name) {
+    int i = 0;
+    while (tag[i] == ' ' || tag[i] == '\t' || tag[i] == '\r' || tag[i] == '\n') i++;
+    if (tag[i] != '/') return 0;
+    return browser_tag_eq(tag + i + 1, name);
+}
+
+static int browser_name_char(char c) {
+    return (c >= 'a' && c <= 'z') || (c >= 'A' && c <= 'Z') ||
+           (c >= '0' && c <= '9') || c == '-' || c == '_' || c == ':';
+}
+
+static int browser_attr_name_eq(const char *p, const char *name, int len) {
+    int i = 0;
+    while (i < len && name[i]) {
+        if (browser_lower(p[i]) != name[i]) return 0;
+        i++;
+    }
+    return i == len && name[i] == 0;
+}
+
+static int browser_tag_attr_value(const char *tag, const char *attr, char *out, int out_max) {
+    int i = 0;
+    out[0] = 0;
+
+    while (tag[i] && tag[i] != '>' && !browser_name_char(tag[i])) i++;
+    while (tag[i] && tag[i] != '>' && browser_name_char(tag[i])) i++;
+
+    while (tag[i] && tag[i] != '>') {
+        while (tag[i] == ' ' || tag[i] == '\t' || tag[i] == '\r' || tag[i] == '\n') i++;
+        int start = i;
+        while (tag[i] && tag[i] != '>' && browser_name_char(tag[i])) i++;
+        int len = i - start;
+        while (tag[i] == ' ' || tag[i] == '\t' || tag[i] == '\r' || tag[i] == '\n') i++;
+        if (tag[i] != '=') {
+            while (tag[i] && tag[i] != '>' && tag[i] != ' ' && tag[i] != '\t' && tag[i] != '\r' && tag[i] != '\n') i++;
+            continue;
+        }
+        i++;
+        while (tag[i] == ' ' || tag[i] == '\t' || tag[i] == '\r' || tag[i] == '\n') i++;
+
+        char quote = 0;
+        if (tag[i] == '"' || tag[i] == '\'') quote = tag[i++];
+        int value_start = i;
+        if (quote) {
+            while (tag[i] && tag[i] != quote) i++;
+        } else {
+            while (tag[i] && tag[i] != '>' && tag[i] != ' ' && tag[i] != '\t' && tag[i] != '\r' && tag[i] != '\n') i++;
+        }
+        int value_len = i - value_start;
+        if (quote && tag[i] == quote) i++;
+
+        if (len > 0 && browser_attr_name_eq(tag + start, attr, len)) {
+            int copy = value_len;
+            if (copy >= out_max) copy = out_max - 1;
+            for (int k = 0; k < copy; k++) out[k] = tag[value_start + k];
+            out[copy] = 0;
+            return copy > 0;
+        }
+    }
+    return 0;
+}
+
+static int browser_starts_with(const char *s, const char *prefix) {
+    int i = 0;
+    while (prefix[i]) {
+        if (s[i] != prefix[i]) return 0;
+        i++;
+    }
+    return 1;
+}
+
+static int browser_has_scheme(const char *url) {
+    int i = 0;
+    if (!((url[i] >= 'A' && url[i] <= 'Z') || (url[i] >= 'a' && url[i] <= 'z'))) return 0;
+    while ((url[i] >= 'A' && url[i] <= 'Z') || (url[i] >= 'a' && url[i] <= 'z') ||
+           (url[i] >= '0' && url[i] <= '9') || url[i] == '+' || url[i] == '-' || url[i] == '.') i++;
+    return url[i] == ':';
+}
+
+static int browser_url_host_end(const char *url) {
+    int scheme = 0;
+    while (url[scheme] && !(url[scheme] == ':' && url[scheme + 1] == '/' && url[scheme + 2] == '/')) scheme++;
+    if (!url[scheme]) return -1;
+    int i = scheme + 3;
+    while (url[i] && url[i] != '/' && url[i] != '?' && url[i] != '#') i++;
+    return i;
+}
+
+static int browser_copy_prefix(char *out, int out_max, const char *src, int len) {
+    if (out_max <= 0) return 0;
+    if (len >= out_max) len = out_max - 1;
+    for (int i = 0; i < len; i++) out[i] = src[i];
+    out[len] = 0;
+    return len;
+}
+
+static int browser_append_limit(char *out, int out_max, const char *src) {
+    int pos = 0;
+    while (out[pos]) pos++;
+    int i = 0;
+    while (src[i] && pos < out_max - 1) out[pos++] = src[i++];
+    out[pos] = 0;
+    return src[i] == 0;
+}
+
+static void browser_normalize_url_path(const char *raw, char *out, int out_max) {
+    int host_end = browser_url_host_end(raw);
+    if (host_end < 0) {
+        b_strncpy0(out, raw, out_max);
+        return;
+    }
+
+    int pos = browser_copy_prefix(out, out_max, raw, host_end);
+    const char *p = raw + host_end;
+    if (*p != '/') {
+        browser_append_limit(out, out_max, p);
+        return;
+    }
+
+    while (*p == '/') p++;
+    while (*p && *p != '?' && *p != '#') {
+        char segment[48];
+        int len = 0;
+        while (*p && *p != '/' && *p != '?' && *p != '#' && len < (int)sizeof(segment) - 1) {
+            segment[len++] = *p++;
+        }
+        while (*p && *p != '/' && *p != '?' && *p != '#') p++;
+        while (*p == '/') p++;
+        segment[len] = 0;
+
+        if (len == 0 || (len == 1 && segment[0] == '.')) continue;
+        if (len == 2 && segment[0] == '.' && segment[1] == '.') {
+            int end = pos;
+            while (end > host_end && out[end - 1] == '/') end--;
+            while (end > host_end && out[end - 1] != '/') end--;
+            if (end < host_end) end = host_end;
+            out[end] = 0;
+            pos = end;
+            continue;
+        }
+
+        if (pos < out_max - 1) out[pos++] = '/';
+        out[pos] = 0;
+        for (int i = 0; segment[i] && pos < out_max - 1; i++) out[pos++] = segment[i];
+        out[pos] = 0;
+    }
+
+    if (pos == host_end && pos < out_max - 1) {
+        out[pos++] = '/';
+        out[pos] = 0;
+    }
+    if (*p) browser_append_limit(out, out_max, p);
+}
+
+static void browser_resolve_href(const char *base_url, const char *href, char *out, int out_max) {
+    if (!href || !href[0]) { out[0] = 0; return; }
+    if (browser_has_scheme(href)) {
+        b_strncpy0(out, href, out_max);
+        return;
+    }
+
+    const char *base = base_url && base_url[0] ? base_url : "";
+    int host_end = browser_url_host_end(base);
+    if (host_end < 0) {
+        b_strncpy0(out, href, out_max);
+        return;
+    }
+
+    char raw[BROWSER_URL_MAX];
+    raw[0] = 0;
+    if (browser_starts_with(href, "//")) {
+        int scheme_len = 0;
+        while (base[scheme_len] && base[scheme_len] != ':') scheme_len++;
+        browser_copy_prefix(raw, sizeof(raw), base, scheme_len + 1);
+        browser_append_limit(raw, sizeof(raw), href);
+    } else if (href[0] == '/') {
+        browser_copy_prefix(raw, sizeof(raw), base, host_end);
+        browser_append_limit(raw, sizeof(raw), href);
+    } else if (href[0] == '#') {
+        int base_len = 0;
+        while (base[base_len] && base[base_len] != '#') base_len++;
+        browser_copy_prefix(raw, sizeof(raw), base, base_len);
+        browser_append_limit(raw, sizeof(raw), href);
+    } else {
+        int dir_end = host_end;
+        int i = host_end;
+        while (base[i] && base[i] != '?' && base[i] != '#') {
+            if (base[i] == '/') dir_end = i + 1;
+            i++;
+        }
+        if (dir_end == host_end) dir_end = host_end + 1;
+        browser_copy_prefix(raw, sizeof(raw), base, dir_end);
+        browser_append_limit(raw, sizeof(raw), href);
+    }
+
+    browser_normalize_url_path(raw, out, out_max);
+}
+
+static int browser_str_eq(const char *a, const char *b) {
+    int i = 0;
+    while (a[i] && b[i]) {
+        if (a[i] != b[i]) return 0;
+        i++;
+    }
+    return a[i] == 0 && b[i] == 0;
+}
+
+static int browser_resource_exists(browser_state_t *st, browser_resource_kind_t kind, const char *url) {
+    for (int i = 0; i < st->resource_count; i++) {
+        if (st->resources[i].kind == kind && browser_str_eq(st->resources[i].url, url)) return 1;
+    }
+    return 0;
+}
+
+static void browser_add_resource(browser_state_t *st, browser_resource_kind_t kind, const char *raw_url) {
+    if (!st || !raw_url || !raw_url[0] || st->resource_count >= BROWSER_MAX_RESOURCES) return;
+    char resolved[BROWSER_LINK_URL_MAX];
+    browser_resolve_href(st->current_url[0] ? st->current_url : st->url, raw_url, resolved, sizeof(resolved));
+    if (!resolved[0] || browser_resource_exists(st, kind, resolved)) return;
+
+    browser_resource_t *res = &st->resources[st->resource_count++];
+    res->kind = kind;
+    b_strncpy0(res->url, resolved, BROWSER_LINK_URL_MAX);
+    res->fetched = 0;
+    res->status_code = 0;
+    res->size = 0;
+    res->truncated = 0;
+}
+
+static int browser_tag_attr_contains_word(const char *tag, const char *attr, const char *word) {
+    char value[96];
+    if (!browser_tag_attr_value(tag, attr, value, sizeof(value))) return 0;
+
+    int word_len = b_strlen(word);
+    int i = 0;
+    while (value[i]) {
+        while (value[i] == ' ' || value[i] == '\t' || value[i] == '\r' || value[i] == '\n') i++;
+        int start = i;
+        while (value[i] && value[i] != ' ' && value[i] != '\t' && value[i] != '\r' && value[i] != '\n') i++;
+        int len = i - start;
+        if (len == word_len) {
+            int same = 1;
+            for (int j = 0; j < word_len; j++) {
+                if (browser_lower(value[start + j]) != word[j]) { same = 0; break; }
+            }
+            if (same) return 1;
+        }
+    }
+    return 0;
+}
+
+static void browser_scan_resources(browser_state_t *st) {
+    st->resource_count = 0;
+    const char *p = st->content ? st->content : "";
+    while (*p && st->resource_count < BROWSER_MAX_RESOURCES) {
+        if (*p++ != '<') continue;
+        const char *tag = p;
+        char src[BROWSER_LINK_URL_MAX];
+
+        if (browser_tag_eq(tag, "img") && browser_tag_attr_value(tag, "src", src, sizeof(src))) {
+            browser_add_resource(st, BROWSER_RES_IMAGE, src);
+        } else if (browser_tag_eq(tag, "script") && browser_tag_attr_value(tag, "src", src, sizeof(src))) {
+            browser_add_resource(st, BROWSER_RES_SCRIPT, src);
+        } else if (browser_tag_eq(tag, "link") &&
+                   browser_tag_attr_contains_word(tag, "rel", "stylesheet") &&
+                   browser_tag_attr_value(tag, "href", src, sizeof(src))) {
+            browser_add_resource(st, BROWSER_RES_STYLE, src);
+        }
+
+        while (*p && *p != '>') p++;
+        if (*p == '>') p++;
+    }
+}
+
+static const char *browser_resource_label(browser_resource_kind_t kind) {
+    switch (kind) {
+        case BROWSER_RES_IMAGE: return "IMG";
+        case BROWSER_RES_STYLE: return "CSS";
+        case BROWSER_RES_SCRIPT: return "JS";
+    }
+    return "RES";
+}
+
+static void browser_fetch_resources(browser_state_t *st) {
+    if (!st || st->resource_count == 0) return;
+
+    char *buf = (char *)malloc(BROWSER_FETCH_BUF_SIZE);
+    if (!buf) return;
+
+    int limit = st->resource_count;
+    if (limit > BROWSER_FETCH_LIMIT) limit = BROWSER_FETCH_LIMIT;
+    for (int i = 0; i < limit; i++) {
+        browser_resource_t *res = &st->resources[i];
+        http_response_t resp;
+        int rc = http_get(res->url, buf, BROWSER_FETCH_BUF_SIZE, &resp);
+        res->fetched = 1;
+        res->status_code = (rc == HTTP_OK) ? resp.status_code : rc;
+        res->size = (rc == HTTP_OK) ? resp.body_len : 0;
+        res->truncated = (rc == HTTP_OK) ? resp.truncated : 0;
+    }
+
+    free(buf);
+}
+
+static void browser_resource_status_text(const browser_resource_t *res, char *out, int out_max) {
+    out[0] = 0;
+    b_strcat_limit(out, browser_resource_label(res->kind), out_max);
+    if (!res->fetched) {
+        b_strcat_limit(out, " pending", out_max);
+        return;
+    }
+
+    b_strcat_limit(out, " ", out_max);
+    if (res->status_code > 0) b_append_int(out, res->status_code, out_max);
+    else b_strcat_limit(out, "ERR", out_max);
+
+    if (res->size > 0) {
+        b_strcat_limit(out, " ", out_max);
+        if (res->size >= 1024) {
+            b_append_int(out, (res->size + 1023) / 1024, out_max);
+            b_strcat_limit(out, "K", out_max);
+        } else {
+            b_append_int(out, res->size, out_max);
+            b_strcat_limit(out, "B", out_max);
+        }
+    }
+    if (res->truncated) b_strcat_limit(out, "+", out_max);
+}
+
+static const char *browser_skip_until_close_tag(const char *p, const char *name) {
+    while (*p) {
+        if (browser_match_close_tag(p, name)) {
+            while (*p && *p != '>') p++;
+            if (*p == '>') p++;
+            return p;
+        }
+        p++;
+    }
+    return p;
+}
+
+static int browser_decode_entity(const char **pp, char *out) {
+    const char *p = *pp;
+    char name[16];
+    int len = 0;
+    while (p[len] && p[len] != ';' && len < 15) {
+        name[len] = p[len];
+        len++;
+    }
+    if (p[len] != ';') return 0;
+    name[len] = 0;
+
+    if (len == 2 && name[0] == 'l' && name[1] == 't') *out = '<';
+    else if (len == 2 && name[0] == 'g' && name[1] == 't') *out = '>';
+    else if (len == 3 && name[0] == 'a' && name[1] == 'm' && name[2] == 'p') *out = '&';
+    else if (len == 4 && name[0] == 'n' && name[1] == 'b' && name[2] == 's' && name[3] == 'p') *out = ' ';
+    else if (len == 4 && name[0] == 'q' && name[1] == 'u' && name[2] == 'o' && name[3] == 't') *out = '"';
+    else if (len == 4 && name[0] == 'a' && name[1] == 'p' && name[2] == 'o' && name[3] == 's') *out = '\'';
+    else if (len > 1 && name[0] == '#') {
+        int value = 0;
+        int i = 1;
+        int hex = 0;
+        if (name[i] == 'x' || name[i] == 'X') { hex = 1; i++; }
+        for (; name[i]; i++) {
+            int digit = -1;
+            if (name[i] >= '0' && name[i] <= '9') digit = name[i] - '0';
+            else if (hex && name[i] >= 'a' && name[i] <= 'f') digit = name[i] - 'a' + 10;
+            else if (hex && name[i] >= 'A' && name[i] <= 'F') digit = name[i] - 'A' + 10;
+            else return 0;
+            value = value * (hex ? 16 : 10) + digit;
+        }
+        if (value == 160) *out = ' ';
+        else if (value >= 32 && value < 127) *out = (char)value;
+        else return 0;
+    } else return 0;
+
+    *pp = p + len + 1;
+    return 1;
+}
+
+static void browser_newline(int *col, int *cy, int line_h, int *cur_line, int skip_lines) {
+    *col = 0;
+    if (*cur_line >= skip_lines) {
+        *cy += line_h;
+    } else {
+        (*cur_line)++;
+    }
+}
+
+static void browser_record_link_rect(browser_state_t *st, const char *url, int x, int y, int w, int h) {
+    if (!st || !url || !url[0] || w <= 0 || h <= 0) return;
+
+    if (st->link_count > 0) {
+        browser_link_t *last = &st->links[st->link_count - 1];
+        if (last->y == y && last->h == h && last->x + last->w == x && browser_str_eq(last->url, url)) {
+            last->w += w;
+            return;
+        }
+    }
+
+    if (st->link_count >= BROWSER_MAX_LINKS) return;
+    browser_link_t *link = &st->links[st->link_count++];
+    link->x = x;
+    link->y = y;
+    link->w = w;
+    link->h = h;
+    b_strncpy0(link->url, url, BROWSER_LINK_URL_MAX);
+}
+
+static void browser_emit_char(int cx, int max_col, int max_y, int line_h,
+                              int skip_lines, int *cur_line, int *col, int *cy,
+                              char c, uint32_t color, browser_state_t *st,
+                              const char *link_url) {
+    if (c == '\n' || *col >= max_col) {
+        browser_newline(col, cy, line_h, cur_line, skip_lines);
+        if (c == '\n') return;
+    }
+    if (c == '\r' || c == '\t') c = ' ';
+
+    if (*cur_line < skip_lines) {
+        (*col)++;
+        return;
+    }
+
+    if (*cy < max_y && *col < max_col) {
+        int px = cx + (*col) * 6;
+        char buf[2] = { c, 0 };
+        bb_draw_text(px, *cy, buf, color, 1);
+        browser_record_link_rect(st, link_url, px, *cy, 6, line_h);
+        (*col)++;
+    }
+}
+
+static void browser_emit_text(int cx, int max_col, int max_y, int line_h,
+                              int skip_lines, int *cur_line, int *col, int *cy,
+                              const char *text, uint32_t color,
+                              browser_state_t *st, const char *link_url) {
+    for (int i = 0; text[i] && *cy < max_y; i++) {
+        browser_emit_char(cx, max_col, max_y, line_h, skip_lines, cur_line, col, cy,
+                          text[i], color, st, link_url);
+    }
+}
+
+static const browser_resource_t *browser_find_resource(browser_state_t *st, browser_resource_kind_t kind,
+                                                       const char *url) {
+    if (!st || !url) return 0;
+    for (int i = 0; i < st->resource_count; i++) {
+        if (st->resources[i].kind == kind && browser_str_eq(st->resources[i].url, url)) return &st->resources[i];
+    }
+    return 0;
+}
+
+static void browser_emit_resource_placeholder(browser_state_t *st, browser_resource_kind_t kind,
+                                              const char *raw_url, int cx, int max_col, int max_y,
+                                              int line_h, int skip_lines, int *cur_line,
+                                              int *col, int *cy) {
+    char resolved[BROWSER_LINK_URL_MAX];
+    browser_resolve_href(st->current_url[0] ? st->current_url : st->url, raw_url, resolved, sizeof(resolved));
+    if (!resolved[0]) return;
+
+    char status[48];
+    const browser_resource_t *res = browser_find_resource(st, kind, resolved);
+    if (res) browser_resource_status_text(res, status, sizeof(status));
+    else b_strncpy0(status, browser_resource_label(kind), sizeof(status));
+
+    browser_newline(col, cy, line_h, cur_line, skip_lines);
+    browser_emit_text(cx, max_col, max_y, line_h, skip_lines, cur_line, col, cy,
+                      "[", 0xF9E2AF, st, 0);
+    browser_emit_text(cx, max_col, max_y, line_h, skip_lines, cur_line, col, cy,
+                      status, 0xF9E2AF, st, 0);
+    browser_emit_text(cx, max_col, max_y, line_h, skip_lines, cur_line, col, cy,
+                      ": ", 0xF9E2AF, st, 0);
+    browser_emit_text(cx, max_col, max_y, line_h, skip_lines, cur_line, col, cy,
+                      resolved, 0xA6E3A1, st, 0);
+    browser_emit_text(cx, max_col, max_y, line_h, skip_lines, cur_line, col, cy,
+                      "]", 0xF9E2AF, st, 0);
+    browser_newline(col, cy, line_h, cur_line, skip_lines);
+}
+
+/* Nyers szöveg renderelése HTML tagek kihagyásával */
 static void browser_render_text(window_t *w, browser_state_t *st) {
     int cx = w->x + 8;
     int cy = w->y + TITLE_H + 50; /* fejléc + URL bar alá */
     int max_y = w->y + w->h - 10;
     int line_h = 10;
     int col = 0;
-    int max_col = (w->w - 24) / 6;
+    int max_col = (w->w - 16) / 6;
 
+    /* Görgetés figyelembevétele */
     int skip_lines = st->scroll;
     int cur_line = 0;
 
-    const char *p = st->content;
-    int in_tag = 0;
-    int skip_content = 0; /* 1: style, 2: script */
+    const char *p = st->content ? st->content : "";
+    st->link_count = 0;
+    int in_link = 0;
+    char link_href[160];
+    link_href[0] = 0;
 
     while (*p && cy < max_y) {
-        char c = *p;
-
-        /* Tag kezelés */
+        char c = *p++;
         if (c == '<') {
-            in_tag = 1;
-            /* Speciális tartalom-kihagyás detektálása */
-            if (sstrcmp_n(p, "<style", 6) == 0) skip_content = 1;
-            if (sstrcmp_n(p, "<script", 7) == 0) skip_content = 2;
-            
-            /* Lezáró tagek detektálása a tartalom-visszakapcsoláshoz */
-            if (skip_content == 1 && sstrcmp_n(p, "</style>", 8) == 0) { skip_content = 0; p += 8; in_tag = 0; continue; }
-            if (skip_content == 2 && sstrcmp_n(p, "</script>", 9) == 0) { skip_content = 0; p += 9; in_tag = 0; continue; }
-
-            /* Alap formázó tagek után sortörés */
-            if (sstrcmp_n(p, "<p", 2) == 0 || sstrcmp_n(p, "<div", 4) == 0 || 
-                sstrcmp_n(p, "<h1", 3) == 0 || sstrcmp_n(p, "<br", 3) == 0 ||
-                sstrcmp_n(p, "<li", 3) == 0 || sstrcmp_n(p, "</p", 3) == 0) {
-                if (col > 0) {
-                    col = 0;
-                    if (cur_line >= skip_lines) cy += line_h; else cur_line++;
-                }
+            const char *tag = p;
+            char resource_url[BROWSER_LINK_URL_MAX];
+            if (browser_tag_eq(tag, "img") && browser_tag_attr_value(tag, "src", resource_url, sizeof(resource_url))) {
+                browser_emit_resource_placeholder(st, BROWSER_RES_IMAGE, resource_url,
+                                                  cx, max_col, max_y, line_h, skip_lines,
+                                                  &cur_line, &col, &cy);
             }
-            p++;
+            if (browser_tag_eq(tag, "link") &&
+                browser_tag_attr_contains_word(tag, "rel", "stylesheet") &&
+                browser_tag_attr_value(tag, "href", resource_url, sizeof(resource_url))) {
+                browser_emit_resource_placeholder(st, BROWSER_RES_STYLE, resource_url,
+                                                  cx, max_col, max_y, line_h, skip_lines,
+                                                  &cur_line, &col, &cy);
+            }
+            if (browser_tag_eq(tag, "script")) {
+                if (browser_tag_attr_value(tag, "src", resource_url, sizeof(resource_url))) {
+                    browser_emit_resource_placeholder(st, BROWSER_RES_SCRIPT, resource_url,
+                                                      cx, max_col, max_y, line_h, skip_lines,
+                                                      &cur_line, &col, &cy);
+                }
+                p = browser_skip_until_close_tag(p, "script");
+                continue;
+            }
+            if (browser_tag_eq(tag, "style")) {
+                p = browser_skip_until_close_tag(p, "style");
+                continue;
+            }
+            if (browser_tag_is_closing(tag, "a")) {
+                if (in_link && link_href[0]) {
+                    browser_emit_text(cx, max_col, max_y, line_h, skip_lines,
+                                      &cur_line, &col, &cy, " [", 0xA6E3A1, st, link_href);
+                    browser_emit_text(cx, max_col, max_y, line_h, skip_lines,
+                                      &cur_line, &col, &cy, link_href, 0xA6E3A1, st, link_href);
+                    browser_emit_text(cx, max_col, max_y, line_h, skip_lines,
+                                      &cur_line, &col, &cy, "]", 0xA6E3A1, st, link_href);
+                }
+                in_link = 0;
+                link_href[0] = 0;
+            } else if (browser_tag_eq(tag, "a")) {
+                char raw_href[160];
+                in_link = browser_tag_attr_value(tag, "href", raw_href, sizeof(raw_href));
+                if (in_link) browser_resolve_href(st->current_url[0] ? st->current_url : st->url,
+                                                  raw_href, link_href, sizeof(link_href));
+            }
+
+            int do_break = browser_tag_eq(tag, "br") || browser_is_block_tag(tag);
+            while (*p && *p != '>') p++;
+            if (*p == '>') p++;
+            if (do_break) browser_newline(&col, &cy, line_h, &cur_line, skip_lines);
             continue;
         }
-        if (c == '>') { in_tag = 0; p++; continue; }
-        
-        if (in_tag) { p++; continue; }
-        if (skip_content) { p++; continue; }
-
-        /* Megjelenítendő karakter */
-        if (c == '\n' || col >= max_col) {
-            col = 0;
-            if (cur_line >= skip_lines) cy += line_h; else cur_line++;
-            p++;
-            if (c == '\n') continue;
-        }
-        if (c == '\r' || c == '\t') { p++; continue; }
-
-        if (cur_line >= skip_lines) {
-            if (cy < max_y && col < max_col) {
-                char buf[2] = { c, 0 };
-                bb_draw_text(cx + col * 6, cy, buf, 0xCDD6F4, 1);
-                col++;
+        if (c == '&') {
+            const char *entity = p;
+            char decoded;
+            if (browser_decode_entity(&entity, &decoded)) {
+                c = decoded;
+                p = entity;
             }
-        } else {
-            col++;
         }
-        p++;
+
+        browser_emit_char(cx, max_col, max_y, line_h, skip_lines, &cur_line, &col, &cy,
+                          c, in_link ? 0x89B4FA : 0xCDD6F4, st,
+                          in_link ? link_href : 0);
     }
 }
 
@@ -2169,7 +2746,7 @@ static void app_browser_draw(window_t *w) {
     } else if (st->error) {
         bb_draw_text(w->x + 10, w->y + TITLE_H + 60, "Could not load page.", 0xFF5555, 1);
         bb_draw_text(w->x + 10, w->y + TITLE_H + 74, st->status, 0x6C7086, 1);
-    } else if (st->content[0] == 0) {
+    } else if (!st->content || st->content[0] == 0) {
         int cx = w->x + w->w / 2 - 80;
         int cy = w->y + TITLE_H + 70;
         bb_draw_text(cx, cy,      "RexBrowser v0.1", 0xCBA6F7, 2);
@@ -2177,6 +2754,20 @@ static void app_browser_draw(window_t *w) {
         bb_draw_text(cx - 20, cy + 36, "TCP/IP stack: ACTIVE", 0xA6E3A1, 1);
     } else {
         browser_render_text(w, st);
+
+        if (st->resource_count > 0) {
+            int ry = w->y + w->h - 14;
+            bb_draw_text(w->x + 10, ry, "Resources:", 0xF9E2AF, 1);
+            int rx = w->x + 76;
+            for (int i = 0; i < st->resource_count && i < 3; i++) {
+                char summary[48];
+                browser_resource_status_text(&st->resources[i], summary, sizeof(summary));
+                bb_draw_text(rx, ry, summary, 0xA6E3A1, 1);
+                rx += b_strlen(summary) * 6 + 10;
+                if (rx > w->x + w->w - 70) break;
+            }
+            if (st->resource_count > 3) bb_draw_text(rx, ry, "+", 0xA6E3A1, 1);
+        }
 
         /* Görgetés hint */
         bb_draw_text(w->x + w->w - 80, w->y + TITLE_H + 37, "UP/DOWN", 0x45475A, 1);
@@ -2193,6 +2784,20 @@ static void app_browser_click(window_t *w, int x, int y, int btn) {
         browser_do_fetch(st);
         dirty_mark(w->x, w->y, w->w, w->h);
         return;
+    }
+
+    /* Látható linkek */
+    for (int i = 0; i < st->link_count; i++) {
+        browser_link_t *link = &st->links[i];
+        if (x >= link->x && x < link->x + link->w &&
+            y >= link->y && y < link->y + link->h) {
+            b_strncpy0(st->url, link->url, BROWSER_URL_MAX);
+            st->url_len = b_strlen(st->url);
+            st->url_focused = 0;
+            browser_do_fetch(st);
+            dirty_mark(w->x, w->y, w->w, w->h);
+            return;
+        }
     }
 
     /* URL bar */
@@ -2376,17 +2981,23 @@ static void launch_app(app_kind_t app) {
             if (idx >= 0) {
                 browser_state_t *bs = (browser_state_t *)g_windows[idx].priv;
                 bs->url[0]     = 0;
+                bs->current_url[0] = 0;
                 bs->url_len    = 0;
                 bs->url_focused = 1;
-                bs->content[0] = 0;
+                browser_free_content(bs);
+                int content_ok = browser_ensure_content(bs);
                 bs->loading    = 0;
-                bs->error      = 0;
+                bs->error      = content_ok ? 0 : 1;
                 bs->scroll     = 0;
-                /* Alapértelmezett státus */
-                const char *ready = "TCP/IP Stack active. Type a URL and press Enter.";
-                int ri = 0;
-                while(ready[ri] && ri < 63) { bs->status[ri] = ready[ri]; ri++; }
-                bs->status[ri] = 0;
+                bs->link_count = 0;
+                bs->resource_count = 0;
+                if (content_ok) {
+                    /* Alapértelmezett státus */
+                    const char *ready = "TCP/IP Stack active. Type a URL and press Enter.";
+                    int ri = 0;
+                    while(ready[ri] && ri < 63) { bs->status[ri] = ready[ri]; ri++; }
+                    bs->status[ri] = 0;
+                }
             }
             break;
         }
@@ -2396,6 +3007,7 @@ static void launch_app(app_kind_t app) {
 /* --- Tálca + Start menü --------------------------------------------------- */
 
 static void draw_taskbar(uint64_t ticks, int mx, int my) {
+    (void)ticks;
     int ty = (int)scr_h - TASKBAR_H;
 
     /* Dirty rect: a teljes tálca sáv */
