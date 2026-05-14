@@ -104,6 +104,15 @@ int unlink(const char *path);
 int seek(int fd, uint64_t offset);
 int write_file(int fd, const void *buf, uint64_t count);
 
+/* Szabvanyos C mem... / str... (a libc.c-ben implementalva, BearSSL es GCC
+ * builtin elvarasok miatt). A size_t a BearSSL fordEgyseg en stddef.h-bol
+ * jon; itt uint64_t-vel kompatibilis (x86_64-en mindketto 8 byte). */
+void   *memcpy(void *dst, const void *src, uint64_t n);
+void   *memmove(void *dst, const void *src, uint64_t n);
+void   *memset(void *dst, int value, uint64_t n);
+int     memcmp(const void *a, const void *b, uint64_t n);
+uint64_t strlen(const char *s);
+
 /* Hálózat */
 static inline uint64_t net_connect(const char *hostname, uint16_t port) {
     return syscall2(SYS_NET_CONNECT, (uint64_t)hostname, port);

@@ -176,32 +176,47 @@ void tcp_receive(net_device_t *dev, const ip4_header_t *ip_hdr, const tcp_header
         }
         break;
 
-    case TCP_ESTABLISHED:
+    case TCP_ESTABLISHED: {
+        /* In-order ellenőrzés: csak akkor fogadjuk be a payload-ot, ha a
+         * remote_seq pont a következő várt byte. Out-of-order szegmensekre
+         * duplicate-ACK-et küldünk és eldobjuk - egyszerű kezdeti viselkedés,
+         * a szerver retransmittel. (A TLS rétegnek byte-pontos in-order
+         * stream kell, így bármi más csendben elrontaná a rekordokat.) */
+        bool consumed_data = false;
         if (data_len > 0) {
-            s->ack = remote_seq + data_len;
-
-            /* Store into rx_buf */
-            uint32_t copy = data_len;
-            if (s->rx_len + copy > TCP_RX_BUF_SIZE)
-                copy = TCP_RX_BUF_SIZE - s->rx_len;
-            kmemcpy(s->rx_buf + s->rx_len, data, copy);
-            s->rx_len += copy;
-
-            /* Send ACK */
-            tcp_send_segment(s, TCP_ACK, NULL, 0);
-
-            if (s->on_data) s->on_data(s, data, data_len);
+            if (remote_seq == s->ack) {
+                uint32_t copy = data_len;
+                if (s->rx_len + copy > TCP_RX_BUF_SIZE)
+                    copy = TCP_RX_BUF_SIZE - s->rx_len;
+                kmemcpy(s->rx_buf + s->rx_len, data, copy);
+                s->rx_len += copy;
+                s->ack += data_len;
+                consumed_data = true;
+                if (s->on_data) s->on_data(s, data, data_len);
+            } else {
+                /* Reordered / retransmitted: csak nyugtázzuk amit eddig vártunk. */
+                tcp_send_segment(s, TCP_ACK, NULL, 0);
+            }
         }
+
         if (flags & TCP_FIN) {
-            s->ack = remote_seq + 1;
+            /* FIN csak akkor "fogyasztott", ha a megfelelő sorrendben van.
+             * Ha jött adat ÉS FIN ugyanabban a szegmensben, az ACK
+             * = remote_seq + data_len + 1 (s->ack-et már megnöveltük data_len-nel). */
+            if (remote_seq + (consumed_data ? data_len : 0) == s->ack) {
+                s->ack += 1;
+                tcp_send_segment(s, TCP_ACK, NULL, 0);
+                s->state = TCP_CLOSE_WAIT;
+                if (s->on_close) s->on_close(s);
+                /* Saját FIN visszaküldése - egyszerűsített átmenet zárt felé. */
+                tcp_send_segment(s, TCP_FIN | TCP_ACK, NULL, 0);
+                s->state = TCP_CLOSED;
+            }
+        } else if (consumed_data) {
             tcp_send_segment(s, TCP_ACK, NULL, 0);
-            s->state = TCP_CLOSE_WAIT;
-            if (s->on_close) s->on_close(s);
-            /* Send our own FIN */
-            tcp_send_segment(s, TCP_FIN | TCP_ACK, NULL, 0);
-            s->state = TCP_CLOSED;
         }
         break;
+    }
 
     case TCP_FIN_WAIT_1:
         if (flags & TCP_ACK) s->state = TCP_FIN_WAIT_2;
