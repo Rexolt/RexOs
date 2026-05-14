@@ -13,6 +13,7 @@
 #include <drivers/pci/pci.h>
 #include <rexos/net.h>
 #include <rexos/rtc.h>
+#include <rexos/io.h>
 
 extern uint64_t pit_ticks(void);
 
@@ -453,22 +454,37 @@ uint64_t syscall_handler(uint64_t nr, uint64_t arg1, uint64_t arg2, uint64_t arg
         if (!tcp_socket_is_valid(sock)) return (uint64_t)-1;
         if (!uptr_ok(arg2, arg3)) return (uint64_t)-1;
 
-        /* Busy-wait á max 5M iterációig adatértre */
-        for (int i = 0; i < 5000000 && sock->rx_len == 0 &&
-             sock->state == TCP_ESTABLISHED; i++)
+        /* Várakozás adatra vagy a kapcsolat lezárására. PIT-alapú timeout,
+         * így a TLS handshake apró recv-jeinél is determinisztikus a viselkedés. */
+        uint64_t recv_start = pit_ticks();
+        const uint64_t RECV_TIMEOUT_TICKS = 5 * PIT_HZ; /* ~5 másodperc */
+        while (sock->rx_len == 0 &&
+               (sock->state == TCP_ESTABLISHED || sock->state == TCP_SYN_SENT) &&
+               pit_ticks() - recv_start < RECV_TIMEOUT_TICKS) {
             __asm__ volatile("pause");
+        }
 
-        uint32_t copy = sock->rx_len;
-        if (copy == 0) return 0;
+        /* Kritikus szakasz: az e1000 IRQ a tcp_receive-en keresztül ugyanezt
+         * a rx_buf-ot/rx_len-t írja. Rövid CLI/STI a konzisztens szelet
+         * kimásolásához. */
+        cli();
+        uint32_t avail = sock->rx_len;
+        if (avail == 0) {
+            sti();
+            return 0;
+        }
+        uint32_t copy = avail;
         if (copy > (uint32_t)arg3) copy = (uint32_t)arg3;
         kmemcpy((void *)arg2, sock->rx_buf, copy);
-        /* Consume bytes: Safe move for overlapping regions */
-        sock->rx_len -= copy;
-        if (sock->rx_len > 0) {
-            for (uint32_t i = 0; i < sock->rx_len; i++) {
+        uint32_t remaining = avail - copy;
+        if (remaining > 0) {
+            /* Memmove-szerű shift balra; a forrás és cél átfedhet. */
+            for (uint32_t i = 0; i < remaining; i++) {
                 sock->rx_buf[i] = sock->rx_buf[i + copy];
             }
         }
+        sock->rx_len = remaining;
+        sti();
         return copy;
 
     } else if (nr == 24) { /* SYS_TIME(out_ptr) */

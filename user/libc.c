@@ -201,3 +201,49 @@ int write_file(int fd, const void *buf, uint64_t count) {
     return (int)syscall3(SYS_WRITE, (uint64_t)fd, (uint64_t)buf, count);
 }
 
+/* --- Szabványos C mem... / str... primitivek ---
+ * Ezekre tobb helyen is szukseg van: a fordito -O2-vel struct masolasra es
+ * tomb inicializalasra automatikusan memcpy/memset hivasokat emittal, a
+ * BearSSL freestanding build pedig explicit hivatkozik rajuk. */
+
+void *memcpy(void *dst, const void *src, uint64_t n) {
+    uint8_t       *d = (uint8_t *)dst;
+    const uint8_t *s = (const uint8_t *)src;
+    for (uint64_t i = 0; i < n; i++) d[i] = s[i];
+    return dst;
+}
+
+void *memmove(void *dst, const void *src, uint64_t n) {
+    uint8_t       *d = (uint8_t *)dst;
+    const uint8_t *s = (const uint8_t *)src;
+    if (d == s || n == 0) return dst;
+    if (d < s) {
+        for (uint64_t i = 0; i < n; i++) d[i] = s[i];
+    } else {
+        for (uint64_t i = n; i > 0; i--) d[i - 1] = s[i - 1];
+    }
+    return dst;
+}
+
+void *memset(void *dst, int value, uint64_t n) {
+    uint8_t *d = (uint8_t *)dst;
+    uint8_t  v = (uint8_t)value;
+    for (uint64_t i = 0; i < n; i++) d[i] = v;
+    return dst;
+}
+
+int memcmp(const void *a, const void *b, uint64_t n) {
+    const uint8_t *pa = (const uint8_t *)a;
+    const uint8_t *pb = (const uint8_t *)b;
+    for (uint64_t i = 0; i < n; i++) {
+        if (pa[i] != pb[i]) return (int)pa[i] - (int)pb[i];
+    }
+    return 0;
+}
+
+uint64_t strlen(const char *s) {
+    uint64_t n = 0;
+    while (s && s[n]) n++;
+    return n;
+}
+

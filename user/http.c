@@ -513,6 +513,16 @@ static int h_http_get_impl(const char *url, char *fixed_out, uint64_t fixed_out_
              status_code == 307 || status_code == 308) && redirect < HTTP_MAX_REDIRECTS) {
             char location[HTTP_URL_MAX];
             if (h_header_location(raw, header_len, location, HTTP_URL_MAX)) {
+                /* Ha a szerver HTTPS-re küld át, ennek a buildnek még nincs TLS-e.
+                 * Adjunk barátságos, az eredeti URL-t megtartó hibát ahelyett,
+                 * hogy a következő redirect-iterációnál "Bad URL"-ként esnénk el. */
+                if (h_strncmp(location, "https://", 8) == 0) {
+                    h_set_status(resp, "Server redirects to HTTPS (TLS not yet supported)");
+                    if (resp) h_strncpy0(resp->final_url, location, HTTP_URL_MAX);
+                    h_close_socket(sock);
+                    free(raw);
+                    return HTTP_ERR_HTTPS;
+                }
                 int ar = h_make_absolute_url(normalized, location, current_url);
                 if (ar != HTTP_OK) {
                     h_set_status(resp, "Bad redirect URL");

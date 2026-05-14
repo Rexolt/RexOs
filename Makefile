@@ -80,6 +80,55 @@ help:
 	@echo "  make clean      - remove build artifacts"
 
 # -----------------------------------------------------------------------------
+#  BearSSL (TLS könyvtár) - third_party/bearssl/
+#  Freestanding build a kernelünk flagjeivel. Statikus libként készül,
+#  egyelőre a kerneltől függetlenül; később a user-space HTTPS kliens
+#  (third_party/bearssl/inc/bearssl.h headerek) köti be.
+# -----------------------------------------------------------------------------
+BEARSSL_DIR   := third_party/bearssl
+BEARSSL_BUILD := $(BUILD)/bearssl
+BEARSSL_SRCS  := $(shell find $(BEARSSL_DIR)/src -name '*.c' 2>/dev/null)
+BEARSSL_OBJS  := $(patsubst $(BEARSSL_DIR)/src/%.c,$(BEARSSL_BUILD)/%.o,$(BEARSSL_SRCS))
+BEARSSL_LIB   := $(BEARSSL_BUILD)/libbearssl.a
+
+# A kernel-CFLAGS-szal kompatibilis, de BearSSL-specifikus -D kapcsolók.
+# Lásd third_party/bearssl/src/config.h - minden #ifndef-fel védett.
+BEARSSL_CFLAGS := \
+    -std=c17 \
+    -ffreestanding \
+    -fno-stack-protector \
+    -fno-PIC -fno-PIE \
+    -m64 \
+    -march=x86-64 \
+    -mno-red-zone \
+    -mno-mmx -mno-sse -mno-sse2 \
+    -mcmodel=kernel \
+    -O2 \
+    -DBR_64=1 \
+    -DBR_INT128=1 \
+    -DBR_LE_UNALIGNED=1 \
+    -DBR_SSE2=0 \
+    -DBR_AES_X86NI=0 \
+    -DBR_USE_URANDOM=0 \
+    -DBR_USE_UNIX_TIME=0 \
+    -DBR_RDRAND=0 \
+    -I$(BEARSSL_DIR)/inc \
+    -I$(BEARSSL_DIR)/src
+
+$(BEARSSL_BUILD)/%.o: $(BEARSSL_DIR)/src/%.c
+	@mkdir -p $(dir $@)
+	@echo "  CC   $<"
+	@$(CC) $(BEARSSL_CFLAGS) -c $< -o $@
+
+$(BEARSSL_LIB): $(BEARSSL_OBJS)
+	@mkdir -p $(dir $@)
+	@echo "  AR   $@"
+	@ar rcs $@ $(BEARSSL_OBJS)
+
+bearssl: $(BEARSSL_LIB)
+.PHONY: bearssl
+
+# -----------------------------------------------------------------------------
 #  Kernel ELF linkelés
 # -----------------------------------------------------------------------------
 $(BUILD)/$(KERNEL): $(OBJS) $(KDIR)/linker.ld
