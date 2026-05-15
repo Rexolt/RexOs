@@ -6,7 +6,7 @@
  *    - A bitmap maga az első olyan USABLE memóriaregionban él, amiben elfér
  *    - A Limine memmap-jából tanuljuk meg, mi USABLE és mi nem
  *    - A HHDM (Higher-Half Direct Map) segítségével írjuk a bitmapet
- *
+ *     -Slab jobb lenne, de ez bemelegítésnek tökéletes.
  *  Allokáció: lineáris keresés (O(n)). Egyszerű, de bemelegítésnek tökéletes.
  *  Felszabadítás: O(1).
  * ========================================================================== */
