@@ -93,7 +93,8 @@ uint64_t syscall_handler(uint64_t nr, uint64_t arg1, uint64_t arg2, uint64_t arg
         // RDI = arg1 (fd), RSI = arg2 (buf), RDX = arg3 (len)
         if (arg1 == 1 || arg1 == 2) {  /* stdout / stderr */
             if (!uptr_ok(arg2, arg3)) return (uint64_t)-1;
-            kprintf("%s", (const char *)arg2);
+            /* User buffer NEM null-terminált; tartsuk be a megadott hosszt. */
+            kprintf("%.*s", (int)arg3, (const char *)arg2);
             return arg3;
         } else if (arg1 >= 3 && arg1 < 16) {  /* fájl fd */
             if (!uptr_ok(arg2, arg3)) return (uint64_t)-1;

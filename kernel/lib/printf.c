@@ -83,11 +83,21 @@ void kvprintf(const char *fmt, va_list ap)
 
         bool zero_pad = false;
         int  width    = 0;
+        int  precision = -1;
 
         if (*fmt == '0') { zero_pad = true; fmt++; }
         while (*fmt >= '0' && *fmt <= '9') {
             width = width * 10 + (*fmt - '0');
             fmt++;
+        }
+        if (*fmt == '.') {
+            fmt++;
+            precision = 0;
+            if (*fmt == '*') { precision = va_arg(ap, int); fmt++; }
+            else while (*fmt >= '0' && *fmt <= '9') {
+                precision = precision * 10 + (*fmt - '0');
+                fmt++;
+            }
         }
 
         bool is_long = false, is_longlong = false;
@@ -132,7 +142,12 @@ void kvprintf(const char *fmt, va_list ap)
         }
         case 's': {
             const char *s = va_arg(ap, const char *);
-            out_str(s ? s : "(null)");
+            if (!s) s = "(null)";
+            if (precision < 0) {
+                out_str(s);
+            } else {
+                for (int i = 0; i < precision && s[i]; i++) out_char(s[i]);
+            }
             break;
         }
         case 'c': {

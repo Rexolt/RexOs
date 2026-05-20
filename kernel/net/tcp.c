@@ -54,10 +54,21 @@ static uint16_t tcp_checksum(const ip4_addr_t *src, const ip4_addr_t *dst,
     return ~sum;
 }
 
+/* ---- Free space in our RX buffer (for advertised window) ----------------- */
+static uint16_t tcp_free_window(const tcp_socket_t *s) {
+    uint32_t free_bytes = (s->rx_len >= TCP_RX_BUF_SIZE) ? 0 : (TCP_RX_BUF_SIZE - s->rx_len);
+    if (free_bytes > 0xFFFF) free_bytes = 0xFFFF;
+    return (uint16_t)free_bytes;
+}
+
 /* ---- Send a raw TCP segment ---------------------------------------------- */
+/* Ha flags & TCP_SYN, az options_buf MSS option-t kap (4 byte: 02 04 MSS_hi MSS_lo). */
 static void tcp_send_segment(tcp_socket_t *s, uint8_t flags, const void *data, uint32_t data_len) {
-    uint32_t seg_len = sizeof(tcp_header_t) + data_len;
     uint8_t buffer[2048];
+    uint32_t opt_len = 0;
+    if (flags & TCP_SYN) opt_len = 4; /* MSS option only */
+
+    uint32_t seg_len = sizeof(tcp_header_t) + opt_len + data_len;
     if (seg_len > sizeof(buffer)) return;
 
     tcp_header_t *hdr = (tcp_header_t *)buffer;
@@ -65,18 +76,51 @@ static void tcp_send_segment(tcp_socket_t *s, uint8_t flags, const void *data, u
     hdr->dest_port   = htons(s->remote_port);
     hdr->seq         = htonl(s->seq);
     hdr->ack         = (flags & TCP_ACK) ? htonl(s->ack) : 0;
-    hdr->data_offset = 5; /* 5 × 4 = 20 bytes, no options */
+    hdr->data_offset = (sizeof(tcp_header_t) + opt_len) / 4;
     hdr->reserved    = 0;
     hdr->flags       = flags;
-    hdr->window_size = htons(TCP_RX_BUF_SIZE);
+    hdr->window_size = htons(tcp_free_window(s));
     hdr->checksum    = 0;
     hdr->urgent_ptr  = 0;
 
+    uint8_t *p = hdr->options_and_payload;
+    if (opt_len == 4) {
+        /* MSS option: kind=2, len=4, value=TCP_OUR_MSS */
+        p[0] = 2;
+        p[1] = 4;
+        p[2] = (TCP_OUR_MSS >> 8) & 0xFF;
+        p[3] = TCP_OUR_MSS & 0xFF;
+        p += 4;
+    }
+
     if (data && data_len > 0)
-        kmemcpy(hdr->options_and_payload, data, data_len);
+        kmemcpy(p, data, data_len);
 
     hdr->checksum = tcp_checksum(&s->dev->ip, &s->remote_ip, buffer, seg_len);
     ipv4_send(s->dev, &s->remote_ip, IPV4_PROTO_TCP, buffer, seg_len);
+}
+
+/* ---- Parse TCP options for MSS ------------------------------------------- */
+static void tcp_parse_options(tcp_socket_t *s, const tcp_header_t *tcp) {
+    uint8_t hdr_len = tcp->data_offset * 4;
+    if (hdr_len <= sizeof(tcp_header_t)) return;
+    const uint8_t *opt = (const uint8_t *)tcp + sizeof(tcp_header_t);
+    uint32_t left = hdr_len - sizeof(tcp_header_t);
+    while (left > 0) {
+        uint8_t kind = opt[0];
+        if (kind == 0) break;          /* END */
+        if (kind == 1) { opt++; left--; continue; } /* NOP */
+        if (left < 2) break;
+        uint8_t olen = opt[1];
+        if (olen < 2 || olen > left) break;
+        if (kind == 2 && olen == 4) {  /* MSS */
+            uint16_t mss = ((uint16_t)opt[2] << 8) | opt[3];
+            if (mss >= 64 && mss <= TCP_OUR_MSS) s->peer_mss = mss;
+            else s->peer_mss = TCP_OUR_MSS; /* clamp */
+        }
+        opt += olen;
+        left -= olen;
+    }
 }
 
 /* ---- Public API ---------------------------------------------------------- */
@@ -110,9 +154,19 @@ tcp_socket_t *tcp_connect(net_device_t *dev, const ip4_addr_t *dest_ip, uint16_t
 }
 
 void tcp_send_data(tcp_socket_t *s, const void *data, uint32_t len) {
-    if (!s || s->state != TCP_ESTABLISHED) return;
-    tcp_send_segment(s, TCP_ACK | TCP_PSH, data, len);
-    s->seq += len;
+    if (!s || s->state != TCP_ESTABLISHED || !data || len == 0) return;
+    uint32_t mss = s->peer_mss ? s->peer_mss : TCP_DEFAULT_MSS;
+    if (mss > TCP_OUR_MSS) mss = TCP_OUR_MSS;
+    const uint8_t *p = (const uint8_t *)data;
+    uint32_t left = len;
+    while (left > 0) {
+        uint32_t chunk = (left > mss) ? mss : left;
+        uint8_t flags = TCP_ACK | ((chunk == left) ? TCP_PSH : 0);
+        tcp_send_segment(s, flags, p, chunk);
+        s->seq += chunk;
+        p    += chunk;
+        left -= chunk;
+    }
 }
 
 void tcp_close(tcp_socket_t *s) {
@@ -165,7 +219,9 @@ void tcp_receive(net_device_t *dev, const ip4_header_t *ip_hdr, const tcp_header
 
     case TCP_SYN_SENT:
         if ((flags & (TCP_SYN | TCP_ACK)) == (TCP_SYN | TCP_ACK)) {
-            /* Got SYN-ACK: send ACK, move to ESTABLISHED */
+            /* Got SYN-ACK: parse options (MSS), send ACK, move to ESTABLISHED */
+            tcp_parse_options(s, tcp);
+            if (!s->peer_mss) s->peer_mss = TCP_DEFAULT_MSS;
             s->ack = remote_seq + 1;
             s->state = TCP_ESTABLISHED;
             tcp_send_segment(s, TCP_ACK, NULL, 0);
@@ -192,11 +248,17 @@ void tcp_receive(net_device_t *dev, const ip4_header_t *ip_hdr, const tcp_header
                 s->rx_len += copy;
                 s->ack += data_len;
                 consumed_data = true;
+                kprintf("[tcp] rx data seq=%u len=%u rx_buf=%u/%u flags=0x%x\n",
+                        remote_seq, data_len, s->rx_len, TCP_RX_BUF_SIZE, flags);
                 if (s->on_data) s->on_data(s, data, data_len);
             } else {
                 /* Reordered / retransmitted: csak nyugtázzuk amit eddig vártunk. */
+                kprintf("[tcp] OUT-OF-ORDER seq=%u expected=%u len=%u flags=0x%x (DROP)\n",
+                        remote_seq, s->ack, data_len, flags);
                 tcp_send_segment(s, TCP_ACK, NULL, 0);
             }
+        } else if (flags & TCP_ACK) {
+            /* Csak ACK, nincs data - csendben elfogadjuk. */
         }
 
         if (flags & TCP_FIN) {

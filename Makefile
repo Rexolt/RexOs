@@ -129,6 +129,49 @@ bearssl: $(BEARSSL_LIB)
 .PHONY: bearssl
 
 # -----------------------------------------------------------------------------
+#  BearSSL - userspace build (statikus lib a user/tls.c-hez)
+#  Ugyanaz a forrás, de userspace flag-ekkel (-fpie, nincs -mcmodel=kernel),
+#  hogy a PIE userspace ELF-be linkelhető legyen.
+# -----------------------------------------------------------------------------
+BEARSSL_USER_BUILD := $(BUILD)/bearssl_user
+BEARSSL_USER_OBJS  := $(patsubst $(BEARSSL_DIR)/src/%.c,$(BEARSSL_USER_BUILD)/%.o,$(BEARSSL_SRCS))
+BEARSSL_USER_LIB   := $(BEARSSL_USER_BUILD)/libbearssl_user.a
+
+BEARSSL_USER_CFLAGS := \
+    -std=c17 \
+    -ffreestanding \
+    -fno-stack-protector \
+    -fpie \
+    -m64 \
+    -march=x86-64 \
+    -mno-red-zone \
+    -mno-mmx -mno-sse -mno-sse2 \
+    -O2 \
+    -DBR_64=1 \
+    -DBR_INT128=1 \
+    -DBR_LE_UNALIGNED=1 \
+    -DBR_SSE2=0 \
+    -DBR_AES_X86NI=0 \
+    -DBR_USE_URANDOM=0 \
+    -DBR_USE_UNIX_TIME=0 \
+    -DBR_RDRAND=0 \
+    -I$(BEARSSL_DIR)/inc \
+    -I$(BEARSSL_DIR)/src
+
+$(BEARSSL_USER_BUILD)/%.o: $(BEARSSL_DIR)/src/%.c
+	@mkdir -p $(dir $@)
+	@echo "  CC   (user) $<"
+	@$(CC) $(BEARSSL_USER_CFLAGS) -c $< -o $@
+
+$(BEARSSL_USER_LIB): $(BEARSSL_USER_OBJS)
+	@mkdir -p $(dir $@)
+	@echo "  AR   $@"
+	@ar rcs $@ $(BEARSSL_USER_OBJS)
+
+bearssl-user: $(BEARSSL_USER_LIB)
+.PHONY: bearssl-user
+
+# -----------------------------------------------------------------------------
 #  Kernel ELF linkelés
 # -----------------------------------------------------------------------------
 $(BUILD)/$(KERNEL): $(OBJS) $(KDIR)/linker.ld
@@ -196,15 +239,74 @@ $(BUILD)/memtest.elf: user/memtest.c $(BUILD)/libc.o
 	@echo "  CC   user/memtest.c"
 	@$(CC) $(USER_CFLAGS) -static -Wl,-e,_start -Wl,--build-id=none user/memtest.c $(BUILD)/libc.o -o $@
 
-$(BUILD)/http.o: user/http.c user/http.h user/libc.h
-	@mkdir -p $(BUILD)
-	@echo "  CC   user/http.c"
-	@$(CC) $(USER_CFLAGS) -c user/http.c -o $@
+# --- TLS layer (BearSSL userspace lib-re épül) ---
+USER_TLS_CFLAGS := $(USER_CFLAGS) -I$(BEARSSL_DIR)/inc
 
-$(BUILD)/desktop.elf: user/desktop.c user/http.h $(BUILD)/libc.o $(BUILD)/http.o
+$(BUILD)/tls.o: user/tls.c user/tls.h user/libc.h $(BEARSSL_USER_LIB)
 	@mkdir -p $(BUILD)
-	@echo "  CC   user/desktop.c"
-	@$(CC) $(USER_CFLAGS) -static -Wl,-e,_start -Wl,--build-id=none user/desktop.c $(BUILD)/libc.o $(BUILD)/http.o -o $@
+	@echo "  CC   user/tls.c"
+	@$(CC) $(USER_TLS_CFLAGS) -c user/tls.c -o $@
+
+$(BUILD)/ca_bundle.o: user/ca_bundle.c $(BEARSSL_USER_LIB)
+	@mkdir -p $(BUILD)
+	@echo "  CC   user/ca_bundle.c"
+	@$(CC) $(USER_TLS_CFLAGS) -c user/ca_bundle.c -o $@
+
+# TLS skeleton fordítás-teszt: nem linkeljük még appba, csak biztosítjuk
+# hogy a userspace BearSSL + tls.c + ca_bundle.c forrásilag jó.
+tls-check: $(BUILD)/tls.o $(BUILD)/ca_bundle.o
+.PHONY: tls-check
+
+$(BUILD)/http.o: user/http.c user/http.h user/libc.h user/tls.h
+	@mkdir -p $(BUILD)
+	@echo "  CC   user/http.c (with TLS)"
+	@$(CC) $(USER_TLS_CFLAGS) -c user/http.c -o $@
+
+# --- Font subsystem (stb_truetype + DejaVu Sans Mono) ---
+# A font kódhoz SSE/SSE2 KELL (x86-64 ABI float ABI), és kifejezetten engedjük az
+# -O2-t (stb_truetype rasterizer hot path). A USER_CFLAGS -mno-sse-jét levesszük.
+USER_FONT_CFLAGS := $(filter-out -mno-sse -mno-sse2,$(USER_CFLAGS)) \
+    -msse -msse2 \
+    -Wno-unused-function \
+    -Wno-unused-but-set-variable \
+    -Wno-sign-compare \
+    -Wno-missing-field-initializers \
+    -Wno-maybe-uninitialized
+
+$(BUILD)/math_min.o: user/math_min.c
+	@mkdir -p $(BUILD)
+	@echo "  CC   user/math_min.c"
+	@$(CC) $(USER_FONT_CFLAGS) -c user/math_min.c -o $@
+
+$(BUILD)/font_stb.o: user/font_stb.c third_party/stb/stb_truetype.h user/libc.h
+	@mkdir -p $(BUILD)
+	@echo "  CC   user/font_stb.c (stb_truetype)"
+	@$(CC) $(USER_FONT_CFLAGS) -c user/font_stb.c -o $@
+
+$(BUILD)/font.o: user/font.c user/font.h user/libc.h
+	@mkdir -p $(BUILD)
+	@echo "  CC   user/font.c"
+	@$(CC) $(USER_FONT_CFLAGS) -c user/font.c -o $@
+
+# Font binary (DejaVu Sans Mono TTF) közvetlen object-é alakítása linkerrel.
+# Ez sokkal gyorsabb mint xxd-generated C array (~28000 sor).
+$(BUILD)/font_data.o: third_party/fonts/dejavu_mono.ttf
+	@mkdir -p $(BUILD)
+	@echo "  BIN  $< -> $@"
+	@cd third_party/fonts && $(LD) -r -b binary -o $(abspath $@) dejavu_mono.ttf
+
+$(BUILD)/desktop.elf: user/desktop.c user/http.h user/font.h \
+                      $(BUILD)/libc.o $(BUILD)/http.o $(BUILD)/tls.o $(BUILD)/ca_bundle.o \
+                      $(BUILD)/font.o $(BUILD)/font_stb.o $(BUILD)/math_min.o $(BUILD)/font_data.o \
+                      $(BEARSSL_USER_LIB)
+	@mkdir -p $(BUILD)
+	@echo "  CC   user/desktop.c (with HTTPS + TTF)"
+	@$(CC) $(USER_FONT_CFLAGS) -static -Wl,-e,_start -Wl,--build-id=none \
+	    user/desktop.c \
+	    $(BUILD)/libc.o $(BUILD)/http.o $(BUILD)/tls.o $(BUILD)/ca_bundle.o \
+	    $(BUILD)/font.o $(BUILD)/font_stb.o $(BUILD)/math_min.o $(BUILD)/font_data.o \
+	    $(BEARSSL_USER_LIB) \
+	    -o $@
 
 # -----------------------------------------------------------------------------
 #  Initrd (TAR) összerakása

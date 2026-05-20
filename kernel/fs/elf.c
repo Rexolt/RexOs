@@ -42,6 +42,7 @@ uint64_t elf_load_ex(vfs_node_t *file, uint64_t *brk_out) {
             uint64_t vaddr = phdr->p_vaddr;
             uint64_t memsz = phdr->p_memsz;
             uint64_t filesz = phdr->p_filesz;
+            uint64_t p_flags = phdr->p_flags;
             
             uint64_t seg_end = vaddr + memsz;
             if (seg_end > highest_addr) highest_addr = seg_end;
@@ -50,11 +51,17 @@ uint64_t elf_load_ex(vfs_node_t *file, uint64_t *brk_out) {
             uint64_t start_page = vaddr & ~0xFFF;
             uint64_t end_page = (vaddr + memsz + 0xFFF) & ~0xFFF;
             
-            /* Fizikai lapok foglalása és felmappelése (PAGE_USER | PAGE_WRITABLE) */
+            /* Determine page flags from ELF p_flags */
+            /* PF_R = 0x4, PF_W = 0x2, PF_X = 0x1 */
+            uint64_t flags = PAGE_PRESENT | PAGE_USER | PAGE_WRITABLE;  /* Make all segments writable for now */
+            flags &= ~PAGE_NX;  /* Start with NX cleared (executable by default) */
+            if (!(p_flags & 0x1)) flags |= PAGE_NX;    /* Set NX if NOT executable */
+            
+            /* Fizikai lapok foglalása és felmappelése */
             uintptr_t current_pml4 = task_current() ? task_current()->cr3 : vmm_kernel_pml4_phys();
             for (uint64_t page = start_page; page < end_page; page += 0x1000) {
                 uintptr_t phys = pmm_alloc_frame();
-                vmm_map_page_pml4(current_pml4, page, phys, PAGE_PRESENT | PAGE_WRITABLE | PAGE_USER);
+                vmm_map_page_pml4(current_pml4, page, phys, flags);
                 /* Töröljük a lap tartalmát (.bss szekció miatt is fontos) */
                 kmemset((void *)phys_to_virt(phys), 0, 0x1000); // HHDM-en keresztül írjuk, biztonságosabb
             }

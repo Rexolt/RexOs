@@ -130,7 +130,9 @@ typedef enum {
     TCP_CLOSE_WAIT, TCP_CLOSING, TCP_LAST_ACK, TCP_TIME_WAIT,
 } tcp_state_t;
 
-#define TCP_RX_BUF_SIZE 8192
+#define TCP_RX_BUF_SIZE 32768
+#define TCP_DEFAULT_MSS 536
+#define TCP_OUR_MSS     1460
 
 typedef struct tcp_socket {
     tcp_state_t    state;
@@ -139,6 +141,7 @@ typedef struct tcp_socket {
     uint16_t       remote_port;
     uint32_t       seq;
     uint32_t       ack;
+    uint16_t       peer_mss; /* SYN-ACK MSS option from peer, 0 = default 536 */
     uint8_t        rx_buf[TCP_RX_BUF_SIZE];
     uint32_t       rx_len;
     struct net_device *dev;

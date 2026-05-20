@@ -1,5 +1,29 @@
 #include "http.h"
 #include "libc.h"
+#include "tls.h"
+
+/* Debug: serial-on logol (write(1,...) -> kprintf a kernelben). */
+#define HTTP_DBG 1
+static void hdbg(const char *s) {
+#if HTTP_DBG
+    int n = 0; while (s[n]) n++;
+    write(1, s, (uint64_t)n);
+#else
+    (void)s;
+#endif
+}
+static void hdbg_int(int v) {
+#if HTTP_DBG
+    char buf[16]; int i = 0;
+    if (v < 0) { write(1, "-", 1); v = -v; }
+    if (v == 0) { write(1, "0", 1); return; }
+    while (v > 0 && i < 15) { buf[i++] = '0' + (v % 10); v /= 10; }
+    char rev[16]; for (int j = 0; j < i; j++) rev[j] = buf[i - 1 - j];
+    write(1, rev, (uint64_t)i);
+#else
+    (void)v;
+#endif
+}
 
 #define HTTP_HOST_MAX 128
 #define HTTP_PATH_MAX 256
@@ -14,7 +38,49 @@ typedef struct {
     char host[HTTP_HOST_MAX];
     char path[HTTP_PATH_MAX];
     uint16_t port;
+    int      is_tls;  /* https:// -> 1 */
 } http_url_t;
+
+/* ---- Connection wrapper: plain TCP vagy TLS, közös send/recv interfész ---- */
+typedef struct {
+    int        is_tls;
+    uint64_t   sock;     /* csak ha !is_tls */
+    tls_ctx_t *tls;      /* csak ha is_tls */
+} http_conn_t;
+
+static int hc_open(http_conn_t *c, const char *host, uint16_t port, int is_tls) {
+    c->is_tls = is_tls;
+    c->sock   = 0;
+    c->tls    = 0;
+    if (is_tls) {
+        c->tls = tls_connect(host, port);
+        return c->tls ? 0 : -1;
+    } else {
+        c->sock = net_connect(host, port);
+        if (c->sock == (uint64_t)-1 || c->sock == 0) return -1;
+        return 0;
+    }
+}
+
+static int hc_send(http_conn_t *c, const void *buf, uint64_t len) {
+    if (c->is_tls) return tls_send(c->tls, buf, len);
+    return net_send(c->sock, buf, len);
+}
+
+static int hc_recv(http_conn_t *c, void *buf, uint64_t max) {
+    if (c->is_tls) return tls_recv(c->tls, buf, max);
+    return net_recv(c->sock, buf, max);
+}
+
+static void hc_close(http_conn_t *c) {
+    if (c->is_tls) {
+        if (c->tls) tls_close(c->tls);
+    } else {
+        if (c->sock != 0 && c->sock != (uint64_t)-1) net_close(c->sock);
+    }
+    c->tls = 0;
+    c->sock = 0;
+}
 
 static int h_strlen(const char *s) {
     int len = 0;
@@ -135,11 +201,17 @@ static void h_clear_response(http_response_t *resp) {
 
 static int h_parse_url(const char *url, http_url_t *parsed, char *normalized) {
     h_memzero(parsed, sizeof(*parsed));
-    parsed->port = 80;
+    parsed->port   = 80;
+    parsed->is_tls = 0;
 
     const char *p = url;
-    if (h_strncmp(p, "http://", 7) == 0) p += 7;
-    if (h_strncmp(p, "https://", 8) == 0) return HTTP_ERR_HTTPS;
+    if (h_strncmp(p, "https://", 8) == 0) {
+        p += 8;
+        parsed->is_tls = 1;
+        parsed->port   = 443;
+    } else if (h_strncmp(p, "http://", 7) == 0) {
+        p += 7;
+    }
     if (!p[0]) return HTTP_ERR_BAD_URL;
 
     int hi = 0;
@@ -167,10 +239,12 @@ static int h_parse_url(const char *url, http_url_t *parsed, char *normalized) {
     parsed->path[pi] = 0;
 
     if (normalized) {
+        uint16_t default_port = parsed->is_tls ? 443 : 80;
         normalized[0] = 0;
-        if (!h_strcat_limit(normalized, "http://", HTTP_URL_MAX)) return HTTP_ERR_BAD_URL;
+        if (!h_strcat_limit(normalized, parsed->is_tls ? "https://" : "http://", HTTP_URL_MAX))
+            return HTTP_ERR_BAD_URL;
         if (!h_strcat_limit(normalized, parsed->host, HTTP_URL_MAX)) return HTTP_ERR_BAD_URL;
-        if (parsed->port != 80) {
+        if (parsed->port != default_port) {
             if (!h_strcat_limit(normalized, ":", HTTP_URL_MAX)) return HTTP_ERR_BAD_URL;
             if (!h_append_int_limit(normalized, parsed->port, HTTP_URL_MAX)) return HTTP_ERR_BAD_URL;
         }
@@ -308,7 +382,7 @@ static int h_build_request(const http_url_t *url, char *req, int req_max) {
     h_strcat(req, url->path);
     h_strcat(req, " HTTP/1.1\r\nHost: ");
     h_strcat(req, url->host);
-    h_strcat(req, "\r\nUser-Agent: RexOS/0.1\r\nAccept: text/html,*/*\r\nConnection: close\r\n\r\n");
+    h_strcat(req, "\r\nUser-Agent: RexOS/0.1\r\nAccept: text/html,*/*\r\nAccept-Encoding: identity\r\nConnection: close\r\n\r\n");
     return h_strlen(req);
 }
 
@@ -331,7 +405,7 @@ static int h_grow_raw(char **raw, int *raw_cap, int needed, int raw_limit) {
     return 1;
 }
 
-static int h_read_response(uint64_t sock, char **raw_io, int *raw_cap_io, int raw_limit,
+static int h_read_response(http_conn_t *conn, char **raw_io, int *raw_cap_io, int raw_limit,
                            int *out_len, int *header_len, int *content_len, int *hit_limit) {
     int total = 0;
     int hdr_len = -1;
@@ -344,7 +418,7 @@ static int h_read_response(uint64_t sock, char **raw_io, int *raw_cap_io, int ra
 
     while (1) {
         char chunk[HTTP_RECV_CHUNK];
-        int bytes = net_recv(sock, chunk, HTTP_RECV_CHUNK);
+        int bytes = hc_recv(conn, chunk, HTTP_RECV_CHUNK);
         uint64_t now = get_ticks();
         if (bytes < 0) return HTTP_ERR_RECV;
         if (bytes == 0) {
@@ -379,10 +453,6 @@ static int h_read_response(uint64_t sock, char **raw_io, int *raw_cap_io, int ra
     return HTTP_OK;
 }
 
-static void h_close_socket(uint64_t sock) {
-    if (sock != 0 && sock != (uint64_t)-1) net_close(sock);
-}
-
 static int h_make_absolute_url(const char *base_url, const char *location, char *out) {
     if (h_strncmp(location, "http://", 7) == 0 || h_strncmp(location, "https://", 8) == 0) {
         h_strncpy0(out, location, HTTP_URL_MAX);
@@ -393,10 +463,12 @@ static int h_make_absolute_url(const char *base_url, const char *location, char 
     int pr = h_parse_url(base_url, &base, 0);
     if (pr != HTTP_OK) return pr;
 
+    uint16_t default_port = base.is_tls ? 443 : 80;
     out[0] = 0;
-    if (!h_strcat_limit(out, "http://", HTTP_URL_MAX)) return HTTP_ERR_BAD_URL;
+    if (!h_strcat_limit(out, base.is_tls ? "https://" : "http://", HTTP_URL_MAX))
+        return HTTP_ERR_BAD_URL;
     if (!h_strcat_limit(out, base.host, HTTP_URL_MAX)) return HTTP_ERR_BAD_URL;
-    if (base.port != 80) {
+    if (base.port != default_port) {
         if (!h_strcat_limit(out, ":", HTTP_URL_MAX)) return HTTP_ERR_BAD_URL;
         if (!h_append_int_limit(out, base.port, HTTP_URL_MAX)) return HTTP_ERR_BAD_URL;
     }
@@ -460,24 +532,35 @@ static int h_http_get_impl(const char *url, char *fixed_out, uint64_t fixed_out_
         char normalized[HTTP_URL_MAX];
         int pr = h_parse_url(current_url, &parsed, normalized);
         if (pr != HTTP_OK) {
-            h_set_status(resp, pr == HTTP_ERR_HTTPS ? "HTTPS not supported yet (no TLS)" : "Bad URL");
+            h_set_status(resp, "Bad URL");
             free(raw);
             return pr;
         }
         if (resp) h_strncpy0(resp->final_url, normalized, HTTP_URL_MAX);
 
-        uint64_t sock = net_connect(parsed.host, parsed.port);
-        if (sock == (uint64_t)-1 || sock == 0) {
-            h_set_status(resp, "Connection failed (DNS/TCP error)");
+        hdbg("[http] GET ");
+        hdbg(parsed.is_tls ? "https://" : "http://");
+        hdbg(parsed.host);
+        hdbg(":"); hdbg_int((int)parsed.port);
+        hdbg(parsed.path); hdbg("\n");
+
+        http_conn_t conn;
+        if (hc_open(&conn, parsed.host, parsed.port, parsed.is_tls) != 0) {
+            hdbg("[http] hc_open FAILED\n");
+            h_set_status(resp, parsed.is_tls
+                ? "TLS connection failed (handshake or cert)"
+                : "Connection failed (DNS/TCP error)");
             free(raw);
             return HTTP_ERR_CONNECT;
         }
+        hdbg("[http] hc_open ok\n");
 
         char req[512];
         int req_len = h_build_request(&parsed, req, sizeof(req));
-        if (net_send(sock, req, req_len) < 0) {
+        if (hc_send(&conn, req, req_len) < 0) {
+            hdbg("[http] hc_send FAILED\n");
             h_set_status(resp, "HTTP send failed");
-            h_close_socket(sock);
+            hc_close(&conn);
             free(raw);
             return HTTP_ERR_SEND;
         }
@@ -486,22 +569,30 @@ static int h_http_get_impl(const char *url, char *fixed_out, uint64_t fixed_out_
         int header_len = -1;
         int content_len = -1;
         int hit_limit = 0;
-        int rr = h_read_response(sock, &raw, &raw_cap, raw_limit, &raw_len, &header_len, &content_len, &hit_limit);
+        hdbg("[http] sent req, reading response...\n");
+        int rr = h_read_response(&conn, &raw, &raw_cap, raw_limit, &raw_len, &header_len, &content_len, &hit_limit);
+        hdbg("[http] read_response done: total="); hdbg_int(raw_len);
+        hdbg(" hdr="); hdbg_int(header_len);
+        hdbg(" clen="); hdbg_int(content_len);
+        hdbg(" hit_limit="); hdbg_int(hit_limit); hdbg("\n");
         if (rr != HTTP_OK) {
+            hdbg("[http] read_response FAILED rc="); hdbg_int(rr); hdbg("\n");
             h_set_status(resp, "HTTP receive failed");
-            h_close_socket(sock);
+            hc_close(&conn);
             free(raw);
             return rr;
         }
         if (hit_limit && resp) resp->truncated = 1;
         if (header_len <= 0) {
+            hdbg("[http] no header end found\n");
             h_set_status(resp, "Invalid HTTP response");
-            h_close_socket(sock);
+            hc_close(&conn);
             free(raw);
             return HTTP_ERR_RESPONSE;
         }
 
         int status_code = h_parse_status_code(raw, header_len);
+        hdbg("[http] status="); hdbg_int(status_code); hdbg("\n");
         int is_chunked = h_header_is_chunked(raw, header_len);
         if (resp) {
             resp->status_code = status_code;
@@ -513,24 +604,16 @@ static int h_http_get_impl(const char *url, char *fixed_out, uint64_t fixed_out_
              status_code == 307 || status_code == 308) && redirect < HTTP_MAX_REDIRECTS) {
             char location[HTTP_URL_MAX];
             if (h_header_location(raw, header_len, location, HTTP_URL_MAX)) {
-                /* Ha a szerver HTTPS-re küld át, ennek a buildnek még nincs TLS-e.
-                 * Adjunk barátságos, az eredeti URL-t megtartó hibát ahelyett,
-                 * hogy a következő redirect-iterációnál "Bad URL"-ként esnénk el. */
-                if (h_strncmp(location, "https://", 8) == 0) {
-                    h_set_status(resp, "Server redirects to HTTPS (TLS not yet supported)");
-                    if (resp) h_strncpy0(resp->final_url, location, HTTP_URL_MAX);
-                    h_close_socket(sock);
-                    free(raw);
-                    return HTTP_ERR_HTTPS;
-                }
+                hdbg("[http] redirect -> "); hdbg(location); hdbg("\n");
+                /* https:// és http:// célok egyaránt mehetnek - a TLS layer kezeli. */
                 int ar = h_make_absolute_url(normalized, location, current_url);
                 if (ar != HTTP_OK) {
                     h_set_status(resp, "Bad redirect URL");
-                    h_close_socket(sock);
+                    hc_close(&conn);
                     free(raw);
                     return ar;
                 }
-                h_close_socket(sock);
+                hc_close(&conn);
                 continue;
             }
         }
@@ -543,7 +626,7 @@ static int h_http_get_impl(const char *url, char *fixed_out, uint64_t fixed_out_
         if (alloc_out) {
             int fr = h_finish_alloc_body(body, body_len, is_chunked, alloc_max, alloc_out, resp);
             if (fr < 0) {
-                h_close_socket(sock);
+                hc_close(&conn);
                 free(raw);
                 return fr;
             }
@@ -562,7 +645,7 @@ static int h_http_get_impl(const char *url, char *fixed_out, uint64_t fixed_out_
             if (resp->truncated) h_strcat(resp->status, " (truncated)");
         }
 
-        h_close_socket(sock);
+        hc_close(&conn);
         free(raw);
         return HTTP_OK;
     }
