@@ -2004,6 +2004,12 @@ static int b_strlen(const char *s) {
     while (s && s[len]) len++;
     return len;
 }
+static int b_strcmp(const char *a, const char *b) {
+    if (!a || !b) return (a == b) ? 0 : 1;
+    int i = 0;
+    while (a[i] && a[i] == b[i]) i++;
+    return (unsigned char)a[i] - (unsigned char)b[i];
+}
 static void b_strncpy0(char *d, const char *s, int max) {
     int i = 0;
     if (max <= 0) return;
@@ -2657,7 +2663,727 @@ static void browser_emit_resource_placeholder(browser_state_t *st, browser_resou
     browser_newline(col, cy, line_h, cur_line, skip_lines);
 }
 
-/* Nyers szöveg renderelése HTML tagek kihagyásával */
+/* =============================================================================
+ *  HTML + CSS Rendering Engine (Fázis 1)
+ *  - Block/inline doboz-modell, style stack, kis CSS subset
+ *  - Színek: named (kb. 30), #rgb, #rrggbb, rgb(r,g,b)
+ *  - Inline style="" parsing: color, background-color, font-weight
+ *  - Headings (h1-h6), <b>/<strong>, <i>/<em>, <a>, <code>, <pre>, <ul>/<li>, <hr>
+ * ========================================================================== */
+
+/* ---- CSS color parsing -------------------------------------------------- */
+
+static int css_hex1(char c) {
+    if (c >= '0' && c <= '9') return c - '0';
+    if (c >= 'a' && c <= 'f') return c - 'a' + 10;
+    if (c >= 'A' && c <= 'F') return c - 'A' + 10;
+    return -1;
+}
+
+static int css_streqn_ci(const char *a, const char *b, int n) {
+    for (int i = 0; i < n; i++) {
+        char ca = a[i], cb = b[i];
+        if (ca >= 'A' && ca <= 'Z') ca = (char)(ca + 32);
+        if (cb >= 'A' && cb <= 'Z') cb = (char)(cb + 32);
+        if (ca != cb) return 0;
+        if (!ca) return 0;
+    }
+    return 1;
+}
+
+typedef struct { const char *name; uint32_t rgb; } css_named_color_t;
+static const css_named_color_t s_css_colors[] = {
+    {"black",       0x000000}, {"white",       0xFFFFFF}, {"silver",      0xC0C0C0},
+    {"gray",        0x808080}, {"grey",        0x808080}, {"lightgray",   0xD3D3D3},
+    {"lightgrey",   0xD3D3D3}, {"darkgray",    0xA9A9A9}, {"darkgrey",    0xA9A9A9},
+    {"red",         0xFF0000}, {"darkred",     0x8B0000}, {"crimson",     0xDC143C},
+    {"orange",      0xFFA500}, {"orangered",   0xFF4500}, {"gold",        0xFFD700},
+    {"yellow",      0xFFFF00}, {"khaki",       0xF0E68C},
+    {"green",       0x008000}, {"lime",        0x00FF00}, {"olive",       0x808000},
+    {"darkgreen",   0x006400}, {"lightgreen",  0x90EE90}, {"forestgreen", 0x228B22},
+    {"teal",        0x008080}, {"cyan",        0x00FFFF}, {"aqua",        0x00FFFF},
+    {"blue",        0x0000FF}, {"navy",        0x000080}, {"royalblue",   0x4169E1},
+    {"skyblue",     0x87CEEB}, {"deepskyblue", 0x00BFFF}, {"steelblue",   0x4682B4},
+    {"lightblue",   0xADD8E6}, {"dodgerblue",  0x1E90FF},
+    {"purple",      0x800080}, {"violet",      0xEE82EE}, {"magenta",     0xFF00FF},
+    {"fuchsia",     0xFF00FF}, {"indigo",      0x4B0082}, {"orchid",      0xDA70D6},
+    {"pink",        0xFFC0CB}, {"hotpink",     0xFF69B4}, {"deeppink",    0xFF1493},
+    {"brown",       0xA52A2A}, {"sienna",      0xA0522D}, {"chocolate",   0xD2691E},
+    {"tan",         0xD2B48C}, {"beige",       0xF5F5DC}, {"wheat",       0xF5DEB3},
+    {"maroon",      0x800000}, {"salmon",      0xFA8072}, {"coral",       0xFF7F50},
+    {"transparent", 0xFFFFFFFF}, /* sentinel: 0xFFFFFFFF == "no color" */
+    {0, 0}
+};
+
+/* CSS color string -> 0xRRGGBB. transparent/inherit -> 0xFFFFFFFF.
+ * Returns 1 on success, 0 on parse failure. `len` is bytes to look at. */
+static int css_parse_color(const char *s, int len, uint32_t *out) {
+    /* Trimmelés */
+    while (len > 0 && (*s == ' ' || *s == '\t' || *s == '\r' || *s == '\n')) { s++; len--; }
+    while (len > 0 && (s[len-1] == ' ' || s[len-1] == '\t' || s[len-1] == ';')) len--;
+    if (len <= 0) return 0;
+
+    if (s[0] == '#') {
+        if (len == 4) { /* #rgb */
+            int r = css_hex1(s[1]), g = css_hex1(s[2]), b = css_hex1(s[3]);
+            if (r < 0 || g < 0 || b < 0) return 0;
+            *out = ((uint32_t)(r * 17) << 16) | ((uint32_t)(g * 17) << 8) | (uint32_t)(b * 17);
+            return 1;
+        }
+        if (len == 7) { /* #rrggbb */
+            int r1 = css_hex1(s[1]), r2 = css_hex1(s[2]);
+            int g1 = css_hex1(s[3]), g2 = css_hex1(s[4]);
+            int b1 = css_hex1(s[5]), b2 = css_hex1(s[6]);
+            if (r1 < 0 || r2 < 0 || g1 < 0 || g2 < 0 || b1 < 0 || b2 < 0) return 0;
+            *out = ((uint32_t)(r1*16+r2) << 16) | ((uint32_t)(g1*16+g2) << 8) | (uint32_t)(b1*16+b2);
+            return 1;
+        }
+        return 0;
+    }
+
+    /* rgb(r,g,b) */
+    if (len > 4 && css_streqn_ci(s, "rgb(", 4)) {
+        const char *p = s + 4;
+        int vals[3] = {0, 0, 0};
+        for (int i = 0; i < 3; i++) {
+            while (*p == ' ' || *p == '\t') p++;
+            int v = 0; int has = 0;
+            while (*p >= '0' && *p <= '9') { v = v*10 + (*p - '0'); p++; has = 1; }
+            if (!has) return 0;
+            if (v > 255) v = 255;
+            vals[i] = v;
+            while (*p == ' ' || *p == '\t' || *p == ',') p++;
+        }
+        *out = ((uint32_t)vals[0] << 16) | ((uint32_t)vals[1] << 8) | (uint32_t)vals[2];
+        return 1;
+    }
+
+    /* Named */
+    for (int i = 0; s_css_colors[i].name; i++) {
+        const char *n = s_css_colors[i].name;
+        int nlen = 0; while (n[nlen]) nlen++;
+        if (nlen == len && css_streqn_ci(s, n, nlen)) {
+            *out = s_css_colors[i].rgb;
+            return 1;
+        }
+    }
+    return 0;
+}
+
+/* Egy CSS deklaráció ("prop: value") értékének kinyerése a style="" attribútumból.
+ * Megtér 1-et siker esetén; out_buf null-terminált. */
+static int css_inline_get(const char *style, const char *prop, char *out, int out_max) {
+    if (!style || !prop || !out || out_max <= 0) return 0;
+    out[0] = 0;
+    int plen = 0; while (prop[plen]) plen++;
+
+    const char *p = style;
+    while (*p) {
+        /* skip ws */
+        while (*p == ' ' || *p == '\t' || *p == ';') p++;
+        if (!*p) break;
+        const char *kstart = p;
+        while (*p && *p != ':' && *p != ';') p++;
+        if (*p != ':') { while (*p && *p != ';') p++; continue; }
+        int klen = (int)(p - kstart);
+        while (klen > 0 && (kstart[klen-1] == ' ' || kstart[klen-1] == '\t')) klen--;
+        p++; /* past ':' */
+        while (*p == ' ' || *p == '\t') p++;
+        const char *vstart = p;
+        while (*p && *p != ';') p++;
+        int vlen = (int)(p - vstart);
+        while (vlen > 0 && (vstart[vlen-1] == ' ' || vstart[vlen-1] == '\t')) vlen--;
+
+        if (klen == plen && css_streqn_ci(kstart, prop, plen)) {
+            int copy = vlen < (out_max - 1) ? vlen : (out_max - 1);
+            for (int i = 0; i < copy; i++) out[i] = vstart[i];
+            out[copy] = 0;
+            return 1;
+        }
+        if (*p == ';') p++;
+    }
+    return 0;
+}
+
+/* ---- Render style stack ------------------------------------------------- */
+
+#define RSTYLE_STACK_MAX 32
+#define RSTYLE_LINK_MAX  BROWSER_LINK_URL_MAX
+
+typedef struct {
+    uint32_t color;        /* 0xRRGGBB */
+    uint32_t bg_color;     /* 0xFFFFFFFF = no background */
+    uint8_t  bold;
+    uint8_t  underline;
+    uint8_t  scale;        /* 1, 2, or 3 */
+    uint8_t  pre;          /* preserve whitespace */
+    uint8_t  in_link;      /* inside <a> */
+    uint8_t  list_kind;    /* 0=none, 1=ul, 2=ol */
+    int      list_index;   /* for ol counter */
+    int      indent_px;    /* left indent in pixels */
+    char     link_href[RSTYLE_LINK_MAX];
+} rstyle_t;
+
+typedef struct {
+    rstyle_t stack[RSTYLE_STACK_MAX];
+    int depth;
+
+    /* Layout cursor (pixel coords, screen-relative) */
+    int x, y;             /* current pen position */
+    int x_left, x_right;  /* writable x range */
+    int max_y;            /* clip y bottom */
+    int line_h;           /* current line height in pixels */
+    int line_started;     /* 1 if any glyph drawn on current line */
+    int pending_space;    /* whitespace collapsing flag */
+
+    /* Scrolling: skip the first `skip_px` pixels of vertical content */
+    int skip_px;          /* how many pixels of content to skip from doc top */
+    int virt_y;           /* logical y from doc top */
+    int doc_origin_y;     /* y of the doc origin on screen */
+
+    browser_state_t *st;
+} rctx_t;
+
+static rstyle_t rstyle_default(void) {
+    rstyle_t s;
+    s.color     = 0xCDD6F4;
+    s.bg_color  = 0xFFFFFFFF;
+    s.bold      = 0;
+    s.underline = 0;
+    s.scale     = 1;
+    s.pre       = 0;
+    s.in_link   = 0;
+    s.list_kind = 0;
+    s.list_index= 0;
+    s.indent_px = 0;
+    s.link_href[0] = 0;
+    return s;
+}
+
+static rstyle_t *rstyle_top(rctx_t *r) {
+    if (r->depth <= 0) {
+        static rstyle_t fallback;
+        fallback = rstyle_default();
+        return &fallback;
+    }
+    return &r->stack[r->depth - 1];
+}
+
+static void rstyle_push(rctx_t *r, rstyle_t s) {
+    if (r->depth < RSTYLE_STACK_MAX) {
+        r->stack[r->depth++] = s;
+    }
+}
+
+static void rstyle_pop(rctx_t *r) {
+    if (r->depth > 1) r->depth--;
+}
+
+/* ---- Layout primitives -------------------------------------------------- */
+
+static int rctx_visible_y(const rctx_t *r, int y_top, int y_bot) {
+    /* virt_y/skip_px alapján döntjük el, hogy a content látható-e a képernyőn */
+    int vis_top = y_top - r->skip_px;
+    int vis_bot = y_bot - r->skip_px;
+    return (vis_bot >= 0 && vis_top < (r->max_y - r->doc_origin_y));
+}
+
+static void rctx_newline(rctx_t *r) {
+    int line_h = r->line_h > 0 ? r->line_h : 14;
+    r->virt_y += line_h;
+    rstyle_t *s = rstyle_top(r);
+    r->x = r->x_left + s->indent_px;
+    r->y = r->doc_origin_y + r->virt_y - r->skip_px;
+    r->line_h = 8 * s->scale + 4;
+    r->line_started = 0;
+    r->pending_space = 0;
+}
+
+/* Block break: csak akkor csinál újsort, ha még nem üres a sor.
+ * Két blokk között EGY üres sort hagy térközként (kis margó). */
+static void rctx_block_break(rctx_t *r, int margin_px) {
+    if (r->line_started) {
+        rctx_newline(r);
+    }
+    if (margin_px > 0) {
+        r->virt_y += margin_px;
+        r->y = r->doc_origin_y + r->virt_y - r->skip_px;
+    }
+    r->pending_space = 0;
+}
+
+/* Glyph rajzolása + line-height update + linkrekord */
+static void rctx_draw_glyph(rctx_t *r, char c) {
+    rstyle_t *s = rstyle_top(r);
+    int gw = 6 * s->scale;
+    int gh = 8 * s->scale;
+
+    /* Sor magasság: amelyik glyph nagyobb, az dominál */
+    if (r->line_h < gh + 4) r->line_h = gh + 4;
+
+    /* Wrap */
+    if (r->x + gw > r->x_right) {
+        rctx_newline(r);
+    }
+
+    int doc_top = r->virt_y;
+    int doc_bot = r->virt_y + gh;
+    int draw_y = r->doc_origin_y + doc_top - r->skip_px;
+
+    if (draw_y >= 0 && draw_y < r->max_y && rctx_visible_y(r, doc_top, doc_bot)) {
+        /* Background */
+        if (s->bg_color != 0xFFFFFFFF) {
+            bb_fill_rect(r->x, draw_y, gw, gh, s->bg_color);
+        }
+        /* Text - scale & optional bold */
+        char buf[2] = { c, 0 };
+        bb_draw_text(r->x, draw_y, buf, s->color, s->scale);
+        if (s->bold) bb_draw_text(r->x + 1, draw_y, buf, s->color, s->scale);
+        /* Underline */
+        if (s->underline) {
+            bb_hline(r->x, draw_y + gh - 1, gw, s->color);
+        }
+        /* Link rect: csak ha link */
+        if (s->in_link && s->link_href[0]) {
+            browser_record_link_rect(r->st, s->link_href, r->x, draw_y, gw, gh);
+        }
+    }
+
+    r->x += gw;
+    r->y = draw_y;
+    r->line_started = 1;
+    r->pending_space = 0;
+}
+
+static void rctx_emit_char(rctx_t *r, char c) {
+    rstyle_t *s = rstyle_top(r);
+    if (s->pre) {
+        if (c == '\n') { rctx_newline(r); return; }
+        if (c == '\t') {
+            for (int i = 0; i < 4; i++) rctx_draw_glyph(r, ' ');
+            return;
+        }
+        rctx_draw_glyph(r, c);
+        return;
+    }
+    /* Normál módban: whitespace collapse */
+    if (c == ' ' || c == '\t' || c == '\n' || c == '\r') {
+        if (r->line_started) r->pending_space = 1;
+        return;
+    }
+    if (r->pending_space) {
+        r->pending_space = 0;
+        if (r->line_started) rctx_draw_glyph(r, ' ');
+    }
+    rctx_draw_glyph(r, c);
+}
+
+static void rctx_emit_text(rctx_t *r, const char *s) {
+    while (*s) rctx_emit_char(r, *s++);
+}
+
+/* ---- Tag dispatch ------------------------------------------------------- */
+
+static int html_tag_name(const char *p, char *out, int max) {
+    int i = 0;
+    if (*p == '/') p++;
+    while (*p && *p != ' ' && *p != '\t' && *p != '\r' && *p != '\n' &&
+           *p != '>' && *p != '/' && i < max - 1) {
+        char c = *p++;
+        if (c >= 'A' && c <= 'Z') c = (char)(c + 32);
+        out[i++] = c;
+    }
+    out[i] = 0;
+    return i;
+}
+
+/* Forward decl - css_inline_get_attr_style alább van. */
+static int css_inline_get_attr_style(const char *full_tag, char *out, int out_max);
+
+/* Tag default style alkalmazása + inline style="" override */
+static void rstyle_apply_tag(const char *tag_name, const char *full_tag,
+                             rstyle_t *base, rstyle_t *out) {
+    *out = *base; /* öröklés */
+
+    if (b_strcmp(tag_name, "h1") == 0) { out->scale = 3; out->bold = 1; }
+    else if (b_strcmp(tag_name, "h2") == 0) { out->scale = 2; out->bold = 1; }
+    else if (b_strcmp(tag_name, "h3") == 0) { out->scale = 2; out->bold = 0; }
+    else if (b_strcmp(tag_name, "h4") == 0 ||
+             b_strcmp(tag_name, "h5") == 0 ||
+             b_strcmp(tag_name, "h6") == 0) { out->scale = 1; out->bold = 1; }
+    else if (b_strcmp(tag_name, "b") == 0 || b_strcmp(tag_name, "strong") == 0) {
+        out->bold = 1;
+    } else if (b_strcmp(tag_name, "i") == 0 || b_strcmp(tag_name, "em") == 0) {
+        /* No italic font; mild color hint */
+        out->color = 0xE2E8F0;
+    } else if (b_strcmp(tag_name, "u") == 0) {
+        out->underline = 1;
+    } else if (b_strcmp(tag_name, "code") == 0 || b_strcmp(tag_name, "kbd") == 0) {
+        out->color = 0xF9E2AF;
+        out->bg_color = 0x1E293B;
+    } else if (b_strcmp(tag_name, "pre") == 0) {
+        out->pre = 1;
+        out->color = 0xF9E2AF;
+    } else if (b_strcmp(tag_name, "a") == 0) {
+        out->color = 0x89B4FA;
+        out->underline = 1;
+        /* in_link és link_href-et a hívó tölti, mert href kell hozzá */
+    } else if (b_strcmp(tag_name, "small") == 0) {
+        out->scale = 1;
+        out->color = 0x94A3B8;
+    } else if (b_strcmp(tag_name, "mark") == 0) {
+        out->bg_color = 0xF59E0B;
+        out->color = 0x000000;
+    }
+
+    /* Inline style="" override */
+    char val[64];
+    if (full_tag && css_inline_get_attr_style(full_tag, val, sizeof(val))) {
+        char cv[48];
+        if (css_inline_get(val, "color", cv, sizeof(cv))) {
+            uint32_t c;
+            int vlen = 0; while (cv[vlen]) vlen++;
+            if (css_parse_color(cv, vlen, &c) && c != 0xFFFFFFFF) out->color = c;
+        }
+        if (css_inline_get(val, "background-color", cv, sizeof(cv)) ||
+            css_inline_get(val, "background", cv, sizeof(cv))) {
+            uint32_t c;
+            int vlen = 0; while (cv[vlen]) vlen++;
+            if (css_parse_color(cv, vlen, &c)) out->bg_color = c;
+        }
+        if (css_inline_get(val, "font-weight", cv, sizeof(cv))) {
+            if (b_strcmp(cv, "bold") == 0 || b_strcmp(cv, "bolder") == 0) out->bold = 1;
+            else if (b_strcmp(cv, "normal") == 0) out->bold = 0;
+            else {
+                int n = 0; for (int i = 0; cv[i]; i++) if (cv[i] >= '0' && cv[i] <= '9') n = n*10 + (cv[i]-'0');
+                out->bold = (n >= 600) ? 1 : 0;
+            }
+        }
+        if (css_inline_get(val, "text-decoration", cv, sizeof(cv))) {
+            if (b_strcmp(cv, "underline") == 0) out->underline = 1;
+            else if (b_strcmp(cv, "none") == 0) out->underline = 0;
+        }
+        if (css_inline_get(val, "font-size", cv, sizeof(cv))) {
+            /* Heurisztikus: pixel/pt érték -> scale */
+            int n = 0; for (int i = 0; cv[i]; i++) if (cv[i] >= '0' && cv[i] <= '9') n = n*10 + (cv[i]-'0');
+            if (n >= 24) out->scale = 3;
+            else if (n >= 16) out->scale = 2;
+            else if (n > 0)   out->scale = 1;
+            else if (b_strcmp(cv, "small") == 0)   out->scale = 1;
+            else if (b_strcmp(cv, "medium") == 0)  out->scale = 1;
+            else if (b_strcmp(cv, "large") == 0)   out->scale = 2;
+            else if (b_strcmp(cv, "x-large") == 0) out->scale = 3;
+        }
+    }
+}
+
+/* style="..." kinyerő helper. Ezt forward-deklaráljuk fent, itt jön a definíció. */
+static int css_inline_get_attr_style(const char *full_tag, char *out, int out_max) {
+    return browser_tag_attr_value(full_tag, "style", out, out_max);
+}
+
+/* Ismert blokk-tagek. (A meglévő browser_is_block_tag egyik szuperszete.) */
+static int html_is_block(const char *tag_name) {
+    static const char * const blocks[] = {
+        "p","div","section","article","header","footer","main","nav","aside",
+        "h1","h2","h3","h4","h5","h6",
+        "ul","ol","li","table","tr","blockquote","pre","figure","figcaption",
+        "form","fieldset","details","summary",
+        0
+    };
+    for (int i = 0; blocks[i]; i++) {
+        if (b_strcmp(tag_name, blocks[i]) == 0) return 1;
+    }
+    return 0;
+}
+
+static int html_is_void(const char *tag_name) {
+    static const char * const voids[] = {
+        "br","hr","img","input","meta","link","source","col","wbr","embed","area","base",
+        0
+    };
+    for (int i = 0; voids[i]; i++) {
+        if (b_strcmp(tag_name, voids[i]) == 0) return 1;
+    }
+    return 0;
+}
+
+/* ---- Új renderelő belépés ---------------------------------------------- */
+
+static void browser_render_html(window_t *w, browser_state_t *st) {
+    rctx_t R;
+    R.depth = 0;
+    rstyle_push(&R, rstyle_default());
+
+    R.x_left  = w->x + 8;
+    R.x_right = w->x + w->w - 8;
+    R.max_y   = w->y + w->h - 10;
+    R.doc_origin_y = w->y + TITLE_H + 50;
+    R.virt_y  = 0;
+    R.skip_px = st->scroll * 14; /* st->scroll továbbra is "logikai sor" indexként szerepel */
+    R.x       = R.x_left;
+    R.y       = R.doc_origin_y - R.skip_px;
+    R.line_h  = 14;
+    R.line_started = 0;
+    R.pending_space = 0;
+    R.st = st;
+
+    st->link_count = 0;
+
+    const char *p = st->content ? st->content : "";
+
+    while (*p) {
+        if (R.y >= R.max_y && R.virt_y - R.skip_px > (R.max_y - R.doc_origin_y) + 100) {
+            /* Túl messze a viewporttól lefelé - nincs értelme tovább rendelni.
+             * Hagyjuk hogy a doc magasság még tovább nőjön a scroll működéséhez. */
+        }
+
+        char c = *p++;
+        if (c == '<') {
+            /* Komment / DOCTYPE skipping */
+            if (p[0] == '!' && p[1] == '-' && p[2] == '-') {
+                p += 3;
+                while (*p && !(p[0] == '-' && p[1] == '-' && p[2] == '>')) p++;
+                if (*p) p += 3;
+                continue;
+            }
+            if (p[0] == '!') {
+                while (*p && *p != '>') p++;
+                if (*p) p++;
+                continue;
+            }
+
+            int closing = (*p == '/');
+            char tag_name[24];
+            html_tag_name(p, tag_name, sizeof(tag_name));
+
+            const char *full_tag = p; /* a tag első karaktere (nem >) */
+
+            /* <script>/<style> tartalom kihagyása vagy resource emit */
+            if (!closing && b_strcmp(tag_name, "script") == 0) {
+                char src[BROWSER_LINK_URL_MAX];
+                if (browser_tag_attr_value(full_tag, "src", src, sizeof(src))) {
+                    char resolved[BROWSER_LINK_URL_MAX];
+                    browser_resolve_href(st->current_url[0] ? st->current_url : st->url, src, resolved, sizeof(resolved));
+                    if (resolved[0]) {
+                        if (R.line_started) rctx_newline(&R);
+                        rstyle_t s = *rstyle_top(&R);
+                        s.color = 0xF9E2AF; s.scale = 1;
+                        rstyle_push(&R, s);
+                        rctx_emit_text(&R, "[script: ");
+                        rctx_emit_text(&R, resolved);
+                        rctx_emit_text(&R, "]");
+                        rstyle_pop(&R);
+                        rctx_newline(&R);
+                    }
+                }
+                /* skip until </script> */
+                while (*p && *p != '>') p++;
+                if (*p) p++;
+                p = browser_skip_until_close_tag(p, "script");
+                continue;
+            }
+            if (!closing && b_strcmp(tag_name, "style") == 0) {
+                /* TODO Fázis 1.5: <style> belső szabályok parse-olása.
+                 * Most csak átugorjuk. */
+                while (*p && *p != '>') p++;
+                if (*p) p++;
+                p = browser_skip_until_close_tag(p, "style");
+                continue;
+            }
+
+            /* <link rel="stylesheet" href="..."> resource placeholder */
+            if (!closing && b_strcmp(tag_name, "link") == 0 &&
+                browser_tag_attr_contains_word(full_tag, "rel", "stylesheet")) {
+                char href[BROWSER_LINK_URL_MAX];
+                if (browser_tag_attr_value(full_tag, "href", href, sizeof(href))) {
+                    char resolved[BROWSER_LINK_URL_MAX];
+                    browser_resolve_href(st->current_url[0] ? st->current_url : st->url, href, resolved, sizeof(resolved));
+                    if (resolved[0]) {
+                        if (R.line_started) rctx_newline(&R);
+                        rstyle_t s = *rstyle_top(&R);
+                        s.color = 0xA78BFA; s.scale = 1;
+                        rstyle_push(&R, s);
+                        rctx_emit_text(&R, "[stylesheet: ");
+                        rctx_emit_text(&R, resolved);
+                        rctx_emit_text(&R, "]");
+                        rstyle_pop(&R);
+                        rctx_newline(&R);
+                    }
+                }
+                while (*p && *p != '>') p++;
+                if (*p) p++;
+                continue;
+            }
+
+            /* <img src="..."> */
+            if (!closing && b_strcmp(tag_name, "img") == 0) {
+                char src[BROWSER_LINK_URL_MAX];
+                if (browser_tag_attr_value(full_tag, "src", src, sizeof(src))) {
+                    char resolved[BROWSER_LINK_URL_MAX];
+                    browser_resolve_href(st->current_url[0] ? st->current_url : st->url, src, resolved, sizeof(resolved));
+                    char alt[64]; alt[0] = 0;
+                    browser_tag_attr_value(full_tag, "alt", alt, sizeof(alt));
+                    if (R.line_started) rctx_newline(&R);
+                    rstyle_t s = *rstyle_top(&R);
+                    s.color = 0x34D399; s.scale = 1; s.bg_color = 0x064E3B;
+                    rstyle_push(&R, s);
+                    rctx_emit_text(&R, " [img");
+                    if (alt[0]) { rctx_emit_text(&R, ": "); rctx_emit_text(&R, alt); }
+                    rctx_emit_text(&R, "] ");
+                    rstyle_pop(&R);
+                }
+                while (*p && *p != '>') p++;
+                if (*p) p++;
+                continue;
+            }
+
+            /* <br> */
+            if (!closing && b_strcmp(tag_name, "br") == 0) {
+                rctx_newline(&R);
+                while (*p && *p != '>') p++;
+                if (*p) p++;
+                continue;
+            }
+
+            /* <hr> */
+            if (!closing && b_strcmp(tag_name, "hr") == 0) {
+                rctx_block_break(&R, 4);
+                int draw_y = R.doc_origin_y + R.virt_y - R.skip_px;
+                if (draw_y >= 0 && draw_y < R.max_y) {
+                    bb_hline(R.x_left, draw_y, R.x_right - R.x_left, 0x475569);
+                }
+                R.virt_y += 8;
+                R.y = R.doc_origin_y + R.virt_y - R.skip_px;
+                while (*p && *p != '>') p++;
+                if (*p) p++;
+                continue;
+            }
+
+            /* <li>: bullet/szám */
+            if (!closing && b_strcmp(tag_name, "li") == 0) {
+                rctx_block_break(&R, 0);
+                rstyle_t cur = *rstyle_top(&R);
+                rstyle_t nest;
+                rstyle_apply_tag("li", full_tag, &cur, &nest);
+                /* Számláló: ha az ős <ol>, akkor index alapján */
+                rstyle_t *parent = rstyle_top(&R);
+                if (parent->list_kind == 2) {
+                    parent->list_index++;
+                    char num[16];
+                    int n = parent->list_index, ni = 0;
+                    if (n == 0) num[ni++] = '0';
+                    char tmp[12]; int tlen = 0;
+                    while (n > 0) { tmp[tlen++] = (char)('0' + (n % 10)); n /= 10; }
+                    for (int i = tlen - 1; i >= 0; i--) num[ni++] = tmp[i];
+                    num[ni++] = '.'; num[ni++] = ' '; num[ni] = 0;
+                    rctx_emit_text(&R, num);
+                } else {
+                    /* A font csak ASCII (5x7), így "* " a marker. */
+                    rctx_emit_text(&R, "* ");
+                }
+                rstyle_push(&R, nest);
+                while (*p && *p != '>') p++;
+                if (*p) p++;
+                continue;
+            }
+            if (closing && b_strcmp(tag_name, "li") == 0) {
+                rstyle_pop(&R);
+                while (*p && *p != '>') p++;
+                if (*p) p++;
+                continue;
+            }
+
+            /* <ul>/<ol>: indent + lista tipus */
+            if (!closing && (b_strcmp(tag_name, "ul") == 0 || b_strcmp(tag_name, "ol") == 0)) {
+                rctx_block_break(&R, 4);
+                rstyle_t cur = *rstyle_top(&R);
+                rstyle_t nest = cur;
+                nest.list_kind = (b_strcmp(tag_name, "ol") == 0) ? 2 : 1;
+                nest.list_index = 0;
+                nest.indent_px = cur.indent_px + 18;
+                rstyle_push(&R, nest);
+                while (*p && *p != '>') p++;
+                if (*p) p++;
+                continue;
+            }
+            if (closing && (b_strcmp(tag_name, "ul") == 0 || b_strcmp(tag_name, "ol") == 0)) {
+                rstyle_pop(&R);
+                rctx_block_break(&R, 4);
+                while (*p && *p != '>') p++;
+                if (*p) p++;
+                continue;
+            }
+
+            /* <a href=...> */
+            if (!closing && b_strcmp(tag_name, "a") == 0) {
+                rstyle_t cur = *rstyle_top(&R);
+                rstyle_t nest;
+                rstyle_apply_tag("a", full_tag, &cur, &nest);
+                char href[BROWSER_LINK_URL_MAX];
+                if (browser_tag_attr_value(full_tag, "href", href, sizeof(href))) {
+                    nest.in_link = 1;
+                    browser_resolve_href(st->current_url[0] ? st->current_url : st->url,
+                                         href, nest.link_href, sizeof(nest.link_href));
+                }
+                rstyle_push(&R, nest);
+                while (*p && *p != '>') p++;
+                if (*p) p++;
+                continue;
+            }
+            if (closing && b_strcmp(tag_name, "a") == 0) {
+                rstyle_pop(&R);
+                while (*p && *p != '>') p++;
+                if (*p) p++;
+                continue;
+            }
+
+            /* Általános nyitó/záró tag */
+            int is_block = html_is_block(tag_name);
+            int is_void  = html_is_void(tag_name);
+
+            if (is_void) {
+                /* Eddig kezelt: br, hr, img - ide csak a többi (input, meta, ...) jut */
+                while (*p && *p != '>') p++;
+                if (*p) p++;
+                continue;
+            }
+
+            if (closing) {
+                rstyle_pop(&R);
+                if (is_block) rctx_block_break(&R, 4);
+                while (*p && *p != '>') p++;
+                if (*p) p++;
+                continue;
+            }
+
+            /* Nyitó tag */
+            if (is_block) rctx_block_break(&R, 4);
+            rstyle_t cur = *rstyle_top(&R);
+            rstyle_t nest;
+            rstyle_apply_tag(tag_name, full_tag, &cur, &nest);
+            rstyle_push(&R, nest);
+
+            while (*p && *p != '>') p++;
+            if (*p) p++;
+            continue;
+        }
+
+        if (c == '&') {
+            const char *entity = p;
+            char decoded;
+            if (browser_decode_entity(&entity, &decoded)) {
+                rctx_emit_char(&R, decoded);
+                p = entity;
+                continue;
+            }
+        }
+        rctx_emit_char(&R, c);
+    }
+}
+
+/* ---- Régi renderelő (megmaradt referencia, de már nincs használva) ---- */
+__attribute__((unused))
 static void browser_render_text(window_t *w, browser_state_t *st) {
     int cx = w->x + 8;
     int cy = w->y + TITLE_H + 50; /* fejléc + URL bar alá */
@@ -2888,7 +3614,7 @@ static void app_browser_draw(window_t *w) {
         bb_draw_text(cx - 20, cy + 24, "Type a URL and press GO or Enter", 0x6C7086, 1);
         bb_draw_text(cx - 20, cy + 36, "TCP/IP stack: ACTIVE", 0xA6E3A1, 1);
     } else {
-        browser_render_text(w, st);
+        browser_render_html(w, st);
 
         if (st->resource_count > 0) {
             int ry = w->y + w->h - 14;

@@ -281,8 +281,13 @@ static void user_task_launcher(void *arg) {
     task_current()->brk_current = brk_end;
     
     /* Felhasználói stack lefoglalása és mappelése */
-    uint64_t user_stack_top = 0x700000000000;
+    /* Use a high address in user space that doesn't conflict with ELF segments */
+    /* Ensure 16-byte alignment for movaps instructions (System V ABI requirement) */
+    /* jmp_user_mode pushes 40-byte iretq frame, so RSP = user_stack_top - 40 when user code starts */
+    uint64_t user_stack_top = 0x00007FFFFF800000;
     uint64_t stack_size = 4 * 4096; // 16 KB stack
+    user_stack_top = (user_stack_top - 40) & ~0xF;  /* Align RSP after iretq frame, then add back 40 */
+    user_stack_top += 40;
     for (uint64_t page = user_stack_top - stack_size; page < user_stack_top; page += 4096) {
         uintptr_t phys = pmm_alloc_frame();
         vmm_map_page_pml4(task_current()->cr3, page, phys, PAGE_PRESENT | PAGE_WRITABLE | PAGE_USER);
