@@ -282,16 +282,25 @@ static void user_task_launcher(void *arg) {
     
     /* Felhasználói stack lefoglalása és mappelése */
     /* Use a high address in user space that doesn't conflict with ELF segments */
-    /* Ensure 16-byte alignment for movaps instructions (System V ABI requirement) */
-    /* jmp_user_mode pushes 40-byte iretq frame, so RSP = user_stack_top - 40 when user code starts */
-    uint64_t user_stack_top = 0x00007FFFFF800000;
-    uint64_t stack_size = 4 * 4096; // 16 KB stack
-    user_stack_top = (user_stack_top - 40) & ~0xF;  /* Align RSP after iretq frame, then add back 40 */
-    user_stack_top += 40;
-    for (uint64_t page = user_stack_top - stack_size; page < user_stack_top; page += 4096) {
+    uint64_t user_stack_base = 0x00007FFFFF7FC000;  /* page-aligned base */
+    uint64_t stack_size = 4 * 4096;                  // 16 KB stack
+    uint64_t user_stack_top_aligned = user_stack_base + stack_size; /* page-aligned top */
+    for (uint64_t page = user_stack_base; page < user_stack_top_aligned; page += 4096) {
         uintptr_t phys = pmm_alloc_frame();
         vmm_map_page_pml4(task_current()->cr3, page, phys, PAGE_PRESENT | PAGE_WRITABLE | PAGE_USER);
         kmemset((void *)phys_to_virt(phys), 0, 4096);
+    }
+    /* The compiler generates _start as a regular function and assumes RSP%16==8 at entry
+     * (simulating the post-CALL state where a return address was pushed). We're handing
+     * Ring 3 control via iretq with no implicit return address, so we must emulate it by
+     * placing a fake return address (0) at the top of the stack. This makes RSP%16==8 at
+     * _start entry, which propagates correct 16-byte alignment through all subsequent calls
+     * (required for SSE instructions like movaps that operate on stack slots). */
+    uint64_t user_stack_top = user_stack_top_aligned - 8;
+    /* Write fake return address (0) at user_stack_top via the user PML4 translation */
+    uintptr_t ret_phys = vmm_translate_pml4(task_current()->cr3, user_stack_top);
+    if (ret_phys) {
+        *(uint64_t *)phys_to_virt(ret_phys) = 0;
     }
     
     kprintf("[sched] Executing User Task '%s' at 0x%lx. Entering Ring 3...\n", task_current()->name, entry);

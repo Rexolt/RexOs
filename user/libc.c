@@ -206,10 +206,22 @@ int write_file(int fd, const void *buf, uint64_t count) {
  * tomb inicializalasra automatikusan memcpy/memset hivasokat emittal, a
  * BearSSL freestanding build pedig explicit hivatkozik rajuk. */
 
+/* Optimized memcpy: rep movsq for the bulk (8 byte/cycle), rep movsb for tail.
+ * On x86_64 this is ~8x faster than the byte loop and lets the CPU use
+ * fast string ops (ERMSB on modern Intel, FSRM on newer). */
 void *memcpy(void *dst, const void *src, uint64_t n) {
-    uint8_t       *d = (uint8_t *)dst;
-    const uint8_t *s = (const uint8_t *)src;
-    for (uint64_t i = 0; i < n; i++) d[i] = s[i];
+    uint64_t qwords = n >> 3;
+    uint64_t rest   = n & 7;
+    void *d = dst;
+    const void *s = src;
+    __asm__ volatile (
+        "rep movsq\n\t"
+        "mov %3, %%rcx\n\t"
+        "rep movsb"
+        : "+D"(d), "+S"(s), "+c"(qwords)
+        : "r"(rest)
+        : "memory"
+    );
     return dst;
 }
 
@@ -218,17 +230,56 @@ void *memmove(void *dst, const void *src, uint64_t n) {
     const uint8_t *s = (const uint8_t *)src;
     if (d == s || n == 0) return dst;
     if (d < s) {
-        for (uint64_t i = 0; i < n; i++) d[i] = s[i];
+        /* Forward copy: same as memcpy. */
+        return memcpy(dst, src, n);
     } else {
-        for (uint64_t i = n; i > 0; i--) d[i - 1] = s[i - 1];
+        /* Backward copy via rep movs with DF=1. */
+        uint64_t qwords = n >> 3;
+        uint64_t rest   = n & 7;
+        const uint8_t *send = s + n - 1;
+        uint8_t       *dend = d + n - 1;
+        /* Bytes first (the trailing ones). */
+        __asm__ volatile (
+            "std\n\t"
+            "rep movsb\n\t"
+            "cld"
+            : "+D"(dend), "+S"(send), "+c"(rest)
+            :: "memory"
+        );
+        /* Then qwords. Adjust pointers to last qword. */
+        if (qwords) {
+            const uint64_t *sq = (const uint64_t *)(s + (qwords - 1) * 8);
+            uint64_t       *dq = (uint64_t *)(d + (qwords - 1) * 8);
+            __asm__ volatile (
+                "std\n\t"
+                "rep movsq\n\t"
+                "cld"
+                : "+D"(dq), "+S"(sq), "+c"(qwords)
+                :: "memory"
+            );
+        }
     }
     return dst;
 }
 
+/* Optimized memset using rep stosq + rep stosb. */
 void *memset(void *dst, int value, uint64_t n) {
-    uint8_t *d = (uint8_t *)dst;
-    uint8_t  v = (uint8_t)value;
-    for (uint64_t i = 0; i < n; i++) d[i] = v;
+    uint8_t v = (uint8_t)value;
+    uint64_t v64 = (uint64_t)v;
+    v64 |= v64 << 8;
+    v64 |= v64 << 16;
+    v64 |= v64 << 32;
+    uint64_t qwords = n >> 3;
+    uint64_t rest   = n & 7;
+    void *d = dst;
+    __asm__ volatile (
+        "rep stosq\n\t"
+        "mov %3, %%rcx\n\t"
+        "rep stosb"
+        : "+D"(d), "+c"(qwords)
+        : "a"(v64), "r"(rest)
+        : "memory"
+    );
     return dst;
 }
 

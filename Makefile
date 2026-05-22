@@ -295,15 +295,29 @@ $(BUILD)/font_data.o: third_party/fonts/dejavu_mono.ttf
 	@echo "  BIN  $< -> $@"
 	@cd third_party/fonts && $(LD) -r -b binary -o $(abspath $@) dejavu_mono.ttf
 
-$(BUILD)/desktop.elf: user/desktop.c user/http.h user/font.h \
-                      $(BUILD)/libc.o $(BUILD)/http.o $(BUILD)/tls.o $(BUILD)/ca_bundle.o \
+# --- Modular desktop environment (user/desktop/*.c) ---
+DESKTOP_SRCS := user/desktop/main.c user/desktop/render.c user/desktop/wm.c \
+                user/desktop/taskbar.c user/desktop/icons.c user/desktop/apps.c \
+                user/desktop/app_browser.c
+DESKTOP_OBJS := $(DESKTOP_SRCS:user/desktop/%.c=$(BUILD)/desktop_%.o)
+
+$(BUILD)/desktop_%.o: user/desktop/%.c user/desktop/desktop.h user/desktop/theme.h \
+                      user/libc.h user/font.h user/http.h
+	@mkdir -p $(BUILD)
+	@echo "  CC   $<"
+	@$(CC) $(USER_FONT_CFLAGS) -I$(BEARSSL_DIR)/inc -Iuser -c $< -o $@
+
+$(BUILD)/desktop.elf: $(DESKTOP_OBJS) \
+                      $(BUILD)/libc.o \
+                      $(BUILD)/http.o $(BUILD)/tls.o $(BUILD)/ca_bundle.o \
                       $(BUILD)/font.o $(BUILD)/font_stb.o $(BUILD)/math_min.o $(BUILD)/font_data.o \
                       $(BEARSSL_USER_LIB)
 	@mkdir -p $(BUILD)
-	@echo "  CC   user/desktop.c (with HTTPS + TTF)"
+	@echo "  LD   $@ (RexOS Desktop)"
 	@$(CC) $(USER_FONT_CFLAGS) -static -Wl,-e,_start -Wl,--build-id=none \
-	    user/desktop.c \
-	    $(BUILD)/libc.o $(BUILD)/http.o $(BUILD)/tls.o $(BUILD)/ca_bundle.o \
+	    $(DESKTOP_OBJS) \
+	    $(BUILD)/libc.o \
+	    $(BUILD)/http.o $(BUILD)/tls.o $(BUILD)/ca_bundle.o \
 	    $(BUILD)/font.o $(BUILD)/font_stb.o $(BUILD)/math_min.o $(BUILD)/font_data.o \
 	    $(BEARSSL_USER_LIB) \
 	    -o $@
