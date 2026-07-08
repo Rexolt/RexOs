@@ -139,7 +139,9 @@ static void frame(void) {
         fps_frames = 0;
     }
 
-    /* Render */
+    /* Advance animations, then render */
+    wm_animate();
+
     render_wallpaper();
     wm_render_all();
     tb_render();

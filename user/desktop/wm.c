@@ -58,6 +58,8 @@ window_t *wm_open(const app_def_t *app) {
     w->app = app;
     w->state = 0;
     w->dragging = 0;
+    w->anim = 0;        /* slide + fade in from 0 */
+    w->closing = 0;
     w->icon = app->icon;
     /* Title from app name */
     int i = 0;
@@ -113,10 +115,24 @@ void wm_toggle_minimize(window_t *w) {
     if (!w || !w->used) return;
     if (w->minimized) {
         w->minimized = 0;
+        w->anim = 0;        /* re-play the slide-in on restore */
         wm_focus(w);
     } else {
         w->minimized = 1;
         w->focused = 0;
+    }
+}
+
+/* Advance each window's open/restore animation by one frame. Called once per
+ * frame from the main loop before rendering. */
+void wm_animate(void) {
+    for (int i = 0; i < s_z_count; i++) {
+        window_t *w = &s_pool[s_z[i]];
+        if (!w->used || w->minimized) continue;
+        if (w->anim < 255) {
+            w->anim += 28;
+            if (w->anim > 255) w->anim = 255;
+        }
     }
 }
 
@@ -176,9 +192,39 @@ static int titlebar_hit(window_t *w, int mx, int my, int *which) {
     return 0;
 }
 
+/* Draw a macOS-style traffic-light button: filled circle, and on hover a dark
+ * glyph (× / − / +) so the action is legible. */
+static void titlebar_button(int bx, int by, int bs, uint32_t col, int glyph, int hovered) {
+    rd_rounded(bx, by, bs, bs, 3, col);
+    if (!hovered) return;
+    int cx = bx + bs / 2, cy = by + bs / 2;
+    uint32_t g = 0x1A1A1A;
+    if (glyph == 0) {          /* minimize: horizontal bar */
+        rd_rect(cx - 3, cy, 7, 1, g);
+    } else if (glyph == 1) {   /* maximize: plus */
+        rd_rect(cx - 3, cy, 7, 1, g);
+        rd_rect(cx, cy - 3, 1, 7, g);
+    } else {                   /* close: x */
+        for (int i = -2; i <= 2; i++) {
+            rd_pixel(cx + i, cy + i, g);
+            rd_pixel(cx + i, cy - i, g);
+        }
+    }
+}
+
 /* ----- Per-window rendering ------------------------------------------------ */
 static void render_window(window_t *w) {
     if (!w->used || !w->visible || w->minimized) return;
+
+    /* Open/restore animation: slide up a few px and veil-fade from the
+     * wallpaper. We temporarily offset w->y so every sub-element (shadow,
+     * body, titlebar, app content via wm_content_rect) moves together, then
+     * restore it so hit-testing keeps using the real position. */
+    int anim = w->anim;
+    if (anim > 255) anim = 255;
+    int saved_y = w->y;
+    int yoff = ((255 - anim) * 10) / 255;
+    w->y += yoff;
 
     /* Soft drop shadow */
     rd_shadow(w->x, w->y, w->w, w->h, WIN_RADIUS, WIN_SHADOW_SPREAD);
@@ -192,9 +238,17 @@ static void render_window(window_t *w) {
     /* Border */
     rd_rounded_outline(w->x, w->y, w->w, w->h, WIN_RADIUS, border_col);
 
-    /* Titlebar (clip to top portion of rounded rect) */
+    /* Titlebar (clip to top portion of rounded rect). Subtle vertical gradient
+     * over the flat fill for depth, plus a 1px inner highlight along the top. */
     rd_set_clip(w->x, w->y, w->w, WIN_TITLEBAR_H);
     rd_rounded(w->x, w->y, w->w, WIN_TITLEBAR_H + WIN_RADIUS, WIN_RADIUS, titlebar_col);
+    rd_blend_rect(w->x + WIN_RADIUS, w->y, w->w - 2 * WIN_RADIUS, WIN_TITLEBAR_H,
+                  0xFFFFFF, w->focused ? 10 : 4);
+    rd_blend_rect(w->x + WIN_RADIUS, w->y + 1, w->w - 2 * WIN_RADIUS, 1, 0xFFFFFF, 26);
+    if (w->focused) {
+        /* Faint accent glow line just under the titlebar for the active window. */
+        rd_blend_rect(w->x + 1, w->y + WIN_TITLEBAR_H - 2, w->w - 2, 1, COL_ACCENT, 40);
+    }
     /* Bottom border line of titlebar */
     rd_rect(w->x + 1, w->y + WIN_TITLEBAR_H - 1, w->w - 2, 1, COL_WIN_BORDER);
     rd_clear_clip();
@@ -208,15 +262,16 @@ static void render_window(window_t *w) {
     int ty = w->y + WIN_TITLEBAR_H / 2 + 4;
     rd_text(tx, ty, w->title, UI_PX, title_text);
 
-    /* Buttons */
+    /* Buttons (with hover glyphs) */
     int bx, by, bs, gap;
     titlebar_btn_rects(w, &bx, &by, &bs, &gap);
-    /* close */
-    rd_rounded(bx, by, bs, bs, 3, COL_BTN_CLOSE);
-    /* maximize */
-    rd_rounded(bx - bs - gap, by, bs, bs, 3, COL_BTN_MAX);
-    /* minimize */
-    rd_rounded(bx - 2 * (bs + gap), by, bs, bs, 3, COL_BTN_MIN);
+    int mx = g_mouse.x, my = g_mouse.y;
+    titlebar_button(bx, by, bs, COL_BTN_CLOSE, 2,
+                    pt_in_rect(mx, my, bx, by, bs, bs));
+    titlebar_button(bx - bs - gap, by, bs, COL_BTN_MAX, 1,
+                    pt_in_rect(mx, my, bx - bs - gap, by, bs, bs));
+    titlebar_button(bx - 2 * (bs + gap), by, bs, COL_BTN_MIN, 0,
+                    pt_in_rect(mx, my, bx - 2 * (bs + gap), by, bs, bs));
 
     /* Render content via app callback - clip to content area */
     int cx, cy, cw, ch;
@@ -224,6 +279,15 @@ static void render_window(window_t *w) {
     rd_set_clip(cx, cy, cw, ch);
     if (w->app && w->app->on_render) w->app->on_render(w);
     rd_clear_clip();
+
+    /* Veil fade: composite the wallpaper base tone over the whole window with
+     * decreasing alpha so it appears to emerge from the desktop. */
+    if (anim < 255) {
+        uint8_t veil = (uint8_t)(((255 - anim) * 180) / 255);
+        rd_blend_rounded(w->x, w->y, w->w, w->h, WIN_RADIUS, COL_BG_BOT, veil);
+    }
+
+    w->y = saved_y;
 }
 
 void wm_render_all(void) {

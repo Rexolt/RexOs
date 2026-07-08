@@ -6,15 +6,19 @@ void ipv4_receive(net_device_t *dev, const ip4_header_t *ip, uint32_t len) {
     if (ip->version != 4) return;
     
     uint8_t header_len = ip->ihl * 4;
-    if (len < header_len) return;
-    
+    if (header_len < sizeof(ip4_header_t) || len < header_len) return;
+
     /* Calculate checksum to verify */
     uint16_t csum = net_checksum(ip, header_len);
     if (csum != 0) {
         /* Drop bad packet */
         return;
     }
-    
+
+    /* Fragmentált csomagot nem támogatunk: MF flag vagy nem-nulla offset
+     * esetén eldobjuk, különben a felsőbb réteg fél-csomagot parse-olna. */
+    if (ntohs(ip->frag_off) & 0x3FFF) return;
+
     /* Is it for us? Accept limited broadcast too: DHCP replies arrive before
      * the interface owns an address, so they target 255.255.255.255. */
     bool is_broadcast = ip->dest_ip.ip[0] == 255 && ip->dest_ip.ip[1] == 255 &&
@@ -24,7 +28,12 @@ void ipv4_receive(net_device_t *dev, const ip4_header_t *ip, uint32_t len) {
         return;
     }
     
-    uint32_t payload_len = ntohs(ip->length) - header_len;
+    /* Total length validálás: ha kisebb mint a fejléc, a csomag sérült.
+     * Az Ethernet minimum frame-padding miatt len > total_length előfordul,
+     * ilyenkor a total_length a mérvadó. */
+    uint16_t total_len = ntohs(ip->length);
+    if (total_len < header_len) return;
+    uint32_t payload_len = (uint32_t)total_len - header_len;
     if (payload_len > len - header_len) payload_len = len - header_len;
     
     if (ip->protocol == IPV4_PROTO_ICMP) {

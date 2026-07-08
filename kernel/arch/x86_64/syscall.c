@@ -20,9 +20,15 @@ extern uint64_t pit_ticks(void);
 #define SYS_NET_RECV    23
 #define SYS_TIME        24
 #define SYS_NET_CLOSE   25
+#define SYS_RANDOM      26
 
 #define PIT_HZ 100
-#define NET_CONNECT_TIMEOUT_TICKS (3 * PIT_HZ)
+#define NET_CONNECT_TIMEOUT_TICKS (10 * PIT_HZ)
+#define NET_DHCP_WAIT_TICKS       (5 * PIT_HZ)
+
+/* net_recv visszatérési értékek (libc.h-val szinkronban):
+ *   >0 adat, 0 = (még) nincs adat, -1 hiba, -2 = kapcsolat lezárva (EOF). */
+#define NET_RECV_EOF ((uint64_t)-2)
 
 #define MSR_EFER    0xC0000080
 #define MSR_STAR    0xC0000081
@@ -45,14 +51,54 @@ static inline uint64_t rdmsr(uint32_t msr) {
 
 /* Felhasználói tér-beli pointer ellenőrzés (alapvető range-validáció).
  * Megakadályozza, hogy user-space kód kernel memóriacímet adjon át syscall-ban.
- * Az x86_64 canonical user space felső határa: 0x00007fffffffffff.
- * FONTOS: lap-szintű validáció (vmm_translate) nincs; ez csak address range ellenőrzés. */
+ * Az x86_64 canonical user space felső határa: 0x00007fffffffffff. */
 static inline bool uptr_ok(uint64_t ptr, uint64_t len)
 {
     if (!ptr) return false;
     if (ptr > 0x00007fffffffffffULL) return false;
     if (len && (ptr + len < ptr || ptr + len > 0x00007fffffffffffULL + 1ULL)) return false;
     return true;
+}
+
+/* Lap-szintű user pointer validáció: a range minden érintett lapja legyen
+ * ténylegesen bemappelve a hívó task címterébe. E nélkül a user egy nem
+ * mappelt címmel kernel page faultot (= DoS) tudna kiváltani. */
+static bool uptr_mapped(uint64_t ptr, uint64_t len)
+{
+    if (!uptr_ok(ptr, len)) return false;
+    task_t *t = task_current();
+    if (!t) return false;
+    uint64_t first = ptr & ~0xFFFULL;
+    uint64_t last  = (ptr + (len ? len - 1 : 0)) & ~0xFFFULL;
+    for (uint64_t page = first; ; page += 0x1000) {
+        if (!vmm_translate_pml4(t->cr3, page)) return false;
+        if (page == last) break;
+    }
+    return true;
+}
+
+/* Korlátos user string másolás kernel pufferbe. A NUL-t is a mappelt
+ * tartományon belül keressük, laponként validálva. Visszatérés: hossz,
+ * vagy -1 ha érvénytelen a pointer / túl hosszú a string. */
+static int copy_user_string(uint64_t uptr, char *dst, uint64_t dst_max)
+{
+    if (!dst_max || !uptr_ok(uptr, 1)) return -1;
+    task_t *t = task_current();
+    if (!t) return -1;
+
+    uint64_t checked_page = 1; /* sosem lap-igazított -> első kör validál */
+    for (uint64_t i = 0; i < dst_max; i++) {
+        uint64_t addr = uptr + i;
+        uint64_t page = addr & ~0xFFFULL;
+        if (page != checked_page) {
+            if (addr > 0x00007fffffffffffULL) return -1;
+            if (!vmm_translate_pml4(t->cr3, page)) return -1;
+            checked_page = page;
+        }
+        dst[i] = *(const char *)addr;
+        if (!dst[i]) return (int)i;
+    }
+    return -1; /* nincs NUL a limiten belül */
 }
 
 void syscall_init(void) {
@@ -92,12 +138,12 @@ uint64_t syscall_handler(uint64_t nr, uint64_t arg1, uint64_t arg2, uint64_t arg
     if (nr == 0) { // sys_write
         // RDI = arg1 (fd), RSI = arg2 (buf), RDX = arg3 (len)
         if (arg1 == 1 || arg1 == 2) {  /* stdout / stderr */
-            if (!uptr_ok(arg2, arg3)) return (uint64_t)-1;
+            if (!uptr_mapped(arg2, arg3)) return (uint64_t)-1;
             /* User buffer NEM null-terminált; tartsuk be a megadott hosszt. */
             kprintf("%.*s", (int)arg3, (const char *)arg2);
             return arg3;
         } else if (arg1 >= 3 && arg1 < 16) {  /* fájl fd */
-            if (!uptr_ok(arg2, arg3)) return (uint64_t)-1;
+            if (!uptr_mapped(arg2, arg3)) return (uint64_t)-1;
             task_t *t = task_current();
             if (t->fd_table[arg1]) {
                 uint64_t written = vfs_write(t->fd_table[arg1],
@@ -118,7 +164,7 @@ uint64_t syscall_handler(uint64_t nr, uint64_t arg1, uint64_t arg2, uint64_t arg
         return 0;
     } else if (nr == 3) { // sys_read
         if (arg1 == 0) { // stdin
-            if (!uptr_ok(arg2, arg3)) return (uint64_t)-1;
+            if (!uptr_mapped(arg2, arg3)) return (uint64_t)-1;
             char *buf = (char *)arg2;
             uint64_t count = arg3;
             uint64_t read = 0;
@@ -131,7 +177,7 @@ uint64_t syscall_handler(uint64_t nr, uint64_t arg1, uint64_t arg2, uint64_t arg
             }
             return read;
         } else if (arg1 >= 3 && arg1 < 16) {
-            if (!uptr_ok(arg2, arg3)) return (uint64_t)-1;
+            if (!uptr_mapped(arg2, arg3)) return (uint64_t)-1;
             task_t *t = task_current();
             if (t->fd_table[arg1]) {
                 uint64_t bytes = vfs_read(t->fd_table[arg1], t->fd_offset[arg1], arg3, (uint8_t *)arg2);
@@ -141,9 +187,9 @@ uint64_t syscall_handler(uint64_t nr, uint64_t arg1, uint64_t arg2, uint64_t arg
         }
         return 0;
     } else if (nr == 4) { // sys_get_fb
-        if (!uptr_ok(arg1, sizeof(uint64_t)) ||
-            !uptr_ok(arg2, sizeof(uint64_t)) ||
-            !uptr_ok(arg3, sizeof(uint64_t))) return (uint64_t)-1;
+        if (!uptr_mapped(arg1, sizeof(uint64_t)) ||
+            !uptr_mapped(arg2, sizeof(uint64_t)) ||
+            !uptr_mapped(arg3, sizeof(uint64_t))) return (uint64_t)-1;
         uint64_t *width = (uint64_t *)arg1;
         uint64_t *height = (uint64_t *)arg2;
         uint64_t *pitch = (uint64_t *)arg3;
@@ -162,8 +208,8 @@ uint64_t syscall_handler(uint64_t nr, uint64_t arg1, uint64_t arg2, uint64_t arg
         
         return fb_vaddr;
     } else if (nr == 5) { // sys_spawn
-        if (!uptr_ok(arg1, 1)) return (uint64_t)-1;
-        const char *path = (const char *)arg1;
+        char path[128];
+        if (copy_user_string(arg1, path, sizeof(path)) < 0) return (uint64_t)-1;
         vfs_node_t *node = vfs_lookup(path);
         if (!node) node = vfs_finddir(fs_root, path);
         if (node) {
@@ -172,8 +218,8 @@ uint64_t syscall_handler(uint64_t nr, uint64_t arg1, uint64_t arg2, uint64_t arg
         }
         return (uint64_t)-1;
     } else if (nr == 6) { // sys_open(path, flags)
-        if (!uptr_ok(arg1, 1)) return (uint64_t)-1;
-        const char *path = (const char *)arg1;
+        char path[128];
+        if (copy_user_string(arg1, path, sizeof(path)) < 0) return (uint64_t)-1;
         uint64_t oflags = arg2;   /* O_CREAT = 0x40 */
         vfs_node_t *node;
         if (path[0] == '/') {
@@ -215,7 +261,7 @@ uint64_t syscall_handler(uint64_t nr, uint64_t arg1, uint64_t arg2, uint64_t arg
         }
         return (uint64_t)-1;
     } else if (nr == 7) { // sys_getdents
-        if (!uptr_ok(arg2, sizeof(dirent_t))) return (uint64_t)-1;
+        if (!uptr_mapped(arg2, sizeof(dirent_t))) return (uint64_t)-1;
         task_t *t = task_current();
         if (arg1 >= 3 && arg1 < 16 && t->fd_table[arg1]) {
             dirent_t *user_dir = (dirent_t *)arg2;
@@ -268,7 +314,7 @@ uint64_t syscall_handler(uint64_t nr, uint64_t arg1, uint64_t arg2, uint64_t arg
         }
         return 0; /* nincs adat */
     } else if (nr == 12) { // sys_mouse
-        if (!uptr_ok(arg1, 3 * sizeof(uint32_t))) return (uint64_t)-1;
+        if (!uptr_mapped(arg1, 3 * sizeof(uint32_t))) return (uint64_t)-1;
         uint32_t *out = (uint32_t *)arg1;
         mouse_state_t ms;
         mouse_get_state(&ms);
@@ -285,7 +331,7 @@ uint64_t syscall_handler(uint64_t nr, uint64_t arg1, uint64_t arg2, uint64_t arg
          *   out[40..43]   = sector_size  (u32)
          *   out[44]       = writable (u8: 0/1)
          */
-        if (!uptr_ok(arg2, 45)) return (uint64_t)-1;
+        if (!uptr_mapped(arg2, 45)) return (uint64_t)-1;
         size_t idx = (size_t)arg1;
         block_device_t *bd = block_at(idx);
         if (!bd) return (uint64_t)-1;
@@ -308,7 +354,7 @@ uint64_t syscall_handler(uint64_t nr, uint64_t arg1, uint64_t arg2, uint64_t arg
          *   out[6..7]   = vendor (u16)
          *   out[8..9]   = device (u16)
          */
-        if (!uptr_ok(arg2, 10)) return (uint64_t)-1;
+        if (!uptr_mapped(arg2, 10)) return (uint64_t)-1;
         size_t idx = (size_t)arg1;
         const pci_device_t *p = pci_device_at(idx);
         if (!p) return (uint64_t)-1;
@@ -319,8 +365,8 @@ uint64_t syscall_handler(uint64_t nr, uint64_t arg1, uint64_t arg2, uint64_t arg
         *(uint16_t *)(out + 8) = p->device;
         return 0;
     } else if (nr == 17) { // sys_mkdir(path)
-        if (!uptr_ok(arg1, 1)) return (uint64_t)-1;
-        const char *path = (const char *)arg1;
+        char path[128];
+        if (copy_user_string(arg1, path, sizeof(path)) < 0) return (uint64_t)-1;
         vfs_node_t *parent = fs_root;
         const char *dname = path;
         const char *last_slash = NULL;
@@ -341,8 +387,8 @@ uint64_t syscall_handler(uint64_t nr, uint64_t arg1, uint64_t arg2, uint64_t arg
         return (*dname && vfs_mkdir_node(parent, dname) == 0) ? 0 : (uint64_t)-1;
 
     } else if (nr == 18) { // sys_unlink(path)
-        if (!uptr_ok(arg1, 1)) return (uint64_t)-1;
-        const char *path = (const char *)arg1;
+        char path[128];
+        if (copy_user_string(arg1, path, sizeof(path)) < 0) return (uint64_t)-1;
         vfs_node_t *parent = fs_root;
         const char *fname = path;
         const char *last_slash = NULL;
@@ -387,8 +433,14 @@ uint64_t syscall_handler(uint64_t nr, uint64_t arg1, uint64_t arg2, uint64_t arg
         return (uint64_t)-1;
 
     } else if (nr == 21) { /* SYS_NET_CONNECT(hostname_ptr, port) -> socket_id */
-        if (!uptr_ok(arg1, 1)) return (uint64_t)-1;
-        const char *hostname = (const char *)arg1;
+        /* Hostname bemásolása korlátos kernel pufferbe: a user string hossza
+         * nem megbízható, és a kernel nem olvashat NUL-ig validálatlan user
+         * memóriát (stack overflow / oldalhatár-átfutás ellen). */
+        char hostname[254];
+        if (copy_user_string(arg1, hostname, sizeof(hostname)) < 0) {
+            kprintf("[net] invalid hostname pointer or too long\n");
+            return (uint64_t)-1;
+        }
         uint16_t port = (uint16_t)arg2;
 
         net_device_t *dev = net_get_default_dev();
@@ -396,7 +448,7 @@ uint64_t syscall_handler(uint64_t nr, uint64_t arg1, uint64_t arg2, uint64_t arg
 
         /* Várakozás a DHCP-re (IP != 0.0.0.0) max 5 másodpercig */
         uint64_t dhcp_start = pit_ticks();
-        while (dev->ip.ip[0] == 0 && pit_ticks() - dhcp_start < 5000) {
+        while (dev->ip.ip[0] == 0 && pit_ticks() - dhcp_start < NET_DHCP_WAIT_TICKS) {
             __asm__ volatile("pause");
         }
         if (dev->ip.ip[0] == 0) {
@@ -426,12 +478,15 @@ uint64_t syscall_handler(uint64_t nr, uint64_t arg1, uint64_t arg2, uint64_t arg
         tcp_socket_t *sock = tcp_connect(dev, &dest_ip, port);
         if (!sock) return (uint64_t)-1;
 
-        /* Várakozás valódi óra alapján: max 3 másodperc a 100 Hz-es PIT-tel.
+        /* Várakozás valódi óra alapján a 100 Hz-es PIT-tel.
          * Ne hozzunk létre új socketet retry-ként: az eredeti SYN ARP miss esetén
-         * pending queue-ba kerül és az ARP válasz után automatikusan kiküldődik. */
+         * pending queue-ba kerül és az ARP válasz után automatikusan kiküldődik.
+         * A tcp_poll() hajtja a SYN-retransmitet, ha az első elveszett. */
         uint64_t start_tick = pit_ticks();
         while (pit_ticks() - start_tick < NET_CONNECT_TIMEOUT_TICKS &&
                sock->state == TCP_SYN_SENT) {
+            net_poll();
+            tcp_poll();
             __asm__ volatile("pause");
         }
 
@@ -446,22 +501,26 @@ uint64_t syscall_handler(uint64_t nr, uint64_t arg1, uint64_t arg2, uint64_t arg
     } else if (nr == 22) { /* SYS_NET_SEND(socket_id, buf, len) */
         tcp_socket_t *sock = (tcp_socket_t *)(uintptr_t)arg1;
         if (!tcp_socket_is_valid(sock)) return (uint64_t)-1;
-        if (!uptr_ok(arg2, arg3)) return (uint64_t)-1;
+        if (arg3 > (1u << 20)) return (uint64_t)-1; /* józan felső korlát */
+        if (!uptr_mapped(arg2, arg3)) return (uint64_t)-1;
         tcp_send_data(sock, (const void *)arg2, (uint32_t)arg3);
         return arg3;
 
     } else if (nr == 23) { /* SYS_NET_RECV(socket_id, buf, max_len) -> bytes */
         tcp_socket_t *sock = (tcp_socket_t *)(uintptr_t)arg1;
         if (!tcp_socket_is_valid(sock)) return (uint64_t)-1;
-        if (!uptr_ok(arg2, arg3)) return (uint64_t)-1;
+        if (!uptr_mapped(arg2, arg3)) return (uint64_t)-1;
 
         /* Várakozás adatra vagy a kapcsolat lezárására. PIT-alapú timeout,
-         * így a TLS handshake apró recv-jeinél is determinisztikus a viselkedés. */
+         * így a TLS handshake apró recv-jeinél is determinisztikus a viselkedés.
+         * A tcp_poll() közben az elveszett kimenő szegmenseket újraküldi. */
         uint64_t recv_start = pit_ticks();
         const uint64_t RECV_TIMEOUT_TICKS = 5 * PIT_HZ; /* ~5 másodperc */
         while (sock->rx_len == 0 &&
                (sock->state == TCP_ESTABLISHED || sock->state == TCP_SYN_SENT) &&
                pit_ticks() - recv_start < RECV_TIMEOUT_TICKS) {
+            net_poll();
+            tcp_poll();
             __asm__ volatile("pause");
         }
 
@@ -471,7 +530,11 @@ uint64_t syscall_handler(uint64_t nr, uint64_t arg1, uint64_t arg2, uint64_t arg
         cli();
         uint32_t avail = sock->rx_len;
         if (avail == 0) {
+            tcp_state_t st = sock->state;
             sti();
+            /* Lezárt kapcsolat + üres puffer = EOF. Így a userspace meg tudja
+             * különböztetni a "még nincs adat" (0) esettől, és nem vár tovább. */
+            if (st != TCP_ESTABLISHED && st != TCP_SYN_SENT) return NET_RECV_EOF;
             return 0;
         }
         uint32_t copy = avail;
@@ -484,12 +547,16 @@ uint64_t syscall_handler(uint64_t nr, uint64_t arg1, uint64_t arg2, uint64_t arg
                 sock->rx_buf[i] = sock->rx_buf[i + copy];
             }
         }
+        bool was_choked = (TCP_RX_BUF_SIZE - avail) < 2048; /* ablak ~zárva volt */
         sock->rx_len = remaining;
+        /* Ha a hirdetett ablak zárva/majdnem zárva volt, a peer áll és vár:
+         * küldjünk azonnal ablak-frissítő ACK-ot, hogy folytassa a küldést. */
+        if (was_choked) tcp_send_window_update(sock);
         sti();
         return copy;
 
     } else if (nr == 24) { /* SYS_TIME(out_ptr) */
-        if (!uptr_ok(arg1, sizeof(rtc_time_t))) return (uint64_t)-1;
+        if (!uptr_mapped(arg1, sizeof(rtc_time_t))) return (uint64_t)-1;
         rtc_get_time((rtc_time_t *)arg1);
         return 0;
 
@@ -498,6 +565,45 @@ uint64_t syscall_handler(uint64_t nr, uint64_t arg1, uint64_t arg2, uint64_t arg
         if (!tcp_socket_is_valid(sock)) return (uint64_t)-1;
         tcp_release(sock);
         return 0;
+
+    } else if (nr == SYS_RANDOM) { /* SYS_RANDOM(buf, len) - kernel entrópia */
+        if (arg2 == 0 || arg2 > 256) return (uint64_t)-1;
+        if (!uptr_mapped(arg1, arg2)) return (uint64_t)-1;
+        uint8_t *out = (uint8_t *)arg1;
+
+        /* RDRAND támogatás detektálása (CPUID.1:ECX bit 30). */
+        uint32_t eax, ebx, ecx, edx;
+        __asm__ volatile("cpuid" : "=a"(eax), "=b"(ebx), "=c"(ecx), "=d"(edx)
+                                 : "a"(1), "c"(0));
+        bool has_rdrand = (ecx >> 30) & 1;
+
+        for (uint64_t i = 0; i < arg2; i += 8) {
+            uint64_t r = 0;
+            if (has_rdrand) {
+                /* Max 10 próbálkozás RDRAND-dal (a HW átmenetileg kimerülhet). */
+                for (int t = 0; t < 10; t++) {
+                    uint8_t ok;
+                    __asm__ volatile("rdrand %0; setc %1" : "=r"(r), "=qm"(ok));
+                    if (ok) break;
+                    r = 0;
+                }
+            }
+            /* TSC-alapú keverés minden esetben (RDRAND kimenettel XOR-olva,
+             * RDRAND hiányában ez az egyetlen forrás - gyengébb, de a PIT
+             * IRQ-k és a futásidő-jitter miatt nem konstans). */
+            uint32_t lo, hi;
+            __asm__ volatile("rdtsc" : "=a"(lo), "=d"(hi));
+            uint64_t tsc = ((uint64_t)hi << 32) | lo;
+            tsc ^= tsc >> 21;
+            tsc *= 0x9E3779B97F4A7C15ULL; /* golden-ratio mix */
+            tsc ^= pit_ticks() * 0xC2B2AE3D27D4EB4FULL;
+            r ^= tsc;
+
+            uint64_t chunk = arg2 - i;
+            if (chunk > 8) chunk = 8;
+            kmemcpy(out + i, &r, chunk);
+        }
+        return arg2;
     }
 
     kprintf("[syscall] Unknown syscall %lu from task '%s'\n", nr, task_current()->name);

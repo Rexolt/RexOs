@@ -55,6 +55,7 @@ void rd_shadow(int x, int y, int w, int h, int r, int spread);
 void rd_line(int x0, int y0, int x1, int y1, uint32_t color);
 void rd_circle_fill(int cx, int cy, int r, uint32_t color);
 void rd_blend_rect(int x, int y, int w, int h, uint32_t color, uint8_t alpha);
+void rd_blend_rounded(int x, int y, int w, int h, int r, uint32_t color, uint8_t alpha);
 uint32_t rd_lerp_color(uint32_t a, uint32_t b, int t /* 0..255 */);
 
 /* Convenience text drawing (uses font subsystem). All draw on g_back. */
@@ -98,6 +99,10 @@ struct window {
     const app_def_t *app;
     void         *state;     /* per-app state (allocated) */
     int           focused;
+    /* Open/close/minimize animation. anim 0..255 (255 = fully shown).
+     * closing=1 means "run anim to 0 then tear down". */
+    int           anim;
+    int           closing;
 };
 
 void     wm_init(void);
@@ -105,6 +110,7 @@ window_t *wm_open(const app_def_t *app);  /* opens new instance */
 void     wm_close(window_t *w);
 void     wm_focus(window_t *w);
 void     wm_toggle_minimize(window_t *w);
+void     wm_animate(void);       /* advance per-window animations one frame */
 void     wm_render_all(void);
 void     wm_input_frame(void);   /* dispatches mouse/kbd to topmost focused */
 window_t *wm_topmost_at(int x, int y);

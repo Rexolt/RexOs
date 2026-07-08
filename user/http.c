@@ -29,8 +29,8 @@ static void hdbg_int(int v) {
 #define HTTP_PATH_MAX 256
 #define HTTP_RAW_INITIAL 4096
 #define HTTP_HEADER_SLOP 8192
-#define HTTP_RESPONSE_MAX 131072
-#define HTTP_RECV_CHUNK 512
+#define HTTP_RESPONSE_MAX (256 * 1024) /* a böngésző BR_BODY_MAX-ával összhangban */
+#define HTTP_RECV_CHUNK 2048
 #define HTTP_IDLE_TIMEOUT_TICKS 300
 #define HTTP_TOTAL_TIMEOUT_TICKS 1000
 
@@ -420,6 +420,7 @@ static int h_read_response(http_conn_t *conn, char **raw_io, int *raw_cap_io, in
         char chunk[HTTP_RECV_CHUNK];
         int bytes = hc_recv(conn, chunk, HTTP_RECV_CHUNK);
         uint64_t now = get_ticks();
+        if (bytes == NET_EOF) break;              /* kapcsolat lezárva: kész */
         if (bytes < 0) return HTTP_ERR_RECV;
         if (bytes == 0) {
             if (hdr_len >= 0 && clen >= 0 && total - hdr_len >= clen) break;

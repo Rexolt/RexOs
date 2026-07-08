@@ -27,10 +27,18 @@ csak a meglévő hibákat javítjuk.
 - [x] `tcp_receive` hirdetett `window_size = free(rx_buf)`, így nem invitál
       olyan adatot a peer, amit elveszítenénk. `TCP_RX_BUF_SIZE` 8 KB -> 32 KB,
       TLS rekord (16 KB) + handshake fragment elfér.
-- [ ] Retransmission timer (RFC 6298 egyszerűsített): tx_buf + RTO
-- [ ] `rx_buf` ring-buffer (a jelenlegi memmove-os "consume" `O(n)`-es,
-      és teljes feltöltés esetén stallolja a kapcsolatot amíg a userspace
-      ki nem olvas)
+- [x] Retransmission timer (RFC 6298 egyszerűsített): tx_buf + RTO,
+      exponenciális backoff (`TCP_RTO_BASE_TICKS` << tries, max 6 próba).
+      A `tcp_poll()` hajtja a syscall várakozó ciklusokból (SYN és adat
+      retransmit is). ACK-feldolgozás (`tcp_handle_ack`) üríti a tx_buf-ot.
+- [x] RST kezelés (bejövő RST -> CLOSED; ismeretlen szegmensre RST válasz),
+      TCP checksum ellenőrzés RX oldalon, véletlen (TSC-alapú) ISN,
+      átfedő/duplikált szegmensek levágása, LAST_ACK állapot.
+- [x] rx_buf túlcsordulás javítva: ha a szegmens nem fér be, NEM nyugtázzuk
+      (korábban ACK-oltuk az eldobott byte-okat = adatvesztés). Ablak-frissítő
+      ACK megy, amikor a userspace kiolvassa a majdnem-teli buffert.
+- [ ] `rx_buf` ring-buffer (a jelenlegi memmove-os "consume" `O(n)`-es -
+      32 KB-os buffernél elfogadható, optimalizálási lehetőség)
 
 Tesztek a fázis végén:
 - `curl example.com` jellegű terhelés a böngészőből: 1 MB HTML letöltése
@@ -57,11 +65,9 @@ illesztése.
 - [x] **Userspace BearSSL build**: külön `libbearssl_user.a` (812 KB) `-fpie`,
       `-mno-red-zone`, freestanding flag-ekkel a PIE userspace ELF-be linkelhetően.
       Külön target: `make bearssl-user`.
-- [~] **Entropy forrás**: BearSSL PRNG-hez seed kell. Jelenleg `tls.c`
-      `tls_collect_entropy` rdtsc + `get_ticks()` + stack-cím-jitter keverékből
-      ad 32 byte-ot - **KRIPTOGRÁFIAILAG GYENGE**, csak skeleton. TODO:
-      `rdrand` (CPUID jelzi) + e1000 RX timing + PIT jitter SHA-256 kever (a
-      `br_hmac_drbg`-be az engine `inject_entropy`-jával beadva).
+- [x] **Entropy forrás**: kernel `SYS_RANDOM` syscall (26): RDRAND ha a CPU
+      támogatja (CPUID.1:ECX[30]), TSC-alapú golden-ratio keveréssel XOR-olva.
+      A `tls_collect_entropy` erre épít, plusz userspace rdtsc/tick jitter.
 - [x] CA store: `tools/gen_ca_bundle.sh` lefutott, **121 trust anchor**
       (Mozilla CCADB / curl.se cacert.pem). `user/ca_bundle.c` ~270 KB,
       `build/ca_bundle.o` 82 KB. A script `sed`-del a brssl kimenetét

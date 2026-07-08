@@ -27,6 +27,7 @@
 #define SYS_NET_RECV    23
 #define SYS_TIME        24
 #define SYS_NET_CLOSE   25
+#define SYS_RANDOM      26
 
 #define O_RDONLY  0
 #define O_WRONLY  1
@@ -113,7 +114,12 @@ void   *memset(void *dst, int value, uint64_t n);
 int     memcmp(const void *a, const void *b, uint64_t n);
 uint64_t strlen(const char *s);
 
-/* Hálózat */
+/* Hálózat.
+ * net_recv szemantika: >0 = adat, 0 = (még) nincs adat (timeout),
+ * NET_ERR = hiba, NET_EOF = a kapcsolat lezárult és nincs több adat. */
+#define NET_ERR (-1)
+#define NET_EOF (-2)
+
 static inline uint64_t net_connect(const char *hostname, uint16_t port) {
     return syscall2(SYS_NET_CONNECT, (uint64_t)hostname, port);
 }
@@ -125,6 +131,12 @@ static inline int net_recv(uint64_t sock, void *buf, uint64_t max_len) {
 }
 static inline int net_close(uint64_t sock) {
     return (int)syscall1(SYS_NET_CLOSE, sock);
+}
+
+/* Kernel entrópia (RDRAND ha van, egyébként TSC-jitter keverés).
+ * Max 256 byte / hívás. Visszatérés: kiírt byte-ok vagy -1. */
+static inline int get_random(void *buf, uint64_t len) {
+    return (int)syscall2(SYS_RANDOM, (uint64_t)buf, len);
 }
 
 /* Idő */

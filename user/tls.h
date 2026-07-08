@@ -12,8 +12,8 @@
  *  Belül a BearSSL "client" engine fut, X.509 minimal verifier-rel a
  *  ca_bundle.c-ből származó trust anchor-okkal és SNI-vel.
  *
- *  Entrópia: jelenleg gyenge (rdtsc + tick + cím-jitter); TLS kulcscseréhez
- *  ez NEM elég, valódi rdrand/HW RNG kell - lásd TODO a tls.c-ben.
+ *  Entrópia: kernel SYS_RANDOM (RDRAND, ha a CPU támogatja, egyébként
+ *  TSC-keverés) + userspace jitter - lásd tls_collect_entropy a tls.c-ben.
  * ========================================================================== */
 #pragma once
 #include <stdint.h>
@@ -33,7 +33,8 @@ tls_ctx_t *tls_connect(const char *host, uint16_t port);
 /* Küld pontosan `len` byte-ot, vagy < 0 hibakód. */
 int  tls_send(tls_ctx_t *ctx, const void *buf, uint64_t len);
 
-/* Beolvas legfeljebb `max` byte-ot. 0 = peer lezárta, < 0 = hiba. */
+/* Beolvas legfeljebb `max` byte-ot. 0 = még nincs adat,
+ * NET_EOF (-2) = a peer szabályosan lezárta, egyéb < 0 = hiba. */
 int  tls_recv(tls_ctx_t *ctx, void *buf, uint64_t max);
 
 /* Lezárja a kapcsolatot, felszabadítja a kontextust. */

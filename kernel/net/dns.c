@@ -1,6 +1,13 @@
 /* =============================================================================
  *  RexOS - DNS Client (RFC 1035)
  *  Sends a DNS query via UDP port 53 and parses the response.
+ *
+ *  Biztonsági megjegyzések:
+ *    - A query ID minden lekérdezésnél új, TSC-alapú (ne lehessen vakon
+ *      hamis választ beadni egy fix ID-ra).
+ *    - A választ csak attól a szervertől fogadjuk el, akit kérdeztünk.
+ *    - A hostname hossza korlátozott (DNS_NAME_MAX), a wire-encode bounds-
+ *      ellenőrzött, így user-adott hosszú név nem tudja túlírni a puffert.
  * ========================================================================== */
 #include <rexos/net.h>
 #include <lib/printf.h>
@@ -8,6 +15,7 @@
 
 #define DNS_PORT       53
 #define DNS_LOCAL_PORT 1053
+#define DNS_NAME_MAX   253
 #define PIT_HZ         100
 #define DNS_TIMEOUT_TICKS (2 * PIT_HZ)   /* 2 seconds at the 100 Hz PIT rate */
 
@@ -23,8 +31,9 @@ typedef struct {
 
 /* Resolved IP storage (set by dns_receive callback) */
 static ip4_addr_t s_resolved_ip;
-static bool       s_resolved = false;
-static uint16_t   s_query_id = 0xBEEF;
+static volatile bool s_resolved = false;
+static uint16_t   s_query_id = 0;
+static ip4_addr_t s_query_server; /* akitől a választ várjuk */
 
 static bool ip4_is_zero(const ip4_addr_t *ip) {
     return ip->ip[0] == 0 && ip->ip[1] == 0 && ip->ip[2] == 0 && ip->ip[3] == 0;
@@ -37,24 +46,36 @@ static ip4_addr_t dns_server_for_device(const net_device_t *dev) {
     return fallback;
 }
 
+static uint16_t dns_new_query_id(void) {
+    uint32_t lo, hi;
+    __asm__ volatile("rdtsc" : "=a"(lo), "=d"(hi));
+    uint16_t id = (uint16_t)(lo ^ (lo >> 16) ^ hi);
+    if (id == 0) id = 0x1234; /* 0 kerülése (könnyebb debug) */
+    return id;
+}
+
 /* ---- Encode hostname into DNS wire format -------------------------------- */
-/* "example.com" -> \x07example\x03com\x00  */
-static uint32_t dns_encode_name(const char *hostname, uint8_t *out) {
+/* "example.com" -> \x07example\x03com\x00
+ * out_max a teljes kimeneti korlát; hiba (túl hosszú név/label) esetén 0. */
+static uint32_t dns_encode_name(const char *hostname, uint8_t *out, uint32_t out_max) {
     uint32_t total = 0;
     while (*hostname) {
         const char *dot = hostname;
         while (*dot && *dot != '.') dot++;
-        uint8_t len = (uint8_t)(dot - hostname);
-        out[total++] = len;
-        for (uint8_t i = 0; i < len; i++) out[total++] = hostname[i];
+        uint32_t len = (uint32_t)(dot - hostname);
+        if (len == 0 || len > 63) return 0;             /* üres/túl hosszú label */
+        if (total + 1 + len + 1 > out_max) return 0;    /* +1 záró root label */
+        out[total++] = (uint8_t)len;
+        for (uint32_t i = 0; i < len; i++) out[total++] = hostname[i];
         hostname = (*dot == '.') ? dot + 1 : dot;
     }
+    if (total == 0 || total + 1 > out_max) return 0;
     out[total++] = 0; /* Root label */
     return total;
 }
 
 /* ---- Send a DNS A-record query ------------------------------------------ */
-static void dns_send_query(net_device_t *dev, const char *hostname) {
+static bool dns_send_query(net_device_t *dev, const char *hostname) {
     uint8_t packet[512];
     uint32_t pos = 0;
 
@@ -67,26 +88,36 @@ static void dns_send_query(net_device_t *dev, const char *hostname) {
     hdr->arcount = 0;
     pos = sizeof(dns_header_t);
 
-    /* Encode the hostname */
-    pos += dns_encode_name(hostname, packet + pos);
+    /* Encode the hostname (bounded: QTYPE+QCLASS 4 byte-jának is maradnia kell) */
+    uint32_t name_len = dns_encode_name(hostname, packet + pos, sizeof(packet) - pos - 4);
+    if (!name_len) {
+        kprintf("[dns] invalid hostname\n");
+        return false;
+    }
+    pos += name_len;
 
     /* QTYPE=A (1), QCLASS=IN (1) */
     packet[pos++] = 0x00; packet[pos++] = 0x01;
     packet[pos++] = 0x00; packet[pos++] = 0x01;
 
     ip4_addr_t dns_server = dns_server_for_device(dev);
+    s_query_server = dns_server;
     udp_send(dev, &dns_server, DNS_LOCAL_PORT, DNS_PORT, packet, pos);
     kprintf("[dns] Query sent for '%s' via %d.%d.%d.%d (id=0x%x)\n",
             hostname,
             dns_server.ip[0], dns_server.ip[1], dns_server.ip[2], dns_server.ip[3],
             s_query_id);
+    return true;
 }
 
 /* ---- Parse DNS response -------------------------------------------------- */
-void dns_receive(net_device_t *dev, const uint8_t *data, uint32_t len, uint16_t src_port) {
+void dns_receive(net_device_t *dev, const ip4_addr_t *src_ip, const uint8_t *data, uint32_t len, uint16_t src_port) {
     (void)dev;
     if (src_port != DNS_PORT) return;
     if (len < sizeof(dns_header_t)) return;
+
+    /* Anti-spoofing: csak a megkérdezett szervertől fogadunk el választ. */
+    if (kmemcmp(src_ip->ip, s_query_server.ip, 4) != 0) return;
 
     const dns_header_t *hdr = (const dns_header_t *)data;
     uint16_t id = ntohs(hdr->id);
@@ -113,7 +144,7 @@ void dns_receive(net_device_t *dev, const uint8_t *data, uint32_t len, uint16_t 
 
     /* Skip the question section (qdcount questions) */
     uint16_t qdcount = ntohs(hdr->qdcount);
-    for (uint16_t q = 0; q < qdcount; q++) {
+    for (uint16_t q = 0; q < qdcount && pos < len; q++) {
         /* Skip the QNAME (sequence of labels ending in 0) */
         while (pos < len) {
             uint8_t label_len = data[pos++];
@@ -164,15 +195,26 @@ extern uint64_t pit_ticks(void);
 bool dns_resolve(net_device_t *dev, const char *hostname, ip4_addr_t *out_ip) {
     if (!hostname || hostname[0] == 0) return false;
 
+    /* Hossz-korlát: RFC 1035 szerint max 253 karakter. A hosszabb nevet itt
+     * utasítjuk el, mielőtt bármi wire-encode történne. */
+    uint32_t hlen = 0;
+    while (hostname[hlen] && hlen <= DNS_NAME_MAX) hlen++;
+    if (hlen > DNS_NAME_MAX) {
+        kprintf("[dns] hostname too long\n");
+        return false;
+    }
+
     for (int attempt = 0; attempt < 3; attempt++) {
         s_resolved = false;
-        dns_send_query(dev, hostname);
+        s_query_id = dns_new_query_id();
+        if (!dns_send_query(dev, hostname)) return false;
 
         /* Várakozás valódi óra alapján: 2 másodperc a 100 Hz-es PIT-tel. */
         uint64_t start_tick = pit_ticks();
 
         while (pit_ticks() - start_tick < DNS_TIMEOUT_TICKS) {
             if (s_resolved) break;
+            net_poll();
             __asm__ volatile("pause");
         }
 

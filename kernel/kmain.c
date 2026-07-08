@@ -508,6 +508,14 @@ void kmain(void)
         }
     }
 
+    /* Hálózati önteszt: csak akkor fut, ha a nettest.elf benne van az
+     * initrd-ben (NETTEST=1 build). Headless QEMU-tesztekhez való. */
+    vfs_node_t *nettest_node = vfs_finddir(fs_root, "nettest.elf");
+    if (nettest_node) {
+        kprintf("[kmain] nettest.elf found, spawning network self-test...\n");
+        task_spawn_user("nettest.elf", nettest_node);
+    }
+
     /* A kernel fő taszkja (kmain) befejezte a dolgát, nyugovóra térhet.
        Ezzel hivatalosan is átadjuk az irányítást a preemptív schedulernek
        és a User Mode folyamatoknak! */

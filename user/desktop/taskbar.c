@@ -83,8 +83,10 @@ static void render_start_menu(void) {
     int anim_off = (255 - s_start_anim) * 30 / 255;
     sy += anim_off;
 
-    /* Translucent panel with border */
-    rd_blend_rect(sx, sy, START_W, total_h, 0x0A0E14, 240);
+    /* Frosted-glass panel: soft shadow, translucent rounded fill, top highlight. */
+    rd_shadow(sx, sy, START_W, total_h, 10, 14);
+    rd_blend_rounded(sx, sy, START_W, total_h, 10, 0x0A0E14, 224);
+    rd_blend_rect(sx + 10, sy + 1, START_W - 20, 1, 0xFFFFFF, 22);
     rd_rounded_outline(sx, sy, START_W, total_h, 10, COL_WIN_BORDER);
 
     /* Header */
@@ -121,9 +123,12 @@ static void render_start_menu(void) {
 void tb_render(void) {
     int tby = (int)g_scr_h - TASKBAR_H;
 
-    /* Bar background w/ subtle gradient */
-    rd_rect(0, tby, (int)g_scr_w, TASKBAR_H, COL_TASKBAR_BG);
-    rd_rect(0, tby, (int)g_scr_w, 1, COL_TASKBAR_BORDER);
+    /* Glassmorphism bar: translucent dark fill lets the wallpaper (already in
+     * the back buffer) show through, plus a 1px top highlight for a subtle
+     * "frosted glass" edge and the existing accent border underneath it. */
+    rd_blend_rect(0, tby, (int)g_scr_w, TASKBAR_H, COL_TASKBAR_BG, 214);
+    rd_blend_rect(0, tby, (int)g_scr_w, 1, 0xFFFFFF, 24);
+    rd_rect(0, tby + 1, (int)g_scr_w, 1, COL_TASKBAR_BORDER);
 
     /* Start button */
     int sx, sy, sw, sh;

@@ -236,15 +236,59 @@ void rd_rounded_outline(int x, int y, int w, int h, int r, uint32_t color) {
     }
 }
 
-/* Soft shadow underneath a rect: fades alpha radially from the bottom-right. */
+/* Alpha-blended filled rounded rect. Same geometry as rd_rounded, but every
+ * span is composited onto the back buffer with `alpha`. Corner pixels get an
+ * extra ~63% coverage factor for a soft edge. Used by the glass panels and by
+ * the layered soft shadow below. */
+void rd_blend_rounded(int x, int y, int w, int h, int r, uint32_t color, uint8_t alpha) {
+    if (alpha == 0) return;
+    if (r <= 0) { rd_blend_rect(x, y, w, h, color, alpha); return; }
+    if (r > w / 2) r = w / 2;
+    if (r > h / 2) r = h / 2;
+
+    /* Center + top/bottom bands. */
+    rd_blend_rect(x, y + r, w, h - 2 * r, color, alpha);
+    rd_blend_rect(x + r, y, w - 2 * r, r, color, alpha);
+    rd_blend_rect(x + r, y + h - r, w - 2 * r, r, color, alpha);
+
+    /* Corner quarter-discs. */
+    int cx_tl = x + r,         cy_tl = y + r;
+    int cx_tr = x + w - r - 1, cy_tr = y + r;
+    int cx_bl = x + r,         cy_bl = y + h - r - 1;
+    int cx_br = x + w - r - 1, cy_br = y + h - r - 1;
+    int r2_in  = (r - 1) * (r - 1);
+    int r2_out = r * r;
+    uint8_t edge_a = (uint8_t)((alpha * 160) / 255);
+    for (int dy = -r; dy < r; dy++) {
+        for (int dx = -r; dx < r; dx++) {
+            int d2 = dx * dx + dy * dy;
+            uint8_t a;
+            if (d2 < r2_in)      a = alpha;
+            else if (d2 < r2_out) a = edge_a;
+            else continue;
+            if (dx <= 0 && dy <= 0) rd_blend_rect(cx_tl + dx, cy_tl + dy, 1, 1, color, a);
+            if (dx >= 0 && dy <= 0) rd_blend_rect(cx_tr + dx, cy_tr + dy, 1, 1, color, a);
+            if (dx <= 0 && dy >= 0) rd_blend_rect(cx_bl + dx, cy_bl + dy, 1, 1, color, a);
+            if (dx >= 0 && dy >= 0) rd_blend_rect(cx_br + dx, cy_br + dy, 1, 1, color, a);
+        }
+    }
+}
+
+/* Soft drop shadow: several concentric rounded layers, each larger and fainter
+ * than the last, nudged downward so the light appears to come from above. The
+ * window body drawn on top hides the dark inner layers, leaving only a smooth
+ * feathered halo around the edges. */
 void rd_shadow(int x, int y, int w, int h, int r, int spread) {
     if (spread <= 0) return;
-    /* Outer feather: increasing offset/decreasing alpha. */
-    for (int s = spread; s >= 1; s--) {
-        uint8_t alpha = (uint8_t)(60 - (s * 50) / spread);
-        if ((int)alpha < 6) alpha = 6;
-        rd_blend_rect(x + s, y + s, w, h, 0x000000, alpha);
-        (void)r;
+    int ydrop = spread / 3;          /* shadow falls slightly downward */
+    /* Step of 2 keeps the layer count (and per-corner blend cost) modest while
+     * still overlapping enough to read as a continuous gradient. */
+    for (int s = spread; s >= 1; s -= 2) {
+        /* Inner layers (small s) darkest; outer layers fade toward the edge. */
+        int a = 34 - (s * 30) / spread;
+        if (a < 3) a = 3;
+        rd_blend_rounded(x - s, y - s + ydrop, w + 2 * s, h + 2 * s,
+                         r + s, 0x000000, (uint8_t)a);
     }
 }
 

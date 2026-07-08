@@ -131,19 +131,33 @@ typedef enum {
 } tcp_state_t;
 
 #define TCP_RX_BUF_SIZE 32768
+#define TCP_TX_BUF_SIZE 8192
 #define TCP_DEFAULT_MSS 536
 #define TCP_OUR_MSS     1460
+
+/* Retransmission (egyszerűsített RFC 6298): fix alap-RTO exponenciális
+ * backoff-fal. 100 Hz-es PIT mellett 30 tick = 300 ms. */
+#define TCP_RTO_BASE_TICKS 30
+#define TCP_MAX_RETRIES    6
 
 typedef struct tcp_socket {
     tcp_state_t    state;
     ip4_addr_t     remote_ip;
     uint16_t       local_port;
     uint16_t       remote_port;
-    uint32_t       seq;
-    uint32_t       ack;
+    uint32_t       iss;      /* Initial send sequence number */
+    uint32_t       seq;      /* Következő küldendő sorszám (snd_nxt) */
+    uint32_t       snd_una;  /* Legrégebbi nem nyugtázott sorszám */
+    uint32_t       ack;      /* Következő várt fogadási sorszám (rcv_nxt) */
     uint16_t       peer_mss; /* SYN-ACK MSS option from peer, 0 = default 536 */
     uint8_t        rx_buf[TCP_RX_BUF_SIZE];
     uint32_t       rx_len;
+    /* Nem nyugtázott kimenő payload (retransmithez). tx_buf[0] sorszáma
+     * mindig snd_una (ESTABLISHED állapotban). */
+    uint8_t        tx_buf[TCP_TX_BUF_SIZE];
+    uint32_t       tx_len;
+    uint64_t       rto_deadline; /* pit tick, 0 = nincs függő retransmit */
+    uint8_t        rto_tries;
     struct net_device *dev;
     void (*on_data)(struct tcp_socket *s, const uint8_t *d, uint32_t l);
     void (*on_connect)(struct tcp_socket *s);
@@ -162,7 +176,11 @@ typedef struct net_device {
     
     /* Küldés a kártyán keresztül */
     int (*send_frame)(struct net_device *dev, const void *data, uint32_t len);
-    
+
+    /* Opcionális RX polling (task kontextusból hívva). IRQ-vesztés vagy
+     * hibás IRQ-routing esetén is halad így a csomagfeldolgozás. */
+    void (*poll)(struct net_device *dev);
+
     struct net_device *next;
 } net_device_t;
 
@@ -173,6 +191,8 @@ net_device_t *net_get_default_dev(void);
 /* Globális interfész regisztráció (net.c) */
 void net_register_device(net_device_t *dev);
 void net_receive_frame(net_device_t *dev, const void *data, uint32_t len);
+/* Minden regisztrált eszköz RX pollozása (blokkolló várakozó ciklusokból). */
+void net_poll(void);
 
 /* Ethernet (eth.c) */
 void eth_receive(net_device_t *dev, const eth_header_t *eth, uint32_t len);
@@ -209,7 +229,11 @@ void          tcp_send_data(tcp_socket_t *sock, const void *data, uint32_t len);
 void          tcp_close(tcp_socket_t *sock);
 bool          tcp_socket_is_valid(tcp_socket_t *sock);
 void          tcp_release(tcp_socket_t *sock);
+/* Task-kontextusból hívandó: lejárt RTO-k újraküldése (SYN és adat). */
+void          tcp_poll(void);
+/* Ablak-frissítő ACK, miután a userspace kiolvasta az rx_buf-ot. */
+void          tcp_send_window_update(tcp_socket_t *sock);
 
 /* DNS (dns.c) */
 bool dns_resolve(net_device_t *dev, const char *hostname, ip4_addr_t *out_ip);
-void dns_receive(net_device_t *dev, const uint8_t *data, uint32_t len, uint16_t src_port);
+void dns_receive(net_device_t *dev, const ip4_addr_t *src_ip, const uint8_t *data, uint32_t len, uint16_t src_port);

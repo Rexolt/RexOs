@@ -10,6 +10,10 @@ DISK        := disk.img
 # -----------------------------------------------------------------------------
 #  Toolchain
 # -----------------------------------------------------------------------------
+# A nasm/xorriso lokálisan (~/.local/bin) is lehet telepítve (sudo nélküli
+# gépeken forrásból) - vegyük fel a PATH-ba, ha létezik.
+export PATH := $(HOME)/.local/bin:$(PATH)
+
 CC          := gcc
 LD          := ld
 NASM        := nasm
@@ -262,6 +266,18 @@ $(BUILD)/http.o: user/http.c user/http.h user/libc.h user/tls.h
 	@echo "  CC   user/http.c (with TLS)"
 	@$(CC) $(USER_TLS_CFLAGS) -c user/http.c -o $@
 
+# --- Hálózati end-to-end önteszt (headless QEMU teszthez) ---
+$(BUILD)/nettest.elf: user/nettest.c user/http.h user/libc.h \
+                      $(BUILD)/libc.o $(BUILD)/http.o $(BUILD)/tls.o \
+                      $(BUILD)/ca_bundle.o $(BEARSSL_USER_LIB)
+	@mkdir -p $(BUILD)
+	@echo "  CC   user/nettest.c"
+	@$(CC) $(USER_TLS_CFLAGS) -static -Wl,-e,_start -Wl,--build-id=none \
+	    user/nettest.c \
+	    $(BUILD)/libc.o $(BUILD)/http.o $(BUILD)/tls.o $(BUILD)/ca_bundle.o \
+	    $(BEARSSL_USER_LIB) \
+	    -o $@
+
 # --- Font subsystem (stb_truetype + DejaVu Sans Mono) ---
 # A font kódhoz SSE/SSE2 KELL (x86-64 ABI float ABI), és kifejezetten engedjük az
 # -O2-t (stb_truetype rasterizer hot path). A USER_CFLAGS -mno-sse-jét levesszük.
@@ -325,7 +341,13 @@ $(BUILD)/desktop.elf: $(DESKTOP_OBJS) \
 # -----------------------------------------------------------------------------
 #  Initrd (TAR) összerakása
 # -----------------------------------------------------------------------------
-$(INITRD_TAR): $(BUILD)/hello.elf $(BUILD)/shell.elf $(BUILD)/gui.elf $(BUILD)/ls.elf $(BUILD)/cat.elf $(BUILD)/memtest.elf $(BUILD)/desktop.elf
+# NETTEST=1 esetén a hálózati önteszt is bekerül az initrd-be, és a kernel
+# boot után automatikusan elindítja (lásd kmain.c). Normál buildben nincs ott.
+ifeq ($(NETTEST),1)
+INITRD_NETTEST := $(BUILD)/nettest.elf
+endif
+
+$(INITRD_TAR): $(BUILD)/hello.elf $(BUILD)/shell.elf $(BUILD)/gui.elf $(BUILD)/ls.elf $(BUILD)/cat.elf $(BUILD)/memtest.elf $(BUILD)/desktop.elf $(INITRD_NETTEST)
 	@mkdir -p $(BUILD)
 	@echo "  TAR  $@"
 	@cp $(BUILD)/hello.elf initrd/hello.elf
@@ -335,6 +357,10 @@ $(INITRD_TAR): $(BUILD)/hello.elf $(BUILD)/shell.elf $(BUILD)/gui.elf $(BUILD)/l
 	@cp $(BUILD)/cat.elf initrd/cat.elf
 	@cp $(BUILD)/memtest.elf initrd/memtest.elf
 	@cp $(BUILD)/desktop.elf initrd/desktop.elf
+	@rm -f initrd/nettest.elf
+ifeq ($(NETTEST),1)
+	@cp $(BUILD)/nettest.elf initrd/nettest.elf
+endif
 	@cd initrd && tar -cf ../$@ .
 
 # -----------------------------------------------------------------------------

@@ -190,6 +190,7 @@ bool dhcp_configure(net_device_t *dev) {
 
         uint64_t start = pit_ticks();
         while (!s_offer_seen && pit_ticks() - start < DHCP_TIMEOUT_TICKS) {
+            net_poll();
             __asm__ volatile("pause");
         }
         if (!s_offer_seen) continue;
@@ -200,6 +201,7 @@ bool dhcp_configure(net_device_t *dev) {
 
         start = pit_ticks();
         while (!s_ack_seen && pit_ticks() - start < DHCP_TIMEOUT_TICKS) {
+            net_poll();
             __asm__ volatile("pause");
         }
         if (s_ack_seen) return true;

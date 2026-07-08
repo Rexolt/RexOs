@@ -4,7 +4,11 @@
 
 void icmp_receive(net_device_t *dev, const ip4_header_t *ip_hdr, const icmp_header_t *icmp, uint32_t len) {
     if (len < sizeof(icmp_header_t)) return;
-    
+
+    /* Checksum ellenőrzés: a teljes ICMP üzenet összege (a checksum mezővel
+     * együtt) érvényes csomagnál 0-t ad. */
+    if (net_checksum(icmp, len) != 0) return;
+
     if (icmp->type == ICMP_TYPE_ECHO_REQUEST) {
         kprintf("[icmp] Echo Request from %d.%d.%d.%d\n",
                 ip_hdr->src_ip.ip[0], ip_hdr->src_ip.ip[1],

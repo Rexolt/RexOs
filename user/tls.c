@@ -8,16 +8,15 @@
  *      illesztve
  *    - Bidi I/O buffer (BR_SSL_BUFSIZE_BIDI)
  *
- *  Ami még NEM működik / TODO:
- *    - Entrópia ideiglenes: rdtsc + tick + cím-jitter. Kriptográfiailag GYENGE.
- *      Valódi rdrand-ot vagy a kerneltől kért HW seed-et kell hozzátenni.
- *    - CA bundle: amíg `ca_bundle.c` placeholder (TAs_NUM=0), minden cert
- *      BR_ERR_X509_NOT_TRUSTED-del el fog bukni. Futtasd: ./tools/gen_ca_bundle.sh
- *    - Idő/RTC: a tanusítvány validity check `br_x509_minimal_set_time`-mal
- *      állítható. Most a default = 0 (UNIX epoch), tehát "notBefore" majdnem
- *      mindig OK lesz, "notAfter" mindig OK -> ezt is fixálni kell, mihelyt
- *      a get_time() pontos UTC napokat ad.
- *    - tls_send/recv hibakezelés: csak alap, retry/timeout nincs.
+ *  Állapot:
+ *    - Entrópia: kernel SYS_RANDOM (RDRAND ha van, egyébként TSC-keverés)
+ *      + userspace jitter. Lásd tls_collect_entropy().
+ *    - CA bundle: ca_bundle.c 121 Mozilla CCADB trust anchort tartalmaz
+ *      (újragenerálás: ./tools/gen_ca_bundle.sh).
+ *    - Idő/RTC: a tanúsítvány érvényesség az RTC-ből számolt (days, seconds)
+ *      párral megy a br_x509_minimal_set_time-nak.
+ *    - TCP EOF: a kernel net_recv NET_EOF (-2) értékét az engine lezárásaként
+ *      kezeljük (close_notify nélküli szerver-oldali bontásnál is korrekt).
  * ========================================================================== */
 #include "tls.h"
 #include "libc.h"
@@ -36,7 +35,7 @@ struct tls_ctx {
     uint8_t   iobuf[BR_SSL_BUFSIZE_BIDI];
 };
 
-/* ---- Entrópia (GYENGE - csak fejlesztéshez) ----------------------------- */
+/* ---- Entrópia ------------------------------------------------------------ */
 static uint64_t tls_rdtsc(void) {
     uint32_t lo, hi;
     __asm__ __volatile__("rdtsc" : "=a"(lo), "=d"(hi));
@@ -69,14 +68,16 @@ static void tls_set_validation_time(tls_ctx_t *ctx) {
 }
 
 static void tls_collect_entropy(uint8_t out[32]) {
-    /* Naiv keverés: rdtsc minden iterációban, ticks(), és pár stack-cím.
-     * Kifejezetten NEM elég TLS-hez! Csak skeletonnak. */
+    /* Elsődleges forrás: a kernel SYS_RANDOM syscall-ja (RDRAND ha a CPU
+     * támogatja, egyébként TSC-keverés). Erre rákeverünk userspace jittert
+     * is, hogy a kimenet akkor se legyen konstans, ha a syscall hibázna. */
     uint64_t pool[4] = { 0, 0, 0, 0 };
-    for (int i = 0; i < 64; i++) {
+    get_random(pool, sizeof(pool));
+    for (int i = 0; i < 16; i++) {
         pool[0] ^= tls_rdtsc();
         pool[1] = (pool[1] << 7) ^ get_ticks();
         pool[2] += (uint64_t)(uintptr_t)&pool;
-        pool[3] = (pool[3] * 1103515245ULL + 12345ULL) ^ tls_rdtsc();
+        pool[3] = (pool[3] * 0x9E3779B97F4A7C15ULL + 12345ULL) ^ tls_rdtsc();
         yield();
     }
     memcpy(out, pool, 32);
@@ -119,6 +120,13 @@ static int tls_run_until(tls_ctx_t *ctx, unsigned wait_for) {
             size_t rlen;
             uint8_t *rbuf = br_ssl_engine_recvrec_buf(eng, &rlen);
             int got = net_recv(ctx->sock, rbuf, rlen);
+            if (got == NET_EOF) {
+                /* A peer lezárta a TCP kapcsolatot (close_notify nélkül is
+                 * előfordul). Ha van kiolvasatlan app-adat, azt a hívó még
+                 * megkapja; az engine-t lezárjuk. */
+                br_ssl_engine_close(eng);
+                continue;
+            }
             if (got < 0) {
                 ctx->last_err = BR_ERR_IO;
                 return 0;
@@ -186,7 +194,7 @@ tls_ctx_t *tls_connect(const char *host, uint16_t port) {
     /* 2b) Tanúsítvány érvényességi idő az RTC-ből, különben BR_ERR_X509_TIME_UNKNOWN */
     tls_set_validation_time(ctx);
 
-    /* 3) Entrópia injektálás (GYENGE - lásd TODO) */
+    /* 3) Entrópia injektálás (kernel SYS_RANDOM + userspace jitter) */
     uint8_t seed[32];
     tls_collect_entropy(seed);
     br_ssl_engine_inject_entropy(&ctx->cc.eng, seed, sizeof(seed));
@@ -244,8 +252,11 @@ int tls_recv(tls_ctx_t *ctx, void *buf, uint64_t max) {
     br_ssl_engine_context *eng = &ctx->cc.eng;
 
     if (!tls_run_until(ctx, BR_SSL_RECVAPP)) {
-        /* Lehet, hogy a peer szabályosan lezárta */
-        if (ctx->last_err == 0) return 0;
+        /* Szabályos lezárás (close_notify vagy TCP EOF): NET_EOF-fal jelezzük,
+         * hogy a hívó (http.c) ne várjon tovább adatra. */
+        if (ctx->last_err == 0 || ctx->last_err == BR_ERR_IO) {
+            return (ctx->last_err == 0) ? NET_EOF : TLS_ERR_IO;
+        }
         return TLS_ERR_IO;
     }
 

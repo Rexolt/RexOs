@@ -254,6 +254,7 @@ static void parse_html(const char *html, int len, char *title_out, int title_max
 }
 
 /* Forward declaration */
+static void br_fetch_ex(br_state_t *st, int push_history);
 static void br_fetch(br_state_t *st);
 
 /* ---- Lifecycle ----------------------------------------------------------- */
@@ -272,7 +273,7 @@ static void br_close(window_t *w) {
 }
 
 /* ---- Fetch (synchronous) ------------------------------------------------- */
-static void br_fetch(br_state_t *st) {
+static void br_fetch_ex(br_state_t *st, int push_history) {
     /* Free any previous body */
     if (st->body) { free(st->body); st->body = 0; st->body_len = 0; }
     st->loading = 1;
@@ -292,17 +293,20 @@ static void br_fetch(br_state_t *st) {
         st->is_https = 1;
     }
 
-    /* Add to history (drop forward history if navigating from middle) */
-    if (st->hist_pos < st->hist_count - 1) st->hist_count = st->hist_pos + 1;
-    if (st->hist_count >= BR_HISTORY_MAX) {
-        for (int i = 0; i < BR_HISTORY_MAX - 1; i++) {
-            d_strcpy(st->history[i], st->history[i+1], BR_URL_MAX);
+    /* Add to history (drop forward history if navigating from middle).
+     * Back/Forward navigáció push_history=0-val hív, így nem duplikál. */
+    if (push_history) {
+        if (st->hist_pos < st->hist_count - 1) st->hist_count = st->hist_pos + 1;
+        if (st->hist_count >= BR_HISTORY_MAX) {
+            for (int i = 0; i < BR_HISTORY_MAX - 1; i++) {
+                d_strcpy(st->history[i], st->history[i+1], BR_URL_MAX);
+            }
+            st->hist_count = BR_HISTORY_MAX - 1;
         }
-        st->hist_count = BR_HISTORY_MAX - 1;
+        d_strcpy(st->history[st->hist_count], st->url, BR_URL_MAX);
+        st->hist_pos = st->hist_count;
+        st->hist_count++;
     }
-    d_strcpy(st->history[st->hist_count], st->url, BR_URL_MAX);
-    st->hist_pos = st->hist_count;
-    st->hist_count++;
 
     /* Allocate body buffer */
     char *body = (char *)malloc(BR_BODY_MAX);
@@ -348,6 +352,10 @@ static void br_fetch(br_state_t *st) {
     if (!st->page_title[0]) d_strcpy(st->page_title, st->url, sizeof(st->page_title));
 
     st->loading = 0;
+}
+
+static void br_fetch(br_state_t *st) {
+    br_fetch_ex(st, 1);
 }
 
 /* ---- Layout helpers ------------------------------------------------------- */
@@ -633,14 +641,8 @@ static int br_event(window_t *w) {
         if (pt_in_rect(g_mouse.x, g_mouse.y, bx, by, btn_size, btn_size)) {
             if (st->hist_pos > 0) {
                 st->hist_pos--;
-                d_strcpy(st->url, st->history[st->hist_pos], BR_URL_MAX);
                 br_url_set(st, st->history[st->hist_pos]);
-                /* Re-fetch (without pushing to history) - we'd need to refactor.
-                 * For now, do the fetch which will re-push; back history may dup. */
-                /* Save current pos and rewind after fetch */
-                int saved_pos = st->hist_pos;
-                br_fetch(st);
-                st->hist_pos = saved_pos;
+                br_fetch_ex(st, 0); /* history-pozíció megmarad, nincs dup */
             }
             return 1;
         }
@@ -651,9 +653,7 @@ static int br_event(window_t *w) {
             if (st->hist_pos < st->hist_count - 1) {
                 st->hist_pos++;
                 br_url_set(st, st->history[st->hist_pos]);
-                int saved_pos = st->hist_pos;
-                br_fetch(st);
-                st->hist_pos = saved_pos;
+                br_fetch_ex(st, 0);
             }
             return 1;
         }

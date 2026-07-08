@@ -7,7 +7,8 @@
 #include <mm/vmm.h>
 
 #define E1000_VEND 0x8086
-#define E1000_DEV_100E 0x100E /* Qemu default E1000 */
+#define E1000_DEV_100E 0x100E /* Qemu default E1000 (82540EM) */
+#define E1000_DEV_100F 0x100F /* 82545EM (VMware, régebbi QEMU) */
 #define E1000_DEV_10D3 0x10D3 /* Intel Gigabit CT Desktop Adapter */
 
 static const pci_device_t *s_e1000_pci = NULL;
@@ -83,11 +84,22 @@ static int e1000_send_frame(struct net_device *dev, const void *data,
                             uint32_t len) {
   (void)dev;
 
+  if (len > 4096) return -1;
+
   /* Bounce buffer: allocating a physical frame because 'data' might be in virt
    * memory */
   uintptr_t phys = pmm_alloc_frames(1);
+  if (!phys) {
+    kprintf("[e1000] TX drop: out of physical frames\n");
+    return -1;
+  }
   void *bounce = (void *)(phys + hhdm_offset());
   kmemcpy(bounce, data, len);
+
+  /* A TX ringet task ÉS IRQ kontextus is használja (az IRQ-oldali tcp_receive
+   * ACK-okat küld) - a descriptor-foglalás + tail-írás legyen atomi. */
+  uint64_t rflags;
+  __asm__ volatile("pushfq; pop %0; cli" : "=r"(rflags)::"memory");
 
   tx_descs[tx_cur].addr = phys;
   tx_descs[tx_cur].length = len;
@@ -98,12 +110,39 @@ static int e1000_send_frame(struct net_device *dev, const void *data,
   tx_cur = (tx_cur + 1) % E1000_NUM_TX_DESC;
   e1000_write_reg(E1000_REG_TDT, tx_cur);
 
-  while (!(tx_descs[old_cur].status & 0xFF)) {
-    /* Wait for TX to finish */
+  /* Timeout-os várakozás: link-down vagy hibás állapot ne fagyassza a kernelt. */
+  int ok = 0;
+  for (uint32_t spin = 0; spin < 2000000; spin++) {
+    if (tx_descs[old_cur].status & 0xFF) { ok = 1; break; }
+    __asm__ volatile("pause");
   }
 
+  if (rflags & 0x200) __asm__ volatile("sti" ::: "memory");
+
   pmm_free_frames(phys, 1);
+  if (!ok) {
+    kprintf("[e1000] TX timeout (desc %u)\n", old_cur);
+    return -1;
+  }
   return 0;
+}
+
+/* RX ring drain: minden kész descriptor feldolgozása. IRQ handlerből (IF=0)
+ * és pollingból (IRQ-védett szakaszban) is hívható. */
+static void e1000_rx_drain(void) {
+  while (rx_descs[rx_cur].status & (1 << 0)) { /* Descriptor Done bit */
+    uint32_t len = rx_descs[rx_cur].length;
+    void *data = rx_buffers[rx_cur];
+
+    /* Pass to network stack */
+    net_receive_frame(&s_net_dev, data, len);
+
+    /* Clear status and give descriptor back to hardware */
+    rx_descs[rx_cur].status = 0;
+    e1000_write_reg(E1000_REG_RDT, rx_cur);
+
+    rx_cur = (rx_cur + 1) % E1000_NUM_RX_DESC;
+  }
 }
 
 static void e1000_interrupt(uint8_t irq, struct interrupt_frame *frame) {
@@ -117,20 +156,19 @@ static void e1000_interrupt(uint8_t irq, struct interrupt_frame *frame) {
 
   /* Check if it's a Receive interrupt (RXT0, bit 7) */
   if (status & (1 << 7)) {
-    while (rx_descs[rx_cur].status & (1 << 0)) { /* Descriptor Done bit */
-      uint32_t len = rx_descs[rx_cur].length;
-      void *data = rx_buffers[rx_cur];
-
-      /* Pass to network stack */
-      net_receive_frame(&s_net_dev, data, len);
-
-      /* Clear status and give descriptor back to hardware */
-      rx_descs[rx_cur].status = 0;
-      e1000_write_reg(E1000_REG_RDT, rx_cur);
-
-      rx_cur = (rx_cur + 1) % E1000_NUM_RX_DESC;
-    }
+    e1000_rx_drain();
   }
+}
+
+/* Task-kontextusú RX poll: az IRQ-oldali feldolgozással IRQ-letiltással
+ * zárjuk ki egymást. Ha az IRQ-routing hibás (valódi hardver), ez az
+ * egyetlen út, amin a bejövő csomagok feldolgozódnak. */
+static void e1000_poll(struct net_device *dev) {
+  (void)dev;
+  uint64_t rflags;
+  __asm__ volatile("pushfq; pop %0; cli" : "=r"(rflags)::"memory");
+  e1000_rx_drain();
+  if (rflags & 0x200) __asm__ volatile("sti" ::: "memory");
 }
 
 static void e1000_init_rx(void) {
@@ -181,7 +219,8 @@ bool e1000_init(void) {
   for (size_t i = 0; i < count; i++) {
     const pci_device_t *d = pci_device_at(i);
     if (d->vendor == E1000_VEND &&
-        (d->device == E1000_DEV_100E || d->device == E1000_DEV_10D3)) {
+        (d->device == E1000_DEV_100E || d->device == E1000_DEV_100F ||
+         d->device == E1000_DEV_10D3)) {
       s_e1000_pci = d;
       break;
     }
@@ -214,6 +253,7 @@ bool e1000_init(void) {
   /* Hálózat absztrakció beállítása */
   kstrcpy(s_net_dev.name, "eth0");
   s_net_dev.send_frame = e1000_send_frame;
+  s_net_dev.poll       = e1000_poll;
   e1000_read_mac();
 
   e1000_init_rx();

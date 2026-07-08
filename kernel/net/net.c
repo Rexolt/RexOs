@@ -59,6 +59,12 @@ net_device_t *net_get_default_dev(void) {
     return s_net_devices;
 }
 
+void net_poll(void) {
+    for (net_device_t *dev = s_net_devices; dev; dev = dev->next) {
+        if (dev->poll) dev->poll(dev);
+    }
+}
+
 void net_receive_frame(net_device_t *dev, const void *data, uint32_t len) {
     if (len < sizeof(eth_header_t)) return;
     

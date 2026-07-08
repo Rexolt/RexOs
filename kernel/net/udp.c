@@ -3,22 +3,18 @@
 #include <lib/string.h>
 
 void udp_receive(net_device_t *dev, const ip4_header_t *ip_hdr, const udp_header_t *udp, uint32_t len) {
-    (void)dev;
     if (len < sizeof(udp_header_t)) return;
 
     uint16_t src_port = ntohs(udp->src_port);
     uint16_t dest_port = ntohs(udp->dest_port);
     uint16_t udp_len = ntohs(udp->length);
-    
-    if (len < udp_len) return;
-    
+
+    /* A UDP length tartalmazza a fejlécet is: 8-nál kisebb érték sérült
+     * csomagot jelent (különben alulcsordulna a payload_len). */
+    if (udp_len < sizeof(udp_header_t) || len < udp_len) return;
+
     uint32_t payload_len = udp_len - sizeof(udp_header_t);
     const uint8_t *payload = udp->payload;
-
-    kprintf("[udp] Packet from %d.%d.%d.%d:%u to port %u (len: %u)\n",
-            ip_hdr->src_ip.ip[0], ip_hdr->src_ip.ip[1],
-            ip_hdr->src_ip.ip[2], ip_hdr->src_ip.ip[3],
-            src_port, dest_port, payload_len);
 
     /* Route DHCP replies before the interface has a configured IPv4 address. */
     if (dest_port == 68) {
@@ -28,12 +24,7 @@ void udp_receive(net_device_t *dev, const ip4_header_t *ip_hdr, const udp_header
 
     /* Route to DNS if it's a response on our DNS query port */
     if (dest_port == 1053) {
-        dns_receive(dev, payload, payload_len, src_port);
-        return;
-    }
-
-    if (dest_port == 68) {
-        dhcp_receive(dev, payload, payload_len, src_port);
+        dns_receive(dev, &ip_hdr->src_ip, payload, payload_len, src_port);
         return;
     }
 

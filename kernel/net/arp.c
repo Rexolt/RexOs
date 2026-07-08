@@ -70,6 +70,10 @@ static void arp_cache_update(const ip4_addr_t *ip, const mac_addr_t *mac) {
       s_arp_cache[i].ip = *ip;
       s_arp_cache[i].mac = *mac;
       s_arp_cache[i].valid = true;
+      /* Új bejegyzésnél is ki kell küldeni az erre az IP-re várakozó
+       * csomagokat - e nélkül az első DNS query / TCP SYN mindig elveszett,
+       * és csak a 2 másodperces retry / RTO retransmit mentette meg. */
+      arp_flush_pending(ip, mac);
       return;
     }
   }
@@ -78,6 +82,7 @@ static void arp_cache_update(const ip4_addr_t *ip, const mac_addr_t *mac) {
   s_arp_cache[0].ip = *ip;
   s_arp_cache[0].mac = *mac;
   s_arp_cache[0].valid = true;
+  arp_flush_pending(ip, mac);
 }
 
 bool arp_resolve(const ip4_addr_t *ip, mac_addr_t *out_mac) {
