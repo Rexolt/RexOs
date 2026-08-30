@@ -16,3 +16,11 @@ boot/limine/
 # Cscope / ctags
 cscope.*
 tags
+
+# Cross toolchain és a portolt könyvtárak (tools/build-toolchain.sh és
+# tools/build-ports.sh generálja, több gigabájt)
+toolchain/
+
+# A Makefile által az initrd-be másolt, generált fájlok
+initrd/*.elf
+initrd/netsurf/

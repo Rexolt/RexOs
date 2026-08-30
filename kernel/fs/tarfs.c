@@ -77,6 +77,75 @@ static vfs_node_t *tarfs_finddir(vfs_node_t *node, const char *name) {
     return NULL;
 }
 
+/* --- Könyvtár node-ok ----------------------------------------------------
+ * A tar lapos listát tárol, a fájlok teljes útvonal-névvel élnek
+ * ("netsurf/Messages"). A könyvtár node neve a prefix ("netsurf");
+ * finddir/readdir ez alapján szűri a globális listát. */
+
+static vfs_node_t *tarfs_dir_finddir(vfs_node_t *dir, const char *name) {
+    char full[128];
+    uint64_t dl = kstrlen(dir->name);
+    uint64_t nl = kstrlen(name);
+    if (dl + 1 + nl >= sizeof(full)) return NULL;
+    kmemcpy(full, dir->name, dl);
+    full[dl] = '/';
+    kmemcpy(full + dl + 1, name, nl + 1);
+    return tarfs_finddir(fs_root, full);
+}
+
+static dirent_t *tarfs_dir_readdir(vfs_node_t *dir, uint32_t index) {
+    uint64_t dl = kstrlen(dir->name);
+    uint32_t seen = 0;
+    for (uint32_t i = 0; i < tarfs_node_count; i++) {
+        const char *nm = tarfs_nodes[i]->name;
+        /* prefix egyezés: "<dir>/" */
+        if (kstrncmp(nm, dir->name, dl) != 0 || nm[dl] != '/') continue;
+        const char *rest = nm + dl + 1;
+        /* csak közvetlen gyerek (nincs további '/') */
+        const char *q = rest;
+        int nested = 0;
+        while (*q) { if (*q == '/') { nested = 1; break; } q++; }
+        if (nested) continue;
+        if (seen++ == index) {
+            kstrncpy(tarfs_dirent.name, rest, 127);
+            tarfs_dirent.ino = tarfs_nodes[i]->inode;
+            return &tarfs_dirent;
+        }
+    }
+    return NULL;
+}
+
+/* Könyvtár node létrehozása (ha még nincs) egy útvonal-prefixhez */
+static void tarfs_ensure_dir(const char *path) {
+    if (!path[0]) return;
+    if (tarfs_finddir(fs_root, path)) return;
+    if (tarfs_node_count >= TARFS_MAX_NODES) return;
+
+    vfs_node_t *node = kzalloc(sizeof(vfs_node_t));
+    if (!node) return;
+    kstrncpy(node->name, path, 127);
+    node->flags = FS_DIRECTORY;
+    node->inode = tarfs_node_count;
+    node->finddir = tarfs_dir_finddir;
+    node->readdir = tarfs_dir_readdir;
+    tarfs_nodes[tarfs_node_count++] = node;
+    kprintf("[tarfs] Directory: %s\n", node->name);
+}
+
+/* Egy fájl útvonalának összes szülő-prefixét könyvtárként regisztrálja */
+static void tarfs_ensure_parents(const char *name) {
+    char prefix[128];
+    uint64_t n = kstrlen(name);
+    if (n > 127) n = 127;
+    for (uint64_t i = 0; i < n; i++) {
+        if (name[i] == '/') {
+            kmemcpy(prefix, name, i);
+            prefix[i] = 0;
+            tarfs_ensure_dir(prefix);
+        }
+    }
+}
+
 void tarfs_init(uint64_t address, uint64_t size) {
     uint64_t offset = 0;
     
@@ -104,8 +173,20 @@ void tarfs_init(uint64_t address, uint64_t size) {
         
         uint64_t file_size = octal_to_int(header->size, 11);
         
-        /* Csak normál fájlokat dolgozunk fel most (típus 0 vagy '0')
-         * Mappák bejegyzéseit (typeflag == '5') most átlépjük a flat struktúra miatt. */
+        /* Könyvtár bejegyzések: prefix-alapú dir node-ként regisztráljuk */
+        if (header->typeflag == '5') {
+            const char *name = header->filename;
+            if (name[0] == '.' && name[1] == '/') name += 2;
+            char clean[128];
+            uint64_t n = kstrlen(name);
+            if (n > 0 && n < 128) {
+                kmemcpy(clean, name, n + 1);
+                if (clean[n - 1] == '/') clean[n - 1] = 0; /* záró '/' le */
+                tarfs_ensure_dir(clean);
+            }
+        }
+
+        /* Normál fájlok (típus 0 vagy '0') */
         if (header->typeflag == '0' || header->typeflag == '\0') {
             vfs_node_t *node = kzalloc(sizeof(vfs_node_t));
             if (!node) break;
@@ -120,6 +201,7 @@ void tarfs_init(uint64_t address, uint64_t size) {
             node->length = file_size;
             node->flags = FS_FILE;
             node->inode = tarfs_node_count;
+            tarfs_ensure_parents(node->name);
             
             /* Az adatok a 512 byte-os fejléc után kezdődnek */
             node->ptr = (struct vfs_node *)(address + offset + 512);

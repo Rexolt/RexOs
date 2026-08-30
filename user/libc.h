@@ -28,6 +28,9 @@
 #define SYS_TIME        24
 #define SYS_NET_CLOSE   25
 #define SYS_RANDOM      26
+#define SYS_STAT        27
+#define SYS_FSTAT       28
+#define SYS_SLEEP_MS    29
 
 #define O_RDONLY  0
 #define O_WRONLY  1
@@ -131,6 +134,24 @@ static inline int net_recv(uint64_t sock, void *buf, uint64_t max_len) {
 }
 static inline int net_close(uint64_t sock) {
     return (int)syscall1(SYS_NET_CLOSE, sock);
+}
+/* Fájl metaadatok (SYS_STAT/SYS_FSTAT out struktúrája) */
+typedef struct {
+    uint64_t length;
+    uint32_t flags;   /* FS_FILE=1, FS_DIRECTORY=2, ... */
+    uint32_t inode;
+} stat_t;
+
+static inline int stat_path(const char *path, stat_t *out) {
+    return (int)syscall2(SYS_STAT, (uint64_t)path, (uint64_t)out);
+}
+static inline int fstat_fd(int fd, stat_t *out) {
+    return (int)syscall2(SYS_FSTAT, (uint64_t)fd, (uint64_t)out);
+}
+
+/* Alvás: legalább ms ideig átadja a CPU-t (10 ms-es PIT felbontással). */
+static inline void sleep_ms(uint64_t ms) {
+    syscall1(SYS_SLEEP_MS, ms);
 }
 
 /* Kernel entrópia (RDRAND ha van, egyébként TSC-jitter keverés).

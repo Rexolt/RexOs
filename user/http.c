@@ -1,6 +1,7 @@
 #include "http.h"
 #include "libc.h"
 #include "tls.h"
+#include "inflate.h"
 
 /* Debug: serial-on logol (write(1,...) -> kprintf a kernelben). */
 #define HTTP_DBG 1
@@ -309,6 +310,16 @@ static int h_header_is_chunked(const char *headers, int header_len) {
     return 0;
 }
 
+/* Content-Encoding: gzip / deflate / x-gzip => 1; identity vagy hiányzik => 0.
+ * A rex_gunzip auto-detektálja a konkrét konténert, így boolean elég. */
+static int h_header_is_encoded(const char *headers, int header_len) {
+    int len = 0;
+    const char *v = h_header_value(headers, header_len, "Content-Encoding", &len);
+    if (!v || len <= 0) return 0;
+    if (len == 8 && h_strncasecmp(v, "identity", 8) == 0) return 0;
+    return 1;
+}
+
 static int h_header_content_length(const char *headers, int header_len) {
     int len = 0;
     const char *v = h_header_value(headers, header_len, "Content-Length", &len);
@@ -382,7 +393,7 @@ static int h_build_request(const http_url_t *url, char *req, int req_max) {
     h_strcat(req, url->path);
     h_strcat(req, " HTTP/1.1\r\nHost: ");
     h_strcat(req, url->host);
-    h_strcat(req, "\r\nUser-Agent: RexOS/0.1\r\nAccept: text/html,*/*\r\nAccept-Encoding: identity\r\nConnection: close\r\n\r\n");
+    h_strcat(req, "\r\nUser-Agent: RexOS/0.1\r\nAccept: text/html,*/*\r\nAccept-Encoding: gzip, deflate\r\nConnection: close\r\n\r\n");
     return h_strlen(req);
 }
 
@@ -487,7 +498,46 @@ static int h_body_cap_from(uint64_t desired) {
     return (int)desired;
 }
 
-static int h_finish_alloc_body(const char *body, int body_len, int is_chunked,
+/* Body kiírása `out`-ba (out_max a NUL-lal együtt). Kezeli a chunked
+ * transfer-encoding-ot és a gzip/deflate Content-Encoding-ot is.
+ * Visszatérés: kiírt byte-ok száma (>=0), vagy negatív HTTP_ERR_*. */
+static int h_emit_body(const char *body, int body_len, int is_chunked, int is_encoded,
+                       char *out, uint64_t out_max, http_response_t *resp) {
+    if (out_max == 0) return 0;
+
+    if (!is_encoded) {
+        if (is_chunked) return h_decode_chunked(body, body_len, out, out_max, resp);
+        int copied = h_copy_body(body, body_len, out, out_max, resp);
+        if ((uint64_t)body_len > out_max - 1 && resp) resp->truncated = 1;
+        return copied;
+    }
+
+    /* Tömörített: előbb (ha kell) de-chunkoljuk egy ideiglenes pufferbe a
+     * folytonos tömörített byte-folyamot, majd kicsomagoljuk `out`-ba. */
+    const char *comp = body;
+    int comp_len = body_len;
+    char *tmp = 0;
+    if (is_chunked) {
+        tmp = (char *)malloc((uint64_t)body_len + 1);
+        if (!tmp) { h_set_status(resp, "Out of memory"); return HTTP_ERR_NO_MEMORY; }
+        comp_len = h_decode_chunked(body, body_len, tmp, (uint64_t)body_len + 1, resp);
+        comp = tmp;
+    }
+
+    unsigned long olen = out_max - 1;
+    int ir = rex_gunzip((uint8_t *)out, &olen, (const uint8_t *)comp, (unsigned long)comp_len);
+    if (tmp) free(tmp);
+
+    if (ir != 0 && ir != 1) {
+        h_set_status(resp, "Decompression failed");
+        return HTTP_ERR_RESPONSE;
+    }
+    if (ir == 1 && resp) resp->truncated = 1;   /* kimenet betelt -> csonkolt */
+    out[olen] = 0;
+    return (int)olen;
+}
+
+static int h_finish_alloc_body(const char *body, int body_len, int is_chunked, int is_encoded,
                                uint64_t max_body, char **out_body, http_response_t *resp) {
     uint64_t cap_body = max_body;
     if (cap_body == 0 || cap_body > HTTP_RESPONSE_MAX) cap_body = HTTP_RESPONSE_MAX;
@@ -496,10 +546,11 @@ static int h_finish_alloc_body(const char *body, int body_len, int is_chunked,
         h_set_status(resp, "Out of memory");
         return HTTP_ERR_NO_MEMORY;
     }
-    int copied = is_chunked
-        ? h_decode_chunked(body, body_len, body_buf, cap_body + 1, resp)
-        : h_copy_body(body, body_len, body_buf, cap_body + 1, resp);
-    if (!is_chunked && (uint64_t)body_len > cap_body && resp) resp->truncated = 1;
+    int copied = h_emit_body(body, body_len, is_chunked, is_encoded, body_buf, cap_body + 1, resp);
+    if (copied < 0) {
+        free(body_buf);
+        return copied;
+    }
     *out_body = body_buf;
     return copied;
 }
@@ -595,6 +646,7 @@ static int h_http_get_impl(const char *url, char *fixed_out, uint64_t fixed_out_
         int status_code = h_parse_status_code(raw, header_len);
         hdbg("[http] status="); hdbg_int(status_code); hdbg("\n");
         int is_chunked = h_header_is_chunked(raw, header_len);
+        int is_encoded = h_header_is_encoded(raw, header_len);
         if (resp) {
             resp->status_code = status_code;
             resp->header_len = header_len;
@@ -625,7 +677,7 @@ static int h_http_get_impl(const char *url, char *fixed_out, uint64_t fixed_out_
 
         int copied;
         if (alloc_out) {
-            int fr = h_finish_alloc_body(body, body_len, is_chunked, alloc_max, alloc_out, resp);
+            int fr = h_finish_alloc_body(body, body_len, is_chunked, is_encoded, alloc_max, alloc_out, resp);
             if (fr < 0) {
                 hc_close(&conn);
                 free(raw);
@@ -633,9 +685,12 @@ static int h_http_get_impl(const char *url, char *fixed_out, uint64_t fixed_out_
             }
             copied = fr;
         } else {
-            copied = is_chunked
-                ? h_decode_chunked(body, body_len, fixed_out, fixed_out_max, resp)
-                : h_copy_body(body, body_len, fixed_out, fixed_out_max, resp);
+            copied = h_emit_body(body, body_len, is_chunked, is_encoded, fixed_out, fixed_out_max, resp);
+            if (copied < 0) {
+                hc_close(&conn);
+                free(raw);
+                return copied;
+            }
         }
 
         if (resp) {

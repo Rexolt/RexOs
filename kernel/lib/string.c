@@ -75,6 +75,13 @@ int kstrcmp(const char *a, const char *b)
     return (int)(uint8_t)*a - (int)(uint8_t)*b;
 }
 
+int kstrncmp(const char *a, const char *b, size_t n)
+{
+    while (n && *a && (*a == *b)) { a++; b++; n--; }
+    if (n == 0) return 0;
+    return (int)(uint8_t)*a - (int)(uint8_t)*b;
+}
+
 /* --- Aliasok GCC implicit hívásokhoz --- */
 void *memset (void *d, int c, size_t n)              { return kmemset(d, c, n); }
 void *memcpy (void *d, const void *s, size_t n)      { return kmemcpy(d, s, n); }

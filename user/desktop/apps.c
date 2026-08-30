@@ -729,6 +729,46 @@ const app_def_t app_about = {
 };
 
 /* ============================================================================
+ * NetSurf launcher
+ *
+ * A NetSurf teljes képernyős, közvetlenül a framebufferre rajzoló app.
+ * Indításkor spawn + waitpid: amíg fut, a desktop main loopja itt blokkol,
+ * így nem rajzol bele a NetSurf képébe. Kilépés után a desktop következő
+ * frame-je visszarajzolja az asztalt.
+ * ========================================================================== */
+static int g_netsurf_ran = 0;
+
+static void netsurf_open(window_t *w) {
+    (void)w;
+    int pid = spawn("netsurf.elf");
+    if (pid > 0) {
+        waitpid(pid);
+        g_netsurf_ran = 1;
+    } else {
+        g_netsurf_ran = -1;
+    }
+}
+
+static void netsurf_render(window_t *w) {
+    int cx = w->x + 16, cy = w->y + WIN_TITLEBAR_H + 24;
+    if (g_netsurf_ran > 0) {
+        rd_text(cx, cy, "A NetSurf munkamenet veget ert.", UI_PX, COL_TEXT);
+        rd_text(cx, cy + 24, "Ujrainditas: nyisd meg ujra a NetSurf ikont.",
+                UI_PX, COL_TEXT_MUTED);
+    } else {
+        rd_text(cx, cy, "netsurf.elf nem talalhato az initrd-ben!", UI_PX, COL_TEXT);
+    }
+}
+
+const app_def_t app_netsurf = {
+    .name = "NetSurf",
+    .icon = ICON_GLOBE,
+    .default_w = 480, .default_h = 160,
+    .on_open = netsurf_open,
+    .on_render = netsurf_render,
+};
+
+/* ============================================================================
  * System Monitor
  * ========================================================================== */
 typedef struct {
@@ -990,6 +1030,7 @@ const app_def_t app_notes = {
  * ========================================================================== */
 const app_def_t *g_apps[] = {
     &app_browser,
+    &app_netsurf,
     &app_files,
     &app_terminal,
     &app_calc,

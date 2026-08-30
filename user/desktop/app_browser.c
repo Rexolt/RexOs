@@ -75,28 +75,79 @@ static int ci_eq(const char *a, const char *b, int n) {
     return 1;
 }
 
-/* ---- Entity decoder ------------------------------------------------------- */
-static int decode_entity(const char *s, int max, char *out) {
-    /* Returns number of input chars consumed, or 0 if not an entity. */
-    if (s[0] != '&') return 0;
-    if (max >= 5 && ci_eq(s, "&amp;", 5)) { *out = '&'; return 5; }
-    if (max >= 4 && ci_eq(s, "&lt;", 4))  { *out = '<'; return 4; }
-    if (max >= 4 && ci_eq(s, "&gt;", 4))  { *out = '>'; return 4; }
-    if (max >= 6 && ci_eq(s, "&quot;", 6)){ *out = '"'; return 6; }
-    if (max >= 6 && ci_eq(s, "&nbsp;", 6)){ *out = ' '; return 6; }
-    if (max >= 6 && ci_eq(s, "&apos;", 6)){ *out = '\''; return 6; }
-    if (max >= 5 && ci_eq(s, "&#39;", 5)) { *out = '\''; return 5; }
-    if (max >= 6 && ci_eq(s, "&copy;", 6)){ *out = 'C'; return 6; }
-    /* Numeric &#NN; */
-    if (s[1] == '#') {
-        int code = 0; int i = 2;
-        while (i < max && s[i] >= '0' && s[i] <= '9') { code = code*10 + (s[i]-'0'); i++; }
-        if (i < max && s[i] == ';') {
-            *out = (code >= 32 && code < 127) ? (char)code : '?';
-            return i + 1;
-        }
+/* ---- UTF-8 encoder -------------------------------------------------------- */
+static int utf8_encode(int cp, char *out) {
+    if (cp < 0 || cp > 0x10FFFF) cp = 0xFFFD;
+    if (cp < 0x80) { out[0] = (char)cp; return 1; }
+    if (cp < 0x800) {
+        out[0] = (char)(0xC0 | (cp >> 6));
+        out[1] = (char)(0x80 | (cp & 0x3F));
+        return 2;
     }
-    return 0;
+    if (cp < 0x10000) {
+        out[0] = (char)(0xE0 | (cp >> 12));
+        out[1] = (char)(0x80 | ((cp >> 6) & 0x3F));
+        out[2] = (char)(0x80 | (cp & 0x3F));
+        return 3;
+    }
+    out[0] = (char)(0xF0 | (cp >> 18));
+    out[1] = (char)(0x80 | ((cp >> 12) & 0x3F));
+    out[2] = (char)(0x80 | ((cp >> 6) & 0x3F));
+    out[3] = (char)(0x80 | (cp & 0x3F));
+    return 4;
+}
+
+/* ---- Entity decoder ------------------------------------------------------- */
+/* Visszaadja a felhasznált bemeneti karakterek számát (0 = nem entitás), és
+ * `out`-ba UTF-8 byte-okat ír (max 4), `*out_len`-be a hosszt. */
+static int decode_entity(const char *s, int max, char *out, int *out_len) {
+    *out_len = 0;
+    if (s[0] != '&') return 0;
+    int cp = 0, consumed = 0;
+    if      (max >= 5 && ci_eq(s, "&amp;", 5))   { cp = '&';    consumed = 5; }
+    else if (max >= 4 && ci_eq(s, "&lt;", 4))    { cp = '<';    consumed = 4; }
+    else if (max >= 4 && ci_eq(s, "&gt;", 4))    { cp = '>';    consumed = 4; }
+    else if (max >= 6 && ci_eq(s, "&quot;", 6))  { cp = '"';    consumed = 6; }
+    else if (max >= 6 && ci_eq(s, "&nbsp;", 6))  { cp = ' ';    consumed = 6; }
+    else if (max >= 6 && ci_eq(s, "&apos;", 6))  { cp = '\'';   consumed = 6; }
+    else if (max >= 6 && ci_eq(s, "&copy;", 6))  { cp = 0xA9;   consumed = 6; }
+    else if (max >= 5 && ci_eq(s, "&reg;", 5))   { cp = 0xAE;   consumed = 5; }
+    else if (max >= 6 && ci_eq(s, "&deg;", 5))   { cp = 0xB0;   consumed = 5; }
+    else if (max >= 7 && ci_eq(s, "&mdash;", 7)) { cp = 0x2014; consumed = 7; }
+    else if (max >= 7 && ci_eq(s, "&ndash;", 7)) { cp = 0x2013; consumed = 7; }
+    else if (max >= 7 && ci_eq(s, "&lsquo;", 7)) { cp = 0x2018; consumed = 7; }
+    else if (max >= 7 && ci_eq(s, "&rsquo;", 7)) { cp = 0x2019; consumed = 7; }
+    else if (max >= 7 && ci_eq(s, "&ldquo;", 7)) { cp = 0x201C; consumed = 7; }
+    else if (max >= 7 && ci_eq(s, "&rdquo;", 7)) { cp = 0x201D; consumed = 7; }
+    else if (max >= 8 && ci_eq(s, "&hellip;", 8)){ cp = 0x2026; consumed = 8; }
+    else if (max >= 7 && ci_eq(s, "&trade;", 7)) { cp = 0x2122; consumed = 7; }
+    else if (max >= 7 && ci_eq(s, "&euro;", 6))  { cp = 0x20AC; consumed = 6; }
+    else if (s[1] == '#') {
+        /* Numerikus: &#NN; vagy &#xHH; */
+        int code = 0, i = 2, hex = 0, digits = 0;
+        if (i < max && (s[i] == 'x' || s[i] == 'X')) { hex = 1; i++; }
+        while (i < max) {
+            char ch = s[i];
+            int d;
+            if (hex) {
+                if (ch >= '0' && ch <= '9') d = ch - '0';
+                else if (ch >= 'a' && ch <= 'f') d = ch - 'a' + 10;
+                else if (ch >= 'A' && ch <= 'F') d = ch - 'A' + 10;
+                else break;
+                code = code * 16 + d;
+            } else {
+                if (ch >= '0' && ch <= '9') d = ch - '0'; else break;
+                code = code * 10 + d;
+            }
+            digits++; i++;
+        }
+        if (digits > 0 && i < max && s[i] == ';') { cp = code; consumed = i + 1; }
+        else return 0;
+    }
+    else return 0;
+
+    *out_len = utf8_encode(cp, out);
+    return consumed;
 }
 
 /* ---- HTML to layout text -------------------------------------------------
@@ -223,14 +274,16 @@ static void parse_html(const char *html, int len, char *title_out, int title_max
             continue;
         }
         if (c == '&') {
-            char ec = 0;
-            int n = decode_entity(html + i, len - i, &ec);
+            char eb[4];
+            int el = 0;
+            int n = decode_entity(html + i, len - i, eb, &el);
             if (n > 0) {
                 if (in_title) {
                     int tl = 0; while (title_out[tl]) tl++;
-                    if (tl < title_max - 1) { title_out[tl] = ec; title_out[tl + 1] = 0; }
+                    for (int k = 0; k < el && tl < title_max - 1; k++) title_out[tl++] = eb[k];
+                    title_out[tl] = 0;
                 } else if (!in_script && !in_style) {
-                    if (bi < BR_BLOCK_TEXT_MAX - 1) buf[bi++] = ec;
+                    for (int k = 0; k < el && bi < BR_BLOCK_TEXT_MAX - 1; k++) buf[bi++] = eb[k];
                 }
                 i += n;
                 continue;

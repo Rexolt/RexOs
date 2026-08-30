@@ -1,0 +1,30 @@
+<!DOCTYPE html>
+<html><head><meta charset="utf-8"><title>RexOS CSS-teszt</title>
+<style>
+body{font-family:sans-serif;margin:10px;font-size:13px}
+.row{margin-bottom:8px}
+.box{width:90px;height:46px;display:inline-block;margin-right:6px;color:#fff;
+     text-align:center;line-height:46px;font-size:11px;background:#345}
+.t1{border-radius:14px;background:#e63946}
+.t2{background:linear-gradient(90deg,#f4a261,#2a9d8f)}
+.t3{opacity:.45;background:#1d3557}
+.t4{box-shadow:4px 4px 0 #888;background:#457b9d}
+.t5{transform:rotate(-8deg);background:#6a4c93}
+.t6{background:rgba(230,57,70,.55);border:3px dashed #023047}
+.flex{display:flex;gap:6px;border:1px solid #bbb;padding:5px}
+.flex div{flex:1;background:#8ecae6;text-align:center;padding:8px 0}
+.flex .grow2{flex:2;background:#ffb703}
+.grid2{display:grid;grid-template-columns:1fr 2fr 1fr;gap:6px;border:1px solid #bbb;padding:5px}
+.grid2 div{background:#a8dadc;text-align:center;padding:8px 0}
+table{border-collapse:collapse}td,th{border:1px solid #999;padding:3px 8px}
+.pos{position:relative;height:46px;border:1px solid #bbb}
+.pos span{position:absolute;right:6px;top:12px;background:#ffd166;padding:2px 6px}
+</style></head><body>
+<div class="row"><b>Alap dobozok:</b><br>
+<span class="box t1">radius</span><span class="box t2">gradient</span><span class="box t3">opacity</span>
+<span class="box t4">shadow</span><span class="box t5">rotate</span><span class="box t6">rgba</span></div>
+<div class="row"><b>Flexbox:</b><div class="flex"><div>1</div><div class="grow2">2 (flex:2)</div><div>3</div></div></div>
+<div class="row"><b>CSS Grid:</b><div class="grid2"><div>1fr</div><div>2fr</div><div>1fr</div></div></div>
+<div class="row"><b>Tablazat:</b><table><tr><th>A</th><th>B</th></tr><tr><td>1</td><td>2</td></tr></table></div>
+<div class="row"><b>position:absolute:</b><div class="pos"><span>jobbra fent</span></div></div>
+</body></html>

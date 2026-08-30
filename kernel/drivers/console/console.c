@@ -60,6 +60,10 @@ void console_init(void)
 
 bool console_is_ready(void) { return s_ready; }
 
+/* Grafikus user app (sys_get_fb) átvette a framebuffert: a konzol nem
+ * rajzolhat többé rá. A kprintf a soros portra továbbra is megy. */
+void console_release_fb(void) { s_ready = false; }
+
 void console_set_colors(uint32_t fg, uint32_t bg)
 {
     s_fg = fg;

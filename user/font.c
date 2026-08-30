@@ -50,6 +50,32 @@ static unsigned int  s_cache_age[GLYPH_CACHE_SLOTS];
 
 static stbtt_fontinfo *get_info(void) { return (stbtt_fontinfo *)s_fontinfo_storage; }
 
+/* Egy UTF-8 szekvencia dekódolása `*p`-től. Visszaadja a Unicode codepoint-ot,
+ * és `*p`-t a következő karakterre lépteti. Érvénytelen byte-ot Latin-1-ként
+ * (önmagaként) ad vissza, 1 byte lépéssel. NUL-terminált stringen biztonságos:
+ * a folytonossági byte-ok ellenőrzése rövidre zár, mielőtt a NUL után olvasna. */
+static int utf8_next(const unsigned char **p) {
+    const unsigned char *s = *p;
+    unsigned char c = s[0];
+    if (c < 0x80) { *p = s + 1; return c; }
+    if ((c & 0xE0) == 0xC0 && (s[1] & 0xC0) == 0x80) {
+        *p = s + 2;
+        return ((c & 0x1F) << 6) | (s[1] & 0x3F);
+    }
+    if ((c & 0xF0) == 0xE0 && (s[1] & 0xC0) == 0x80 && (s[2] & 0xC0) == 0x80) {
+        *p = s + 3;
+        return ((c & 0x0F) << 12) | ((s[1] & 0x3F) << 6) | (s[2] & 0x3F);
+    }
+    if ((c & 0xF8) == 0xF0 && (s[1] & 0xC0) == 0x80 &&
+        (s[2] & 0xC0) == 0x80 && (s[3] & 0xC0) == 0x80) {
+        *p = s + 4;
+        return ((c & 0x07) << 18) | ((s[1] & 0x3F) << 12) |
+               ((s[2] & 0x3F) << 6) | (s[3] & 0x3F);
+    }
+    *p = s + 1;   /* érvénytelen lead byte: Latin-1 fallback */
+    return c;
+}
+
 int font_init(void) {
     if (s_font_initialized) return 1;
     int off = stbtt_GetFontOffsetForIndex(font_dejavu_mono, 0);
@@ -186,9 +212,10 @@ int font_draw_text(uint32_t *dst, int dst_w, int dst_h,
                    int x, int y, const char *text, int pixel_height, uint32_t color) {
     if (!text) return 0;
     int x0 = x;
-    while (*text) {
-        unsigned char c = (unsigned char)*text++;
-        x += font_draw_char(dst, dst_w, dst_h, x, y, (int)c, pixel_height, color);
+    const unsigned char *p = (const unsigned char *)text;
+    while (*p) {
+        int cp = utf8_next(&p);
+        x += font_draw_char(dst, dst_w, dst_h, x, y, cp, pixel_height, color);
     }
     return x - x0;
 }
@@ -204,8 +231,10 @@ int font_draw_text_bold(uint32_t *dst, int dst_w, int dst_h,
 int font_measure_text(const char *text, int pixel_height) {
     if (!text) return 0;
     int w = 0;
-    while (*text) {
-        glyph_entry_t *g = cache_get((unsigned char)*text++, pixel_height);
+    const unsigned char *p = (const unsigned char *)text;
+    while (*p) {
+        int cp = utf8_next(&p);
+        glyph_entry_t *g = cache_get(cp, pixel_height);
         if (g) w += g->advance;
     }
     return w;

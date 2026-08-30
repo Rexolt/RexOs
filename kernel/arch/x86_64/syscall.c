@@ -4,6 +4,7 @@
 #include <sched/sched.h>
 #include <drivers/keyboard/keyboard.h>
 #include <drivers/framebuffer/fb.h>
+#include <drivers/console/console.h>
 #include <mm/vmm.h>
 #include <mm/pmm.h>
 #include <rexos/fs.h>
@@ -21,6 +22,9 @@ extern uint64_t pit_ticks(void);
 #define SYS_TIME        24
 #define SYS_NET_CLOSE   25
 #define SYS_RANDOM      26
+#define SYS_STAT        27
+#define SYS_FSTAT       28
+#define SYS_SLEEP_MS    29
 
 #define PIT_HZ 100
 #define NET_CONNECT_TIMEOUT_TICKS (10 * PIT_HZ)
@@ -142,7 +146,7 @@ uint64_t syscall_handler(uint64_t nr, uint64_t arg1, uint64_t arg2, uint64_t arg
             /* User buffer NEM null-terminált; tartsuk be a megadott hosszt. */
             kprintf("%.*s", (int)arg3, (const char *)arg2);
             return arg3;
-        } else if (arg1 >= 3 && arg1 < 16) {  /* fájl fd */
+        } else if (arg1 >= 3 && arg1 < TASK_FD_MAX) {  /* fájl fd */
             if (!uptr_mapped(arg2, arg3)) return (uint64_t)-1;
             task_t *t = task_current();
             if (t->fd_table[arg1]) {
@@ -176,7 +180,7 @@ uint64_t syscall_handler(uint64_t nr, uint64_t arg1, uint64_t arg2, uint64_t arg
                 }
             }
             return read;
-        } else if (arg1 >= 3 && arg1 < 16) {
+        } else if (arg1 >= 3 && arg1 < TASK_FD_MAX) {
             if (!uptr_mapped(arg2, arg3)) return (uint64_t)-1;
             task_t *t = task_current();
             if (t->fd_table[arg1]) {
@@ -187,6 +191,7 @@ uint64_t syscall_handler(uint64_t nr, uint64_t arg1, uint64_t arg2, uint64_t arg
         }
         return 0;
     } else if (nr == 4) { // sys_get_fb
+        console_release_fb(); /* a fb mostantól a user appé; konzol csak serial */
         if (!uptr_mapped(arg1, sizeof(uint64_t)) ||
             !uptr_mapped(arg2, sizeof(uint64_t)) ||
             !uptr_mapped(arg3, sizeof(uint64_t))) return (uint64_t)-1;
@@ -252,7 +257,7 @@ uint64_t syscall_handler(uint64_t nr, uint64_t arg1, uint64_t arg2, uint64_t arg
         if (!node) return (uint64_t)-1;
 
         task_t *t = task_current();
-        for (int i = 3; i < 16; i++) {
+        for (int i = 3; i < TASK_FD_MAX; i++) {
             if (!t->fd_table[i]) {
                 t->fd_table[i] = node;
                 t->fd_offset[i] = 0;
@@ -263,7 +268,7 @@ uint64_t syscall_handler(uint64_t nr, uint64_t arg1, uint64_t arg2, uint64_t arg
     } else if (nr == 7) { // sys_getdents
         if (!uptr_mapped(arg2, sizeof(dirent_t))) return (uint64_t)-1;
         task_t *t = task_current();
-        if (arg1 >= 3 && arg1 < 16 && t->fd_table[arg1]) {
+        if (arg1 >= 3 && arg1 < TASK_FD_MAX && t->fd_table[arg1]) {
             dirent_t *user_dir = (dirent_t *)arg2;
             dirent_t *d = vfs_readdir(t->fd_table[arg1], t->fd_offset[arg1]);
             if (d) {
@@ -290,16 +295,39 @@ uint64_t syscall_handler(uint64_t nr, uint64_t arg1, uint64_t arg2, uint64_t arg
         
         /* Igazítsuk page-re */
         new_brk = (new_brk + 0xFFF) & ~0xFFF;
-        
+
         if (new_brk < t->brk_start) {
             return t->brk_current; /* nem engedjük az ELF alá menni */
         }
+
+        /* Felső korlát: a framebuffer user mappingje 0xA0000000-nál kezdődik
+         * (sys_get_fb), a heap nem nőhet bele. 2 GB bőven elég a NetSurfnek. */
+        if (new_brk > 0x80000000ULL) {
+            kprintf("[brk] heap cap hit: request 0x%lx > 0x80000000\n", new_brk);
+            return t->brk_current;
+        }
         
-        /* Növelés: új lapok mappelése */
+        /* Növelés: új lapok mappelése.
+         *
+         * A heap zsugorodhat is (a newlib malloc_trim negatív sbrk-t hív);
+         * ilyenkor csak a brk_current megy lejjebb, a lapok mappelve
+         * maradnak. Újranövéskor tehát MÁR MAPPELT lapokra futhatunk: ezeket
+         * békén kell hagyni, különben minden ciklusban új fizikai frame
+         * kerülne a régi helyére (frame-szivárgás + a régi frame-re mutató
+         * fordítások elárvulnak). */
         uint64_t old_page = (t->brk_current + 0xFFF) & ~0xFFF;
         for (uint64_t page = old_page; page < new_brk; page += 0x1000) {
+            if (vmm_translate_pml4(t->cr3, page) != 0) continue; /* már megvan */
             uintptr_t phys = pmm_alloc_frame();
-            if (!phys) return t->brk_current; /* nincs elég memória */
+            if (!phys) {
+                kprintf("[brk] OUT OF PHYSICAL MEMORY at 0x%lx (heap %lu KB, free frames %lu)\n",
+                        page, (t->brk_current - t->brk_start) / 1024,
+                        (uint64_t)pmm_free_frames_count());
+                /* A már lefoglalt lapok mappelve maradnak; a brk_current nem
+                 * mozdul, így a következő próbálkozás újra tudja használni
+                 * őket (a fenti skip miatt). */
+                return t->brk_current;
+            }
             vmm_map_page_pml4(t->cr3, page, phys, PAGE_PRESENT | PAGE_WRITABLE | PAGE_USER);
             kmemset((void *)phys_to_virt(phys), 0, 0x1000);
         }
@@ -410,7 +438,7 @@ uint64_t syscall_handler(uint64_t nr, uint64_t arg1, uint64_t arg2, uint64_t arg
 
     } else if (nr == 19) { // sys_close(fd)
         int fd = (int)arg1;
-        if (fd >= 3 && fd < 16) {
+        if (fd >= 3 && fd < TASK_FD_MAX) {
             task_t *t = task_current();
             if (t->fd_table[fd]) {
                 vfs_close(t->fd_table[fd]);
@@ -423,7 +451,7 @@ uint64_t syscall_handler(uint64_t nr, uint64_t arg1, uint64_t arg2, uint64_t arg
 
     } else if (nr == 20) { // sys_seek(fd, offset)
         int fd = (int)arg1;
-        if (fd >= 3 && fd < 16) {
+        if (fd >= 3 && fd < TASK_FD_MAX) {
             task_t *t = task_current();
             if (t->fd_table[fd]) {
                 t->fd_offset[fd] = arg2;
@@ -604,6 +632,39 @@ uint64_t syscall_handler(uint64_t nr, uint64_t arg1, uint64_t arg2, uint64_t arg
             kmemcpy(out + i, &r, chunk);
         }
         return arg2;
+
+    } else if (nr == SYS_STAT || nr == SYS_FSTAT) {
+        /* SYS_STAT(path, out) / SYS_FSTAT(fd, out)
+         *   out[0..7]   = length (u64)
+         *   out[8..11]  = flags  (u32, FS_FILE / FS_DIRECTORY / ...)
+         *   out[12..15] = inode  (u32)
+         */
+        if (!uptr_mapped(arg2, 16)) return (uint64_t)-1;
+        vfs_node_t *node = NULL;
+        if (nr == SYS_STAT) {
+            if (!uptr_ok(arg1, 1)) return (uint64_t)-1;
+            const char *path = (const char *)arg1;
+            node = (path[0] == '/') ? vfs_lookup(path) : vfs_finddir(fs_root, path);
+        } else {
+            int fd = (int)arg1;
+            if (fd >= 3 && fd < TASK_FD_MAX) node = task_current()->fd_table[fd];
+        }
+        if (!node) return (uint64_t)-1;
+        uint8_t *out = (uint8_t *)arg2;
+        *(uint64_t *)(out + 0)  = node->length;
+        *(uint32_t *)(out + 8)  = node->flags;
+        *(uint32_t *)(out + 12) = node->inode;
+        return 0;
+
+    } else if (nr == SYS_SLEEP_MS) { /* SYS_SLEEP_MS(ms) */
+        /* PIT 100 Hz -> 1 tick = 10 ms; felfelé kerekítünk, hogy sleep(1) is
+         * legalább egy tickig adja át a CPU-t. */
+        uint64_t ticks = (arg1 + (1000 / PIT_HZ) - 1) / (1000 / PIT_HZ);
+        uint64_t start = pit_ticks();
+        while (pit_ticks() - start < ticks) {
+            task_yield();
+        }
+        return 0;
     }
 
     kprintf("[syscall] Unknown syscall %lu from task '%s'\n", nr, task_current()->name);

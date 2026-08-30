@@ -9,3 +9,4 @@ void console_clear(void);
 
 void console_set_colors(uint32_t fg, uint32_t bg);
 bool console_is_ready(void);
+void console_release_fb(void);           /* konzol leválasztása a fb-ről */

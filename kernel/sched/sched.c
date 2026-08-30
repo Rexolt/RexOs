@@ -97,6 +97,16 @@ static void reaper_task_entry(void *arg) {
 
 /* --- Helpers ------------------------------------------------------------ */
 
+/* FPU/SSE kezdőállapot egy új tasknak. A kzalloc miatt a terület nulla;
+ * csak a kontrollregisztereket kell default-ra állítani, mert a csupa nulla
+ * FCW/MXCSR minden FP kivételt DEMASZKOLNA (első SSE művelet -> #XM/#MF).
+ * FXSAVE layout: offset 0 = x87 FCW (u16), offset 24 = MXCSR (u32). */
+static void fpu_state_init(task_t *t)
+{
+    *(uint16_t *)(t->fpu_state + 0)  = 0x037F; /* x87 control word: minden maszkolva */
+    *(uint32_t *)(t->fpu_state + 24) = 0x1F80; /* MXCSR: minden SSE kivétel maszkolva */
+}
+
 static void list_insert(task_t *t)
 {
     if (!s_task_list_head) {
@@ -163,6 +173,7 @@ void sched_init(void)
 
     t0->id   = s_next_id++;
     t0->state = TASK_STATE_RUNNING;
+    fpu_state_init(t0);
     t0->stack_base = (uint8_t *)kmalloc(TASK_STACK_SIZE);
     t0->cr3 = vmm_kernel_pml4_phys();
     t0->rsp = 0;            /* az első IRQ exit fogja kitölteni mentéskor */
@@ -205,6 +216,7 @@ task_t *task_create(const char *name, task_entry_fn entry, void *arg)
 
     t->id = s_next_id++;
     t->state = TASK_STATE_READY;
+    fpu_state_init(t);
     t->stack_base = stack;
     t->cr3 = vmm_kernel_pml4_phys();
     t->entry = entry;
@@ -282,8 +294,9 @@ static void user_task_launcher(void *arg) {
     
     /* Felhasználói stack lefoglalása és mappelése */
     /* Use a high address in user space that doesn't conflict with ELF segments */
-    uint64_t user_stack_base = 0x00007FFFFF7FC000;  /* page-aligned base */
-    uint64_t stack_size = 4 * 4096;                  // 16 KB stack
+    uint64_t stack_size = 256 * 1024;               /* 256 KB: a NetSurf/libcss
+                                                       rekurzív hívásaihoz kell */
+    uint64_t user_stack_base = 0x00007FFFFF800000 - stack_size; /* page-aligned */
     uint64_t user_stack_top_aligned = user_stack_base + stack_size; /* page-aligned top */
     for (uint64_t page = user_stack_base; page < user_stack_top_aligned; page += 4096) {
         uintptr_t phys = pmm_alloc_frame();
@@ -404,6 +417,9 @@ uint64_t sched_maybe_switch(uint64_t current_rsp)
      * éppen, de azt csak a következő reaper takaríthatja ki később). */
     if (prev->state != TASK_STATE_DEAD) {
         prev->rsp = current_rsp;
+        /* FPU/SSE állapot mentése: a user kód (és később a newlib/NetSurf)
+         * XMM regisztereket használ, ezek az IRQ frame-ben NINCSENEK benne. */
+        __asm__ volatile("fxsave64 (%0)" :: "r"(prev->fpu_state) : "memory");
         if (prev->state == TASK_STATE_RUNNING) prev->state = TASK_STATE_READY;
     } else {
         /* Kihúzzuk a listából, hogy a következő pick már ne válassza. */
@@ -414,6 +430,9 @@ uint64_t sched_maybe_switch(uint64_t current_rsp)
 
     next->state = TASK_STATE_RUNNING;
     s_current = next;
+
+    /* A következő task FPU/SSE állapotának visszatöltése. */
+    __asm__ volatile("fxrstor64 (%0)" :: "r"(next->fpu_state) : "memory");
 
     g_current_kernel_rsp = (uint64_t)next->stack_base + TASK_STACK_SIZE;
     tss_set_rsp0(g_current_kernel_rsp);

@@ -1,0 +1,15 @@
+<!DOCTYPE html><html><head><meta charset="utf-8"><title>Timer teszt</title></head>
+<body><h2>Idozito teszt</h2><div id="log">indul</div>
+<script>
+/* A sikert NEM a kepernyorol olvassuk le: minden lepes letolt egy kepet,
+   ami a soros naplon [fetch] GET sorkent latszik. Igy a repaint kerdese
+   nem zavar bele a meresbe. */
+function ping(tag){ var i=document.createElement("img"); i.src="ping-"+tag+".png"; document.body.appendChild(i); }
+ping("sync");
+setTimeout(function(){ ping("timeout300"); }, 300);
+setTimeout(function(){ ping("timeout2000"); }, 2000);
+var n=0;
+var iv=setInterval(function(){ n++; ping("interval"+n); if(n>=3) clearInterval(iv); }, 500);
+document.addEventListener("DOMContentLoaded", function(){ ping("domcontentloaded"); });
+window.addEventListener("load", function(){ ping("windowload"); });
+</script></body></html>

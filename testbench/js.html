@@ -1,0 +1,54 @@
+<!DOCTYPE html>
+<html><head><meta charset="utf-8"><title>RexOS JS-teszt</title>
+<style>body{font-family:sans-serif;font-size:13px;margin:10px}
+#out div{padding:2px 6px;margin:2px 0;border-left:4px solid #ccc}
+.ok{border-color:#2a9d8f !important;background:#e8f6f3}
+.no{border-color:#e63946 !important;background:#fdeaec}</style></head>
+<body><h2 id="h">JS teszt</h2><div id="out"></div>
+<script>
+var out=document.getElementById("out");
+function t(name,fn){
+  var d=document.createElement("div");
+  try{ var r=fn(); d.className=r?"ok":"no"; d.textContent=(r?"OK   ":"NEM  ")+name+(typeof r==="string"?" -> "+r:""); }
+  catch(e){ d.className="no"; d.textContent="HIBA "+name+" -> "+e; }
+  out.appendChild(d);
+}
+t("DOM createElement/appendChild",function(){return !!out});
+t("getElementById",function(){return !!document.getElementById("h")});
+t("querySelector",function(){return !!document.querySelector("#h")});
+t("querySelectorAll",function(){return document.querySelectorAll("div").length>0});
+t("classList",function(){var e=document.createElement("i");e.classList.add("x");return e.className==="x"});
+t("style property",function(){var e=document.createElement("i");e.style.color="red";return e.style.color});
+t("addEventListener",function(){var e=document.createElement("b");var hit=0;
+   e.addEventListener("click",function(){hit=1});
+   if(e.click){e.click();} return hit===1||!!e.addEventListener});
+t("JSON.parse/stringify",function(){return JSON.stringify(JSON.parse('{"a":[1,2]}'))==='{"a":[1,2]}'});
+t("Array map/filter/reduce",function(){return [1,2,3].map(function(x){return x*2}).reduce(function(a,b){return a+b},0)===12});
+t("String methods",function(){return "abc".toUpperCase()==="ABC" && "a,b".split(",").length===2});
+t("Math/Date",function(){return Math.floor(3.7)===3 && (new Date()).getFullYear()>2000});
+t("closures/apply",function(){return (function(){return arguments.length}).apply(null,[1,2,3])===3});
+t("try/catch + throw",function(){try{throw new Error("x")}catch(e){return e.message==="x"}});
+t("regexp",function(){return /^a\d+$/.test("a42")});
+t("setTimeout letezik",function(){return typeof setTimeout==="function"});
+t("XMLHttpRequest letezik",function(){return typeof XMLHttpRequest!=="undefined"});
+t("fetch() letezik",function(){return typeof fetch!=="undefined"});
+t("localStorage letezik",function(){return typeof localStorage!=="undefined"});
+t("navigator.userAgent",function(){return navigator.userAgent});
+t("window.innerWidth",function(){return ""+window.innerWidth});
+t("ES6 let/const",function(){try{eval("let q=1;const w=2;");return true}catch(e){return false}});
+t("ES6 arrow fn",function(){try{return eval("[1,2].map(x=>x*2)[1]")===4}catch(e){return false}});
+t("ES6 template string",function(){try{return eval("`a${1+1}b`")==="a2b"}catch(e){return false}});
+t("innerHTML iras",function(){var e=document.createElement("div");e.innerHTML="<b>x</b>";return e.childNodes.length>0});
+t("document.title",function(){return document.title});
+// aszinkron: setTimeout tenyleg lefut-e
+var d=document.createElement("div"); d.className="no"; d.textContent="NEM  setTimeout tenyleg lefut";
+out.appendChild(d);
+setTimeout(function(){ d.className="ok"; d.textContent="OK   setTimeout tenyleg lefut"; },300);
+// XHR eles proba
+var dx=document.createElement("div"); dx.className="no"; dx.textContent="NEM  XHR lekeres";
+out.appendChild(dx);
+try{ var x=new XMLHttpRequest(); x.onreadystatechange=function(){
+      if(x.readyState===4){ dx.className=x.status===200?"ok":"no";
+        dx.textContent=(x.status===200?"OK   ":"NEM  ")+"XHR lekeres -> status "+x.status+" len "+(x.responseText||"").length; } };
+     x.open("GET","data.txt",true); x.send(); }catch(e){ dx.textContent="HIBA XHR -> "+e; }
+</script></body></html>

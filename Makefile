@@ -185,8 +185,13 @@ $(BUILD)/$(KERNEL): $(OBJS) $(KDIR)/linker.ld
 
 # -----------------------------------------------------------------------------
 #  Object fordítás
+#  Minden kernel .o függ az összes kernel headertől: ha egy struct layout
+#  változik (pl. task_t), MINDEN érintett fordítási egység újraforduljon,
+#  különben a stale .o-k régi mező-offsetekkel olvasnák a structokat.
 # -----------------------------------------------------------------------------
-$(BUILD)/%.c.o: $(KDIR)/%.c
+KERNEL_HDRS := $(shell find $(KDIR) -name '*.h' 2>/dev/null)
+
+$(BUILD)/%.c.o: $(KDIR)/%.c $(KERNEL_HDRS)
 	@mkdir -p $(dir $@)
 	@echo "  CC   $<"
 	@$(CC) $(CFLAGS) -c $< -o $@
@@ -206,7 +211,9 @@ $(LIMINE_DIR)/limine:
 # -----------------------------------------------------------------------------
 #  User Mode Programok építése
 # -----------------------------------------------------------------------------
-USER_CFLAGS = -Wall -Wextra -O2 -ffreestanding -fno-stack-protector -fno-pic -fpie -mno-red-zone -nostdlib -mno-sse -mno-sse2
+# SSE engedélyezve: a scheduler menti az FPU/SSE állapotot (fxsave/fxrstor),
+# és az x86_64 SysV ABI amúgy is XMM-ben adja át a float/double argumentumokat.
+USER_CFLAGS = -Wall -Wextra -O2 -ffreestanding -fno-stack-protector -fno-pic -fpie -mno-red-zone -nostdlib
 
 $(BUILD)/libc.o: user/libc.c
 	@mkdir -p $(BUILD)
@@ -243,6 +250,16 @@ $(BUILD)/memtest.elf: user/memtest.c $(BUILD)/libc.o
 	@echo "  CC   user/memtest.c"
 	@$(CC) $(USER_CFLAGS) -static -Wl,-e,_start -Wl,--build-id=none user/memtest.c $(BUILD)/libc.o -o $@
 
+$(BUILD)/fptest.elf: user/fptest.c user/libc.h $(BUILD)/libc.o
+	@mkdir -p $(BUILD)
+	@echo "  CC   user/fptest.c"
+	@$(CC) $(USER_CFLAGS) -static -Wl,-e,_start -Wl,--build-id=none user/fptest.c $(BUILD)/libc.o -o $@
+
+$(BUILD)/fpspin.elf: user/fpspin.c user/libc.h $(BUILD)/libc.o
+	@mkdir -p $(BUILD)
+	@echo "  CC   user/fpspin.c"
+	@$(CC) $(USER_CFLAGS) -static -Wl,-e,_start -Wl,--build-id=none user/fpspin.c $(BUILD)/libc.o -o $@
+
 # --- TLS layer (BearSSL userspace lib-re épül) ---
 USER_TLS_CFLAGS := $(USER_CFLAGS) -I$(BEARSSL_DIR)/inc
 
@@ -261,7 +278,7 @@ $(BUILD)/ca_bundle.o: user/ca_bundle.c $(BEARSSL_USER_LIB)
 tls-check: $(BUILD)/tls.o $(BUILD)/ca_bundle.o
 .PHONY: tls-check
 
-$(BUILD)/http.o: user/http.c user/http.h user/libc.h user/tls.h
+$(BUILD)/http.o: user/http.c user/http.h user/libc.h user/tls.h user/inflate.h
 	@mkdir -p $(BUILD)
 	@echo "  CC   user/http.c (with TLS)"
 	@$(CC) $(USER_TLS_CFLAGS) -c user/http.c -o $@
@@ -277,6 +294,12 @@ $(BUILD)/nettest.elf: user/nettest.c user/http.h user/libc.h \
 	    $(BUILD)/libc.o $(BUILD)/http.o $(BUILD)/tls.o $(BUILD)/ca_bundle.o \
 	    $(BEARSSL_USER_LIB) \
 	    -o $@
+
+# --- DEFLATE / gzip dekompresszió (puff-alapú, plain C, nincs float) ---
+$(BUILD)/inflate.o: user/inflate.c user/inflate.h user/libc.h
+	@mkdir -p $(BUILD)
+	@echo "  CC   user/inflate.c"
+	@$(CC) $(USER_CFLAGS) -c user/inflate.c -o $@
 
 # --- Font subsystem (stb_truetype + DejaVu Sans Mono) ---
 # A font kódhoz SSE/SSE2 KELL (x86-64 ABI float ABI), és kifejezetten engedjük az
@@ -325,7 +348,7 @@ $(BUILD)/desktop_%.o: user/desktop/%.c user/desktop/desktop.h user/desktop/theme
 
 $(BUILD)/desktop.elf: $(DESKTOP_OBJS) \
                       $(BUILD)/libc.o \
-                      $(BUILD)/http.o $(BUILD)/tls.o $(BUILD)/ca_bundle.o \
+                      $(BUILD)/http.o $(BUILD)/inflate.o $(BUILD)/tls.o $(BUILD)/ca_bundle.o \
                       $(BUILD)/font.o $(BUILD)/font_stb.o $(BUILD)/math_min.o $(BUILD)/font_data.o \
                       $(BEARSSL_USER_LIB)
 	@mkdir -p $(BUILD)
@@ -333,7 +356,7 @@ $(BUILD)/desktop.elf: $(DESKTOP_OBJS) \
 	@$(CC) $(USER_FONT_CFLAGS) -static -Wl,-e,_start -Wl,--build-id=none \
 	    $(DESKTOP_OBJS) \
 	    $(BUILD)/libc.o \
-	    $(BUILD)/http.o $(BUILD)/tls.o $(BUILD)/ca_bundle.o \
+	    $(BUILD)/http.o $(BUILD)/inflate.o $(BUILD)/tls.o $(BUILD)/ca_bundle.o \
 	    $(BUILD)/font.o $(BUILD)/font_stb.o $(BUILD)/math_min.o $(BUILD)/font_data.o \
 	    $(BEARSSL_USER_LIB) \
 	    -o $@
@@ -347,7 +370,7 @@ ifeq ($(NETTEST),1)
 INITRD_NETTEST := $(BUILD)/nettest.elf
 endif
 
-$(INITRD_TAR): $(BUILD)/hello.elf $(BUILD)/shell.elf $(BUILD)/gui.elf $(BUILD)/ls.elf $(BUILD)/cat.elf $(BUILD)/memtest.elf $(BUILD)/desktop.elf $(INITRD_NETTEST)
+$(INITRD_TAR): $(BUILD)/hello.elf $(BUILD)/shell.elf $(BUILD)/gui.elf $(BUILD)/ls.elf $(BUILD)/cat.elf $(BUILD)/memtest.elf $(BUILD)/fptest.elf $(BUILD)/fpspin.elf $(BUILD)/desktop.elf $(BUILD)/netsurf.elf $(INITRD_NETTEST)
 	@mkdir -p $(BUILD)
 	@echo "  TAR  $@"
 	@cp $(BUILD)/hello.elf initrd/hello.elf
@@ -356,7 +379,12 @@ $(INITRD_TAR): $(BUILD)/hello.elf $(BUILD)/shell.elf $(BUILD)/gui.elf $(BUILD)/l
 	@cp $(BUILD)/ls.elf initrd/ls.elf
 	@cp $(BUILD)/cat.elf initrd/cat.elf
 	@cp $(BUILD)/memtest.elf initrd/memtest.elf
+	@cp $(BUILD)/fptest.elf initrd/fptest.elf
+	@cp $(BUILD)/fpspin.elf initrd/fpspin.elf
 	@cp $(BUILD)/desktop.elf initrd/desktop.elf
+	@cp $(BUILD)/netsurf.elf initrd/netsurf.elf
+	$(call NETSURF_RES_COPY,initrd)
+	@printf 'enable_javascript:1\n' > initrd/netsurf/Choices
 	@rm -f initrd/nettest.elf
 ifeq ($(NETTEST),1)
 	@cp $(BUILD)/nettest.elf initrd/nettest.elf
@@ -427,7 +455,7 @@ disk: $(DISK)
 # Split the QEMU flags into small variables instead of line-continuation lists.
 # That keeps make from parsing a following flag as a top-level statement if a
 # continuation backslash picks up stray whitespace ("missing separator").
-QEMU_MEMORY_FLAGS := -m 256M
+QEMU_MEMORY_FLAGS := -m 1G
 QEMU_BOOT_FLAGS   := -cdrom $(ISO) -boot d
 QEMU_SERIAL_FLAGS := -serial stdio
 QEMU_NET_FLAGS    := -netdev user,id=net0 -device e1000,netdev=net0
@@ -445,6 +473,242 @@ QEMU_FLAGS_LEGACY         := $(QEMU_LEGACY_MACHINE_FLAGS) $(QEMU_MEMORY_FLAGS) $
 
 run: $(ISO) $(DISK)
 	qemu-system-x86_64 $(QEMU_FLAGS)
+
+# -----------------------------------------------------------------------------
+#  Newlib-es userspace appok (cross toolchain: tools/build-toolchain.sh)
+#  Explicit -nostdlib link + --start-group, hogy a newlib libc és a RexOS
+#  syscall glue (librexos.a) kölcsönös függőségei felolódjanak.
+# -----------------------------------------------------------------------------
+TC_CC := toolchain/bin/x86_64-elf-gcc
+TC_AR := toolchain/bin/x86_64-elf-ar
+NEWLIB_BUILD  := $(BUILD)/newlib
+NEWLIB_CFLAGS := -O2 -g -Wall -Wextra
+
+$(NEWLIB_BUILD)/crt0.o: user/newlib-glue/crt0.S
+	@mkdir -p $(NEWLIB_BUILD)
+	@echo "  AS   $<"
+	@$(TC_CC) -c $< -o $@
+
+$(NEWLIB_BUILD)/syscalls.o: user/newlib-glue/syscalls.c user/newlib-glue/rexos_syscall.h
+	@mkdir -p $(NEWLIB_BUILD)
+	@echo "  CC   $<"
+	@$(TC_CC) $(NEWLIB_CFLAGS) -c $< -o $@
+
+$(NEWLIB_BUILD)/librexos.a: $(NEWLIB_BUILD)/syscalls.o
+	@echo "  AR   $@"
+	@$(TC_AR) rcs $@ $^
+
+# $(1) = objektumok, $(2) = extra libek (pl. -lpng16 -ljpeg -lz)
+define NEWLIB_LINK
+	@echo "  LD   $@"
+	@$(TC_CC) -nostdlib -static -Wl,--build-id=none -Wl,-e,_start \
+	    $(NEWLIB_BUILD)/crt0.o $(1) \
+	    -Wl,--start-group $(NEWLIB_BUILD)/librexos.a $(2) -lc -lm -lgcc -Wl,--end-group \
+	    -o $@
+endef
+
+$(BUILD)/hello_newlib.elf: user/newlib-glue/hello_newlib.c $(NEWLIB_BUILD)/crt0.o $(NEWLIB_BUILD)/librexos.a
+	@echo "  CC   $<"
+	@$(TC_CC) $(NEWLIB_CFLAGS) -c $< -o $(NEWLIB_BUILD)/hello_newlib.o
+	$(call NEWLIB_LINK,$(NEWLIB_BUILD)/hello_newlib.o)
+
+$(BUILD)/heaptest.elf: user/newlib-glue/heaptest.c $(NEWLIB_BUILD)/crt0.o $(NEWLIB_BUILD)/librexos.a
+	@echo "  CC   $<"
+	@$(TC_CC) $(NEWLIB_CFLAGS) -c $< -o $(NEWLIB_BUILD)/heaptest.o
+	$(call NEWLIB_LINK,$(NEWLIB_BUILD)/heaptest.o)
+
+$(BUILD)/imgview.elf: user/newlib-glue/imgview.c user/newlib-glue/rexos_syscall.h $(NEWLIB_BUILD)/crt0.o $(NEWLIB_BUILD)/librexos.a
+	@echo "  CC   $<"
+	@$(TC_CC) $(NEWLIB_CFLAGS) -c $< -o $(NEWLIB_BUILD)/imgview.o
+	$(call NEWLIB_LINK,$(NEWLIB_BUILD)/imgview.o,-lpng16 -ljpeg -lz)
+
+# -----------------------------------------------------------------------------
+#  Automata tesztek (headless QEMU, soros kimenet, PASS/FAIL grep)
+#  Generikus minta: $(BUILD)/initrd_<nev>.tar -> run-test-<nev>
+#  A tesztelendő app desktop.elf néven kerül az initrd-be, így bootkor indul.
+# -----------------------------------------------------------------------------
+$(BUILD)/initrd_fputest.tar: $(BUILD)/fptest.elf $(BUILD)/fpspin.elf $(BUILD)/hello.elf
+	@echo "  TAR  $@"
+	@rm -rf $(BUILD)/initrd_fputest
+	@mkdir -p $(BUILD)/initrd_fputest
+	@cp $(BUILD)/fptest.elf $(BUILD)/initrd_fputest/desktop.elf
+	@cp $(BUILD)/fpspin.elf $(BUILD)/initrd_fputest/fpspin.elf
+	@cp $(BUILD)/hello.elf  $(BUILD)/initrd_fputest/hello.elf
+	@cd $(BUILD)/initrd_fputest && tar -cf ../initrd_fputest.tar .
+
+$(BUILD)/initrd_heaptest.tar: $(BUILD)/heaptest.elf
+	@echo "  TAR  $@"
+	@rm -rf $(BUILD)/initrd_heaptest
+	@mkdir -p $(BUILD)/initrd_heaptest
+	@cp $(BUILD)/heaptest.elf $(BUILD)/initrd_heaptest/desktop.elf
+	@cd $(BUILD)/initrd_heaptest && tar -cf ../initrd_heaptest.tar .
+
+$(BUILD)/initrd_newlibtest.tar: $(BUILD)/hello_newlib.elf $(BUILD)/hello.elf
+	@echo "  TAR  $@"
+	@rm -rf $(BUILD)/initrd_newlibtest
+	@mkdir -p $(BUILD)/initrd_newlibtest
+	@cp $(BUILD)/hello_newlib.elf $(BUILD)/initrd_newlibtest/desktop.elf
+	@cp $(BUILD)/hello.elf        $(BUILD)/initrd_newlibtest/hello.elf
+	@cd $(BUILD)/initrd_newlibtest && tar -cf ../initrd_newlibtest.tar .
+
+# -----------------------------------------------------------------------------
+#  NetSurf: a tools/build-netsurf.sh által fordított bináris + erőforrások
+#  becsomagolása. A tarfs lapos, ezért a resource fájlok "netsurf/..." néven
+#  kerülnek a tarba (a vfs_lookup exact-match fallbackje kezeli).
+# -----------------------------------------------------------------------------
+NSFB_BIN := toolchain/ports-src/netsurf-all-3.11/netsurf/nsfb
+NSFB_RES := toolchain/ports-src/netsurf-all-3.11/netsurf/frontends/framebuffer/res
+
+$(BUILD)/netsurf.elf: $(NSFB_BIN)
+	@echo "  STRIP $@"
+	@toolchain/bin/x86_64-elf-strip -o $@ $<
+
+define NETSURF_RES_COPY
+	@mkdir -p $(1)/netsurf
+	@cp $(NSFB_RES)/en/Messages     $(1)/netsurf/Messages
+	@cp $(NSFB_RES)/default.css     $(1)/netsurf/default.css
+	@cp $(NSFB_RES)/internal.css    $(1)/netsurf/internal.css
+	@cp $(NSFB_RES)/quirks.css      $(1)/netsurf/quirks.css
+	@cp $(NSFB_RES)/adblock.css     $(1)/netsurf/adblock.css
+	@cp $(NSFB_RES)/en/welcome.html $(1)/netsurf/welcome.html
+	@cp $(NSFB_RES)/en/credits.html $(1)/netsurf/credits.html
+	@cp $(NSFB_RES)/en/licence.html $(1)/netsurf/licence.html
+	@cp $(NSFB_RES)/netsurf.png     $(1)/netsurf/netsurf.png
+	@cp $(NSFB_RES)/favicon.png     $(1)/netsurf/favicon.png
+endef
+
+$(BUILD)/initrd_nstest.tar: $(BUILD)/netsurf.elf $(BUILD)/test.png
+	@echo "  TAR  $@"
+	@rm -rf $(BUILD)/initrd_nstest
+	@mkdir -p $(BUILD)/initrd_nstest
+	@cp $(BUILD)/netsurf.elf $(BUILD)/initrd_nstest/desktop.elf
+	$(call NETSURF_RES_COPY,$(BUILD)/initrd_nstest)
+	@cp $(BUILD)/test.png $(BUILD)/initrd_nstest/netsurf/test.png
+	@printf '<html><head><title>RexOS teszt</title><style>body{background:#dfe;font-family:sans-serif} h1{color:#06c} .box{border:2px solid #06c;padding:8px;width:300px}</style></head><body><h1>NetSurf fut a RexOS-en!</h1><div class="box">CSS layout teszt doboz<br><img src="test.png"></div></body></html>' > $(BUILD)/initrd_nstest/netsurf/test.html
+	@cd $(BUILD)/initrd_nstest && tar -cf ../initrd_nstest.tar .
+
+# JavaScript teszt: helyi HTML DOM-manipuláló scripttel
+$(BUILD)/initrd_nsjs.tar: $(BUILD)/netsurf.elf
+	@echo "  TAR  $@"
+	@rm -rf $(BUILD)/initrd_nsjs
+	@mkdir -p $(BUILD)/initrd_nsjs
+	@cp $(BUILD)/netsurf.elf $(BUILD)/initrd_nsjs/desktop.elf
+	$(call NETSURF_RES_COPY,$(BUILD)/initrd_nsjs)
+	@printf 'homepage_url:file:///netsurf/jstest.html\nenable_javascript:1\n' > $(BUILD)/initrd_nsjs/netsurf/Choices
+	@printf '<html><head><title>JS teszt</title><style>#out{border:3px solid #c00;padding:10px;font-size:20px;background:#fee}</style></head><body><h1>RexOS JavaScript teszt</h1><div id="out">JS NEM FUT (statikus tartalom)</div><script>var d=document.getElementById("out");d.textContent="JS FUT! 6*7="+(6*7)+" | UA: "+navigator.userAgent;d.style.background="#efe";d.style.borderColor="#0a0";var p=document.createElement("p");p.textContent="Ezt a bekezdest JavaScript hozta letre (DOM createElement).";document.body.appendChild(p);</script></body></html>' > $(BUILD)/initrd_nsjs/netsurf/jstest.html
+	@cd $(BUILD)/initrd_nsjs && tar -cf ../initrd_nsjs.tar .
+
+# Élő hálózati teszt: a homepage http://example.com (QEMU user-mode net)
+$(BUILD)/nsspawn.elf: user/nsspawn.c $(BUILD)/libc.o
+	@echo "  CC   $<"
+	@$(CC) $(USER_CFLAGS) -static -Wl,-e,_start -Wl,--build-id=none user/nsspawn.c $(BUILD)/libc.o -o $@
+
+# A desktop valodi utvonala: spawn("netsurf.elf") + waitpid, GUI nelkul.
+$(BUILD)/initrd_nsspawn.tar: $(BUILD)/netsurf.elf $(BUILD)/nsspawn.elf
+	@echo "  TAR  $@"
+	@rm -rf $(BUILD)/initrd_nsspawn
+	@mkdir -p $(BUILD)/initrd_nsspawn
+	@cp $(BUILD)/nsspawn.elf  $(BUILD)/initrd_nsspawn/desktop.elf
+	@cp $(BUILD)/netsurf.elf  $(BUILD)/initrd_nsspawn/netsurf.elf
+	$(call NETSURF_RES_COPY,$(BUILD)/initrd_nsspawn)
+	@printf 'homepage_url:https://en.wikipedia.org/wiki/Operating_system\n' > $(BUILD)/initrd_nsspawn/netsurf/Choices
+	@cd $(BUILD)/initrd_nsspawn && tar -cf ../initrd_nsspawn.tar .
+
+# Merőpad: a testbench/ könyvtárat a hoston egy HTTP szerver szolgálja ki
+# (QEMU slirp: a host = 10.0.2.2), a NetSurf homepage-e erre mutat.
+# Használat: tools/bench.sh <oldal>   (pl. tools/bench.sh images)
+BENCH_URL ?= http://10.0.2.2:8099/index.html
+$(BUILD)/initrd_bench.tar: $(BUILD)/netsurf.elf
+	@echo "  TAR  $@  ($(BENCH_URL))"
+	@rm -rf $(BUILD)/initrd_bench
+	@mkdir -p $(BUILD)/initrd_bench
+	@cp $(BUILD)/netsurf.elf $(BUILD)/initrd_bench/desktop.elf
+	$(call NETSURF_RES_COPY,$(BUILD)/initrd_bench)
+	@printf 'homepage_url:$(BENCH_URL)\nenable_javascript:1\n' > $(BUILD)/initrd_bench/netsurf/Choices
+	@cd $(BUILD)/initrd_bench && tar -cf ../initrd_bench.tar .
+
+$(BUILD)/initrd_nsnet.tar: $(BUILD)/netsurf.elf
+	@echo "  TAR  $@"
+	@rm -rf $(BUILD)/initrd_nsnet
+	@mkdir -p $(BUILD)/initrd_nsnet
+	@cp $(BUILD)/netsurf.elf $(BUILD)/initrd_nsnet/desktop.elf
+	$(call NETSURF_RES_COPY,$(BUILD)/initrd_nsnet)
+	@printf 'homepage_url:https://en.wikipedia.org/wiki/Operating_system\n' > $(BUILD)/initrd_nsnet/netsurf/Choices
+	@cd $(BUILD)/initrd_nsnet && tar -cf ../initrd_nsnet.tar .
+
+# Teszt képek az imgview-hoz (ImageMagick): bal felső sarok = tiszta szín
+$(BUILD)/test.png:
+	@echo "  GEN  $@"
+	@magick -size 200x160 gradient:red-yellow $@
+
+$(BUILD)/test.jpg:
+	@echo "  GEN  $@"
+	@magick -size 200x160 gradient:blue-white -quality 90 $@
+
+$(BUILD)/initrd_imgtest.tar: $(BUILD)/imgview.elf $(BUILD)/test.png $(BUILD)/test.jpg
+	@echo "  TAR  $@"
+	@rm -rf $(BUILD)/initrd_imgtest
+	@mkdir -p $(BUILD)/initrd_imgtest
+	@cp $(BUILD)/imgview.elf $(BUILD)/initrd_imgtest/desktop.elf
+	@cp $(BUILD)/test.png    $(BUILD)/initrd_imgtest/test.png
+	@cp $(BUILD)/test.jpg    $(BUILD)/initrd_imgtest/test.jpg
+	@cd $(BUILD)/initrd_imgtest && tar -cf ../initrd_imgtest.tar .
+
+$(BUILD)/rexos-test-%.iso: $(BUILD)/$(KERNEL) $(BUILD)/initrd_%.tar $(LIMINE_DIR)/limine limine.conf
+	@echo "  ISO  $@"
+	@rm -rf $(BUILD)/iso_root_test_$*
+	@mkdir -p $(BUILD)/iso_root_test_$*/boot/limine
+	@mkdir -p $(BUILD)/iso_root_test_$*/EFI/BOOT
+	@cp $(BUILD)/$(KERNEL)                  $(BUILD)/iso_root_test_$*/boot/
+	@cp $(BUILD)/initrd_$*.tar              $(BUILD)/iso_root_test_$*/boot/initrd.tar
+	@cp limine.conf                         $(BUILD)/iso_root_test_$*/boot/limine/
+	@cp $(LIMINE_DIR)/limine-bios.sys       $(BUILD)/iso_root_test_$*/boot/limine/
+	@cp $(LIMINE_DIR)/limine-bios-cd.bin    $(BUILD)/iso_root_test_$*/boot/limine/
+	@cp $(LIMINE_DIR)/limine-uefi-cd.bin    $(BUILD)/iso_root_test_$*/boot/limine/
+	@cp $(LIMINE_DIR)/BOOTX64.EFI           $(BUILD)/iso_root_test_$*/EFI/BOOT/
+	@xorriso -as mkisofs -quiet \
+	    -b boot/limine/limine-bios-cd.bin \
+	    -no-emul-boot -boot-load-size 4 -boot-info-table \
+	    --efi-boot boot/limine/limine-uefi-cd.bin \
+	    -efi-boot-part --efi-boot-image --protective-msdos-label \
+	    $(BUILD)/iso_root_test_$* -o $@ 2>/dev/null
+	@./$(LIMINE_DIR)/limine bios-install $@ >/dev/null 2>&1
+
+run-test-%: $(BUILD)/rexos-test-%.iso $(DISK)
+	@echo "  TEST $* (headless, max 60s)"
+	@timeout 60 qemu-system-x86_64 $(QEMU_MACHINE_FLAGS) $(QEMU_MEMORY_FLAGS) \
+	    -cdrom $(BUILD)/rexos-test-$*.iso -boot d $(QEMU_DISK_FLAGS) \
+	    -display none -serial stdio $(QEMU_NET_FLAGS) -no-reboot \
+	    | tee $(BUILD)/test_$*.log || true
+	@grep -q "MINDEN TESZT SIKERES" $(BUILD)/test_$*.log \
+	    && echo "== TEST $* PASS ==" \
+	    || (echo "== TEST $* FAIL =="; exit 1)
+
+# A nsspawn teszt sosem "fejezodik be" (a NetSurf addig fut, amig ki nem lepnek
+# belole), ezert nem a sikersztringet keressuk: az a jo eset, ha a gyerek taszk
+# elindult es a futas alatt EGYETLEN CPU exception sem tortent.
+run-test-nsspawn: $(BUILD)/rexos-test-nsspawn.iso $(DISK)
+	@echo "  TEST nsspawn (headless, max 120s)"
+	@timeout 120 qemu-system-x86_64 $(QEMU_MACHINE_FLAGS) $(QEMU_MEMORY_FLAGS) \
+	    -cdrom $(BUILD)/rexos-test-nsspawn.iso -boot d $(QEMU_DISK_FLAGS) \
+	    -display none -serial stdio $(QEMU_NET_FLAGS) -no-reboot \
+	    > $(BUILD)/test_nsspawn.log 2>&1 || true
+	@grep -q "task\[3\] 'netsurf.elf' created" $(BUILD)/test_nsspawn.log \
+	    || (echo "== TEST nsspawn FAIL (a netsurf.elf el sem indult) =="; exit 1)
+	@! grep -q "CPU EXCEPTION" $(BUILD)/test_nsspawn.log \
+	    || (echo "== TEST nsspawn FAIL (CPU exception) =="; \
+	        grep -A16 "CPU EXCEPTION" $(BUILD)/test_nsspawn.log; exit 1)
+	@echo "== TEST nsspawn PASS ($$(grep -c '\[fetch\] GET' $(BUILD)/test_nsspawn.log) letoltes, 0 exception) =="
+
+# DOM-stressz: nagy oldal + képek + folyamatos JS-módosítás, közben gépelés.
+# Ez a dobozfa-újraépítés őre (lásd tools/stress-dom.py).
+run-test-domstress:
+	@echo "  TEST domstress (headless, ~60s)"
+	@python3 tools/stress-dom.py big 35
+
+run-fputest: run-test-fputest
+run-newlibtest: run-test-newlibtest
+run-heaptest: run-test-heaptest
 
 run-legacy: $(ISO) $(DISK)
 	qemu-system-x86_64 $(QEMU_FLAGS_LEGACY)

@@ -151,6 +151,14 @@ vfs_node_t *vfs_lookup(const char *path) {
     /* A vezető '/' levágása */
     if (*path == '/') path++;
 
+    /* A tarfs (initrd) lapos: a fájlok a teljes útvonal-nevükkel a gyökérben
+     * élnek (pl. "netsurf/Messages"). Először ezt az exact match-et
+     * próbáljuk, mert a komponensenkénti bejárás ott zsákutca. */
+    {
+        vfs_node_t *flat = vfs_finddir(fs_root, path);
+        if (flat) return flat;
+    }
+
     vfs_node_t *current = fs_root;
     char component[128];
 

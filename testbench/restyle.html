@@ -1,0 +1,21 @@
+<!DOCTYPE html><html><head><meta charset="utf-8"><title>Restyle</title>
+<style>
+body{font-family:sans-serif;font-size:16px;margin:10px}
+.box{width:300px;height:40px;line-height:40px;margin:6px 0;color:#fff;text-align:center}
+.piros{background:#e63946}
+.zold{background:#2a9d8f}
+</style></head><body>
+<div id="a" class="box piros">1. className csere (piros -> zold)</div>
+<div id="b" class="box piros">2. classList.add (piros -> zold)</div>
+<div id="c" class="box piros">3. style.background kozvetlen</div>
+<div id="d" class="box piros">4. setAttribute("class")</div>
+<div id="e" class="box piros">5. textContent csere</div>
+<script>
+setTimeout(function(){
+  document.getElementById("a").className = "box zold";
+  var b = document.getElementById("b"); b.classList.remove("piros"); b.classList.add("zold");
+  document.getElementById("c").style.background = "#2a9d8f";
+  document.getElementById("d").setAttribute("class", "box zold");
+  document.getElementById("e").textContent = "5. UJ SZOVEG (a doboz maradjon piros)";
+}, 600);
+</script></body></html>

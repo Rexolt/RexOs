@@ -88,8 +88,17 @@ bool vmm_map_page_pml4(uintptr_t pml4_phys, uintptr_t virt, uintptr_t phys, uint
     if (!pt)   return false;
 
     pt[PT_INDEX(virt)] = (phys & ADDR_MASK_4K) | flags;
-    
-    if (pml4_phys == s_kernel_pml4_phys) {
+
+    /* TLB-ürítés: MINDIG kell, ha az érintett címtér épp be van töltve a
+     * CR3-ba. A sys_brk / sys_get_fb / a user stack mappelése az ÉPPEN FUTÓ
+     * taszk PML4-jét módosítja, tehát nem elég a kernel-PML4-et nézni:
+     * enélkül a CPU (és a QEMU softmmu TLB-je) a régi fordítást használja
+     * tovább -> a friss heap-lapokra írás elszáll vagy egy korábbi fizikai
+     * frame-re landol (malloc szabadlista-korrupció). */
+    uint64_t cur_cr3;
+    __asm__ volatile ("mov %%cr3, %0" : "=r"(cur_cr3));
+    if (pml4_phys == s_kernel_pml4_phys ||
+        (cur_cr3 & ADDR_MASK_4K) == (pml4_phys & ADDR_MASK_4K)) {
         vmm_flush_tlb(virt);
     }
     return true;

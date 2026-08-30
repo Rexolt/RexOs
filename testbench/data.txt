@@ -1,0 +1,1 @@
+XHR-rel betoltott szoveg a szerverrol.

@@ -4,6 +4,7 @@
 
 #define TASK_STACK_SIZE   (16 * 1024)   /* 16 KB per task */
 #define TASK_NAME_MAX     32
+#define TASK_FD_MAX       64
 
 typedef enum {
     TASK_STATE_READY = 0,
@@ -14,6 +15,10 @@ typedef enum {
 typedef void (*task_entry_fn)(void *arg);
 
 typedef struct task {
+    /* FXSAVE/FXRSTOR terület: 512 byte, 16-byte igazítás KÖTELEZŐ (#GP egyébként).
+     * A kheap payload 16-byte aligned, a struct elején az offset 0 -> mindig jó. */
+    uint8_t        fpu_state[512] __attribute__((aligned(16)));
+
     uint64_t       rsp;             /* mentett kernel-stack pointer (context switch idején) */
     uint8_t       *stack_base;      /* heap-en allokált stack alja (kfree-hez) */
     uint64_t       cr3;             /* A taszk fizikai PML4 címe (VMM) */
@@ -22,8 +27,8 @@ typedef struct task {
     task_state_t   state;
     task_entry_fn  entry;
     void          *arg;
-    struct vfs_node *fd_table[16];
-    uint64_t       fd_offset[16];
+    struct vfs_node *fd_table[TASK_FD_MAX];
+    uint64_t       fd_offset[TASK_FD_MAX];
 
     /* User heap (brk) */
     uint64_t       brk_start;       /* heap kezdete (ELF vége utáni első page) */
